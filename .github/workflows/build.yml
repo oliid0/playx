@@ -1,0 +1,195 @@
+name: Build PlayerX
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: playerx-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOSUMDB: sum.golang.org
+  XCODE_PROJECT: PlayerX.xcodeproj
+
+jobs:
+  ios:
+    name: iPhone / iPad · unsigned IPA
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+
+      - name: Cache Swift Package Manager
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/Developer/Xcode/DerivedData/**/SourcePackages
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build Go core (iOS + macOS slices)
+        run: bash scripts/build-core-xcframework.sh --all-sources
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Archive iOS app (unsigned)
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          # Pillarbox 的 PackageInfo build-tool plugin 在无人值守 CI 里需要跳过指纹校验。
+          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES || true
+          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES || true
+          xcodebuild clean archive \
+            -project "$XCODE_PROJECT" \
+            -scheme PlayerX \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/PlayerX.xcarchive \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            2>&1 | tee build/xcodebuild-ios.log
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="build/PlayerX.xcarchive/Products/Applications/PlayerX.app"
+          test -d "$APP"
+          rm -rf build/ipa && mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          (cd build/ipa && zip -qry ../PlayerX-unsigned.ipa Payload)
+          ls -lh build/PlayerX-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlayerX-iOS-unsigned-ipa
+          path: build/PlayerX-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload iOS build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlayerX-iOS-build-log
+          path: build/xcodebuild-ios.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  macos:
+    name: Mac · unsigned DMG
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+
+      - name: Cache Swift Package Manager
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/Developer/Xcode/DerivedData/**/SourcePackages
+          key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Install XcodeGen and create-dmg
+        run: |
+          brew install xcodegen
+          brew install create-dmg || true
+
+      - name: Build Go core (iOS + macOS slices)
+        run: bash scripts/build-core-xcframework.sh --all-sources
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Archive macOS app (unsigned)
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          # Pillarbox 的 PackageInfo build-tool plugin 在无人值守 CI 里需要跳过指纹校验。
+          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES || true
+          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES || true
+          xcodebuild clean archive \
+            -project "$XCODE_PROJECT" \
+            -scheme PlayerX-macOS \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -archivePath build/PlayerX-macOS.xcarchive \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            2>&1 | tee build/xcodebuild-macos.log
+
+      - name: Package DMG and zip
+        run: |
+          set -euo pipefail
+          APP="build/PlayerX-macOS.xcarchive/Products/Applications/PlayerX.app"
+          test -d "$APP"
+          bash scripts/package-dmg.sh "$APP" build/PlayerX-macOS.dmg
+          ditto -c -k --sequesterRsrc --keepParent "$APP" build/PlayerX-macOS.zip
+          ls -lh build/PlayerX-macOS.dmg build/PlayerX-macOS.zip
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlayerX-macOS-dmg
+          path: |
+            build/PlayerX-macOS.dmg
+            build/PlayerX-macOS.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload macOS build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlayerX-macOS-build-log
+          path: build/xcodebuild-macos.log
+          if-no-files-found: ignore
+          retention-days: 7
+

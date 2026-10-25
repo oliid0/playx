@@ -1,0 +1,135 @@
+# XcodeGen 工程描述。生成命令：xcodegen generate
+# 仓库里不提交 PlayerX.xcodeproj，本地和 CI 都从这里生成。
+#
+# DuanjuCore.xcframework 由 scripts/build-core-xcframework.sh 在 xcodegen 之前生成
+# （native/ 下 vendor 的 Go 原生核心交叉编译而来），本地没跑过这一步就 xcodegen generate
+# 会提示链接的 framework 不存在，属预期，先跑那个脚本。
+#
+# 两个 target：
+#   PlayerX         iPhone + iPad（iOS 16）
+#   PlayerX-macOS   Mac 原生（macOS 13，SwiftUI 侧边栏，不是 Catalyst）
+# 两者共用 PlayerX/ 下的全部 Swift / Assets 源码，平台差异只在 #if os(...) 里。
+name: PlayerX
+
+options:
+  bundleIdPrefix: com.oliid0
+  developmentLanguage: zh-Hans
+  createIntermediateGroups: true
+  # Pillarbox main 的 swift-tools-version 是 6.4，需要 Xcode 27 / Swift 6.4。
+  # 工程格式仍固定为 xcode16_0，保持旧 Xcode 也能读取。
+  xcodeVersion: "27.0"
+  projectFormat: xcode16_0
+  deploymentTarget:
+    iOS: "16.0"
+    macOS: "13.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.7.0"
+    CURRENT_PROJECT_VERSION: "4"
+    DEVELOPMENT_TEAM: ""
+    ENABLE_BITCODE: NO
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+
+packages:
+  Pillarbox:
+    url: https://github.com/SRGSSR/pillarbox-apple.git
+    branch: main
+
+targets:
+  PlayerX:
+    type: application
+    platform: iOS
+    sources:
+      - path: PlayerX
+        excludes:
+          - "Info.plist"
+          - "Info-macOS.plist"
+    dependencies:
+      - package: Pillarbox
+        product: PillarboxPlayer
+      - framework: native/build/DuanjuCore.xcframework
+        embed: false
+      - sdk: Security.framework
+      - sdk: CoreFoundation.framework
+      - sdk: libresolv.tbd
+    settings:
+      base:
+        PRODUCT_NAME: PlayerX
+        PRODUCT_BUNDLE_IDENTIFIER: com.oliid0.playerx
+        INFOPLIST_FILE: PlayerX/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        # 1 = iPhone, 2 = iPad。iPad 常规宽度自动切到 NavigationSplitView 侧边栏。
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SUPPORTS_MACCATALYST: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        ENABLE_PREVIEWS: NO
+        # Go c-archive 导出的符号只被 Swift 透过桥接头间接调用，静态链接器可能当成
+        # 没人用而整段裁掉（上游 Flutter 工程的 DuanjuCore.podspec 里也加了这三条，照抄）。
+        OTHER_LDFLAGS: "$(inherited) -Wl,-u,_DuanjuRequest -Wl,-u,_DuanjuFree -Wl,-export_dynamic"
+        STRIP_STYLE: non-global
+        SWIFT_OBJC_BRIDGING_HEADER: PlayerX/Core/Bridge/PlayerX-Bridging-Header.h
+        HEADER_SEARCH_PATHS: "$(SRCROOT)/native/build/ios/Headers"
+
+  PlayerX-macOS:
+    type: application
+    platform: macOS
+    sources:
+      - path: PlayerX
+        excludes:
+          - "Info.plist"
+          - "Info-macOS.plist"
+    dependencies:
+      - framework: native/build/DuanjuCore.xcframework
+        embed: false
+      - sdk: Security.framework
+      - sdk: CoreFoundation.framework
+      - sdk: libresolv.tbd
+    settings:
+      base:
+        PRODUCT_NAME: PlayerX
+        PRODUCT_BUNDLE_IDENTIFIER: com.oliid0.playerx.mac
+        INFOPLIST_FILE: PlayerX/Info-macOS.plist
+        GENERATE_INFOPLIST_FILE: NO
+        MACOSX_DEPLOYMENT_TARGET: "13.0"
+        COMBINE_HIDPI_IMAGES: YES
+        ENABLE_HARDENED_RUNTIME: NO
+        ENABLE_PREVIEWS: NO
+        # macOS 不强制 app icon，先在工具栏/侧边栏用 SwiftUI 绘制的 AppMark；
+        # 等有 .icns 后再打开 ASSETCATALOG_COMPILER_APPICON_NAME。
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        # 和 iOS target 同样强制保留 Go 的两个导出符号。
+        OTHER_LDFLAGS: "$(inherited) -Wl,-u,_DuanjuRequest -Wl,-u,_DuanjuFree -Wl,-export_dynamic"
+        STRIP_STYLE: non-global
+        SWIFT_OBJC_BRIDGING_HEADER: PlayerX/Core/Bridge/PlayerX-Bridging-Header.h
+        HEADER_SEARCH_PATHS: "$(SRCROOT)/native/build/macos/Headers"
+
+schemes:
+  PlayerX:
+    build:
+      targets:
+        PlayerX: all
+    run:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
+
+  PlayerX-macOS:
+    build:
+      targets:
+        PlayerX-macOS: all
+    run:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release

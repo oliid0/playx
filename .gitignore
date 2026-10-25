@@ -1,0 +1,44 @@
+# macOS
+.DS_Store
+
+# Xcode user-specific data
+xcuserdata/
+*.xcuserstate
+
+# Xcode build output
+DerivedData/
+build/
+
+# XcodeGen 生成的工程：由 project.yml 生成，不提交（CI 里会重新生成）
+*.xcodeproj/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Archives / signing
+*.xcarchive
+*.ipa
+*.mobileprovision
+*.p12
+*.cer
+*.pem
+*.key
+
+# Go 原生核心的交叉编译产物：由 scripts/build-core-xcframework.sh 生成，CI 里现场编译
+native/build/
+native/*.xcframework
+*.xcframework/
+
+# Go 产物 / 测试缓存
+*.test
+
+# Environment / secrets
+.env
+.env.*
+*.secret
+
+# Temporary files
+*.swp
+*.tmp
+*.log

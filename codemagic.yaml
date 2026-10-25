@@ -1,0 +1,168 @@
+# Codemagic CI —— 构建 PlayerX 未签名 IPA
+#
+# 分发模型同 One-ipa：未签名 IPA，终端用户用自己的证书 / SideStore 自签安装，无需上传任何证书。
+# 工程由 XcodeGen 从 project.yml 生成（仓库里不提交 .xcodeproj）；native/ 下 vendor 的 Go
+# 原生核心（来自 guoapp-src）在这里现场交叉编译成 DuanjuCore.xcframework 再链接进 App，
+# 见 scripts/build-core-xcframework.sh 与 Documentation/Architecture.md。
+#
+# 触发方式：
+#   1) 推送 tag 自动构建：git tag v0.1.0-1 && git push origin v0.1.0-1
+#   2) 在 Codemagic 界面选 unsigned-ipa 工作流手动 Start new build（首次验证用这个）
+
+workflows:
+  unsigned-ipa:
+    name: PlayerX Unsigned IPA
+    max_build_duration: 90
+    instance_type: mac_mini_m2
+    environment:
+      xcode: "27"
+      vars:
+        XCODE_PROJECT: "PlayerX.xcodeproj"
+        XCODE_SCHEME: "PlayerX"
+        APP_NAME: "PlayerX"
+    triggering:
+      events:
+        - tag
+      tag_patterns:
+        - pattern: "*"
+          include: true
+    scripts:
+      - name: 安装 XcodeGen 与 Go
+        script: |
+          set -e
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          export HOMEBREW_NO_INSTALL_CLEANUP=1
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          if ! command -v go >/dev/null 2>&1; then
+            brew install go
+          fi
+          xcodegen --version
+          go version
+
+      - name: 交叉编译 Go 原生核心为 DuanjuCore.xcframework
+        script: |
+          set -eo pipefail
+          # --all-sources：全部 11 个站源都编进二进制，哪些默认展示由 Swift 侧的
+          # SourceRegistry/SourceLockStore 控制，不是编译期裁剪（见 Documentation/Architecture.md）。
+          bash scripts/build-core-xcframework.sh --all-sources 2>&1 | tee "$CM_BUILD_DIR/go-core-build.log"
+
+      - name: 生成 Xcode 工程
+        script: |
+          set -e
+          xcodegen generate --spec project.yml
+          ls -d *.xcodeproj
+
+      - name: 打印工具链与可用 scheme（排障用）
+        script: |
+          set -e
+          xcodebuild -version
+          xcodebuild -list -project "$XCODE_PROJECT"
+
+      - name: 构建未签名 Release 归档
+        script: |
+          set -eo pipefail
+          # 完整日志另存一份当 artifact：出错时直接把文件给人看，不用在网页里翻
+          xcodebuild clean archive \
+            -project "$XCODE_PROJECT" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$CM_BUILD_DIR/$APP_NAME.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            2>&1 | tee "$CM_BUILD_DIR/xcodebuild.log"
+
+      - name: 打包未签名 IPA
+        script: |
+          set -e
+          APP_PATH="$CM_BUILD_DIR/$APP_NAME.xcarchive/Products/Applications/$APP_NAME.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "未找到 .app: $APP_PATH" >&2
+            ls -R "$CM_BUILD_DIR/$APP_NAME.xcarchive/Products" || true
+            exit 1
+          fi
+          WORK="$CM_BUILD_DIR/ipa_build"
+          rm -rf "$WORK" && mkdir -p "$WORK/Payload"
+          cp -R "$APP_PATH" "$WORK/Payload/"
+          cd "$WORK"
+          zip -qry "$CM_BUILD_DIR/$APP_NAME-unsigned.ipa" Payload
+          ls -lh "$CM_BUILD_DIR/$APP_NAME-unsigned.ipa"
+    artifacts:
+      - $CM_BUILD_DIR/PlayerX-unsigned.ipa
+      - $CM_BUILD_DIR/xcodebuild.log
+      - $CM_BUILD_DIR/go-core-build.log
+      - /tmp/xcodebuild_logs/*.log
+
+  unsigned-macos:
+    name: PlayerX macOS App
+    max_build_duration: 90
+    instance_type: mac_mini_m2
+    environment:
+      xcode: "27"
+      vars:
+        XCODE_PROJECT: "PlayerX.xcodeproj"
+        XCODE_SCHEME: "PlayerX-macOS"
+        APP_NAME: "PlayerX"
+    triggering:
+      events:
+        - tag
+      tag_patterns:
+        - pattern: "*"
+          include: true
+    scripts:
+      - name: 安装 XcodeGen 与 Go
+        script: |
+          set -e
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          export HOMEBREW_NO_INSTALL_CLEANUP=1
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          if ! command -v go >/dev/null 2>&1; then
+            brew install go
+          fi
+          xcodegen --version
+          go version
+
+      - name: 交叉编译 Go 原生核心（iOS + macOS 双平台）
+        script: |
+          set -eo pipefail
+          bash scripts/build-core-xcframework.sh --all-sources 2>&1 | tee "$CM_BUILD_DIR/go-core-build.log"
+
+      - name: 生成 Xcode 工程
+        script: |
+          set -e
+          xcodegen generate --spec project.yml
+
+      - name: 构建未签名 macOS App
+        script: |
+          set -eo pipefail
+          xcodebuild clean archive \
+            -project "$XCODE_PROJECT" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=macOS' \
+            -archivePath "$CM_BUILD_DIR/$APP_NAME-macOS.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            2>&1 | tee "$CM_BUILD_DIR/xcodebuild-macos.log"
+
+      - name: 打包 .app 与 zip
+        script: |
+          set -e
+          APP_PATH="$CM_BUILD_DIR/$APP_NAME-macOS.xcarchive/Products/Applications/$APP_NAME.app"
+          test -d "$APP_PATH" || { echo "未找到 $APP_PATH"; ls -R "$CM_BUILD_DIR/$APP_NAME-macOS.xcarchive/Products"; exit 1; }
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$CM_BUILD_DIR/$APP_NAME-macOS.zip"
+          ls -lh "$CM_BUILD_DIR/$APP_NAME-macOS.zip"
+    artifacts:
+      - $CM_BUILD_DIR/PlayerX-macOS.zip
+      - $CM_BUILD_DIR/xcodebuild-macos.log
+      - $CM_BUILD_DIR/go-core-build.log
