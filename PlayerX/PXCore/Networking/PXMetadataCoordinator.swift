@@ -59,8 +59,13 @@ final class PXMetadataCoordinator: ObservableObject {
 
     func refresh(drama: Drama, metadata: PXMediaMetadata? = nil) async -> PXMediaMetadata? {
         guard isEnabled else { return nil }
-        guard let link = metadata.map({ ($0.tmdbID, $0.mediaType) }) ?? (await cache.link(for: drama.id))
-        else { return await metadata(for: drama) }
+        let resolvedLink: (Int, PXMediaKind)?
+        if let metadata {
+            resolvedLink = (metadata.tmdbID, metadata.mediaType)
+        } else {
+            resolvedLink = await cache.link(for: drama.id)
+        }
+        guard let link = resolvedLink else { return await metadata(for: drama) }
         do {
             let detail = try await client.detail(
                 tmdbID: link.0,
@@ -177,6 +182,17 @@ final class PXMetadataCoordinator: ObservableObject {
         return (try? await client.trending(
             language: settings.tmdbLanguage,
             token: settings.effectiveTMDbToken
+        )) ?? []
+    }
+
+    func discover(kind: PXMediaKind, genreID: Int? = nil, page: Int = 1) async -> [PXTMDbSearchResult] {
+        guard isEnabled else { return [] }
+        return (try? await client.discover(
+            kind: kind,
+            genreID: genreID,
+            language: settings.tmdbLanguage,
+            token: settings.effectiveTMDbToken,
+            page: page
         )) ?? []
     }
 

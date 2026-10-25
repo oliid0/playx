@@ -57,7 +57,7 @@ struct PXHomeView: View {
                 NavigationLink {
                     PXBrowseView(section: .library)
                 } label: {
-                    PXChip(title: "全部", symbol: "square.grid.2x2", selected: true)
+                    PXChip(title: "全部", selected: true, symbol: "square.grid.2x2")
                 }
                 .buttonStyle(.plain)
                 ForEach(PXCatalogSection.contentSections.filter { $0 != .home }) { section in

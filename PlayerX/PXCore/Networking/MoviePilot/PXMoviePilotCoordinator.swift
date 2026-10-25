@@ -197,6 +197,11 @@ final class PXMoviePilotCoordinator: ObservableObject {
         pollingTask = nil
     }
 
+    func clearTorrents() {
+        torrents = []
+        errorMessage = nil
+    }
+
     nonisolated private static func normalizedURL(_ raw: String) -> URL? {
         let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return nil }

@@ -117,7 +117,7 @@ struct PXSettingsHomeView: View {
                         .buttonStyle(.plain)
                     }
 
-                    Text("PlayerX \u00b7 \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0")")
+                    Text("PlayerX · \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0")")
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(PXTheme.textTertiary)
                         .frame(maxWidth: .infinity)

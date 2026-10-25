@@ -74,7 +74,7 @@ struct PXFilterSheet: View {
                             Button {
                                 draft.sort = sort
                             } label: {
-                                PXChip(title: sort.title, symbol: sort.symbol, selected: draft.sort == sort)
+                                PXChip(title: sort.title, selected: draft.sort == sort, symbol: sort.symbol)
                             }
                             .buttonStyle(.plain)
                         }

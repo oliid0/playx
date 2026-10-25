@@ -13,8 +13,7 @@ enum PXPlaybackEngineFactory {
         case .erika:
             #if canImport(ErikaKit)
             let engine = PXErikaEngine()
-            if engine.snapshot.state != .failed("") { return engine }
-            return PXAVPlayerEngine()
+            return engine.isUsable ? engine : PXAVPlayerEngine()
             #else
             return PXAVPlayerEngine()
             #endif

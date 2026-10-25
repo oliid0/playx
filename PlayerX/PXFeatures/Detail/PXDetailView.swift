@@ -1,5 +1,11 @@
 import SwiftUI
 
+#if os(iOS)
+import UIKit
+#elseif os(macOS)
+import AppKit
+#endif
+
 struct PXDetailView: View {
     @EnvironmentObject private var app: PXAppState
     @StateObject private var model: PXDetailViewModel

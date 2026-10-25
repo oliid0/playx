@@ -19,6 +19,7 @@ final class PXErikaEngine: PXBasePlaybackEngine {
     private var pendingStart: Double = 0
     private var autoPlay = true
     override var supportsExternalSubtitles: Bool { true }
+    var isUsable: Bool { engine != nil }
 
     override init() {
         super.init()

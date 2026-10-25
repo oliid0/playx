@@ -38,6 +38,8 @@ jobs:
           key: erika-v0.2.1-${{ runner.os }}-${{ runner.arch }}
 
       - name: Fetch Erika playback kernel (FFmpeg + libass)
+        env:
+          ERIKA_MACOS_ARCH: universal
         run: |
           mkdir -p build
           bash Packages/ErikaKit/Scripts/fetch-erika.sh v0.2.1 2>&1 | tee build/erika.log
@@ -155,6 +157,8 @@ jobs:
           key: erika-v0.2.1-${{ runner.os }}-${{ runner.arch }}
 
       - name: Fetch Erika playback kernel (FFmpeg + libass)
+        env:
+          ERIKA_MACOS_ARCH: universal
         run: |
           mkdir -p build
           bash Packages/ErikaKit/Scripts/fetch-erika.sh v0.2.1 2>&1 | tee build/erika.log
@@ -265,6 +269,19 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore Erika kernel cache
+        uses: actions/cache@v4
+        with:
+          path: Packages/ErikaKit/Vendor/downloads
+          key: erika-v0.2.1-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Fetch Erika kernel (project resolution only)
+        env:
+          ERIKA_MACOS_ARCH: universal
+        run: |
+          mkdir -p build
+          bash Packages/ErikaKit/Scripts/fetch-erika.sh v0.2.1 2>&1 | tee build/erika.log
 
       - name: Show Xcode version
         run: xcodebuild -version

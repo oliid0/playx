@@ -67,7 +67,11 @@ struct PXMoviePilotTorrent: Identifiable, Hashable, Sendable {
         title = raw["title"]?.stringValue ?? raw["name"]?.stringValue ?? "未命名资源"
         description = raw["description"]?.stringValue
         siteName = raw["site_name"]?.stringValue ?? raw["site"]?.stringValue
-        size = raw["size"]?.intValue.map(Int64.init) ?? raw["size"]?.doubleValue.map(Int64.init)
+        if let value = raw["size"]?.intValue {
+            size = Int64(value)
+        } else if let value = raw["size"]?.doubleValue {
+            size = Int64(value)
+        }
         seeders = raw["seeders"]?.intValue
         peers = raw["peers"]?.intValue
         hash = raw["hash"]?.stringValue
@@ -129,7 +133,11 @@ struct PXMoviePilotDownload: Identifiable, Hashable, Sendable {
         name = raw["name"]?.stringValue ?? raw["title"]?.stringValue ?? "下载任务"
         progress = raw["progress"]?.doubleValue ?? 0
         if progress > 1 { progress /= 100 }
-        size = raw["size"]?.intValue.map(Int64.init) ?? raw["total_size"]?.intValue.map(Int64.init)
+        if let value = raw["size"]?.intValue {
+            size = Int64(value)
+        } else if let value = raw["total_size"]?.intValue {
+            size = Int64(value)
+        }
         speed = raw["speed"]?.doubleValue
         state = raw["state"]?.stringValue ?? raw["status"]?.stringValue
         let poster = raw["poster"]?.stringValue

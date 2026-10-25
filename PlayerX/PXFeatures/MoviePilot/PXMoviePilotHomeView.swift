@@ -69,7 +69,7 @@ struct PXMoviePilotHomeView: View {
             Spacer()
             if coordinator.isLoggedIn {
                 Button { showLogin = true } label: {
-                    PXRemoteImage(url: coordinator.user?.avatar.flatMap(URL.init(string:)), maxPixel: 100)
+                    PXRemoteImage(url: coordinator.user?.avatar.flatMap { URL(string: $0) }, maxPixel: 100)
                         .frame(width: 36, height: 36)
                         .clipShape(Circle())
                         .overlay(Circle().strokeBorder(PXTheme.stroke))

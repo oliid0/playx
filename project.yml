@@ -39,6 +39,8 @@ packages:
     branch: main
   ErikaKit:
     path: Packages/ErikaKit
+  PlaybackKit:
+    path: Packages/PlaybackKit
 
 targets:
   PlayerX:
@@ -54,6 +56,8 @@ targets:
         product: PillarboxPlayer
       - package: ErikaKit
         product: ErikaKit
+      - package: PlaybackKit
+        product: PlaybackKit
       - framework: native/build/DuanjuCore.xcframework
         embed: false
       - sdk: Security.framework
@@ -90,6 +94,8 @@ targets:
     dependencies:
       - package: ErikaKit
         product: ErikaKit
+      - package: PlaybackKit
+        product: PlaybackKit
       - framework: native/build/DuanjuCore.xcframework
         embed: false
       - sdk: Security.framework

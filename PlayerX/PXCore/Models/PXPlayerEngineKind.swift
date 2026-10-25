@@ -51,7 +51,6 @@ enum PXPlayerEngineKind: String, CaseIterable, Codable, Identifiable, Hashable {
             true
             }
         }
-    }
 
     var unavailableReason: String? {
         if isAvailable { return nil }

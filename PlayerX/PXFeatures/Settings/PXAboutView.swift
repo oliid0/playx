@@ -72,10 +72,10 @@ struct PXLicenseView: View {
 
     var body: some View {
         NavigationStack {
-            List(licenses, id: \.0) { item in
+            List(Array(licenses.enumerated()), id: \.offset) { item in
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(item.0).font(.system(size: 13, weight: .semibold))
-                    Text(item.1).font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text(item.element.0).font(.system(size: 13, weight: .semibold))
+                    Text(item.element.1).font(.system(size: 10)).foregroundStyle(.secondary)
                 }
                 .listRowBackground(PXTheme.surfaceMuted)
             }

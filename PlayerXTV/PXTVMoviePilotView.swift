@@ -77,7 +77,7 @@ struct PXTVMoviePilotView: View {
             HStack {
                 Text(media.title).font(PXFont.title(26)).foregroundStyle(PXTheme.textPrimary)
                 Spacer()
-                Button("返回") { selectedMedia = nil; coordinator.torrents = [] }.buttonStyle(.card)
+                Button("返回") { selectedMedia = nil; coordinator.clearTorrents() }.buttonStyle(.card)
             }
             if coordinator.isSearchingTorrents {
                 PXTVLoadingView(text: "聚合站点资源")
