@@ -181,12 +181,18 @@ final class PXPlayerModel: ObservableObject {
         defer { isResolving = false }
         do {
             let chapter = chapters[index]
-            let resolved = try await request.provider.resolve(
-                drama: request.drama,
-                chapter: chapter,
-                index: index + 1,
-                quality: selectedQuality > 0 ? selectedQuality : nil
-            )
+            let downloads = DownloadStore.shared
+            let resolved: PlaybackPlan
+            if downloads.job(dramaId: request.drama.id, index: index + 1)?.state == DownloadJob.stateCompleted {
+                resolved = try await downloads.localPlan(drama: request.drama, index: index + 1)
+            } else {
+                resolved = try await request.provider.resolve(
+                    drama: request.drama,
+                    chapter: chapter,
+                    index: index + 1,
+                    quality: selectedQuality > 0 ? selectedQuality : nil
+                )
+            }
             saveProgress(force: true)
             engine?.stop()
             plan = resolved

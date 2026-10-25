@@ -16,6 +16,7 @@ final class PXErikaEngine: PXBasePlaybackEngine {
     private var consumeTask: Task<Void, Never>?
     private var pollTask: Task<Void, Never>?
     private var tracks: [PlaybackKit.TrackInfo] = []
+    private var openTask: Task<Void, Never>?
     private var pendingStart: Double = 0
     private var autoPlay = true
     override var supportsExternalSubtitles: Bool { true }
@@ -37,6 +38,7 @@ final class PXErikaEngine: PXBasePlaybackEngine {
     deinit {
         consumeTask?.cancel()
         pollTask?.cancel()
+        openTask?.cancel()
     }
 
     override func makeSurface() -> AnyView {
@@ -49,15 +51,29 @@ final class PXErikaEngine: PXBasePlaybackEngine {
         autoPlay = autoplay
         publish { $0 = .init(); $0.state = .opening }
         let source = PlaybackSource(uri: url.absoluteString, headers: headers)
-        Task { @MainActor [weak self] in
+        let volume = snapshot.volume
+        openTask?.cancel()
+        openTask = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
-                try engine.open(source)
-                try engine.setVolume(self.snapshot.volume)
+                // Erika 的 open 同步完成网络连接与格式探测，弱网下可达数十秒；
+                // 放到 detached 任务，避免主线程被 open 的锁和网络阻塞。
+                try await Task.detached(priority: .userInitiated) {
+                    try engine.open(source)
+                }.value
+                guard !Task.isCancelled else {
+                    try? engine.stop()
+                    return
+                }
+                try engine.setVolume(volume)
                 if startAt > 0 { try engine.seek(to: .seconds(startAt)) }
                 if autoplay { try engine.play() }
             } catch {
-                self.publish { $0.state = .failed(error.localizedDescription); $0.errorMessage = error.localizedDescription }
+                guard !Task.isCancelled else { return }
+                self.publish {
+                    $0.state = .failed(error.localizedDescription)
+                    $0.errorMessage = error.localizedDescription
+                }
             }
         }
     }
@@ -100,6 +116,7 @@ final class PXErikaEngine: PXBasePlaybackEngine {
     override func stop() {
         consumeTask?.cancel()
         pollTask?.cancel()
+        openTask?.cancel()
         try? engine?.stop()
         publish { $0.state = .idle; $0.currentTime = 0 }
     }

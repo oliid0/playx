@@ -42,3 +42,6 @@ native/*.xcframework
 *.swp
 *.tmp
 *.log
+
+# Local agent workspace
+.dsh/

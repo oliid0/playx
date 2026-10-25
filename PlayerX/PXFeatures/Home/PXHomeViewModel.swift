@@ -68,17 +68,20 @@ final class PXHomeViewModel: ObservableObject {
         // 站源自己的推荐栏也保留，方便用户感知“内容来自哪里”。
         built.append(contentsOf: feed.prefix(4))
 
-        var heroes = all.prefix(6).map { PXHeroItem(entry: $0) }
-        // 只给前 3 个补 TMDB 背景，避免首屏同时发太多请求；失败就回落站源封面。
-        for index in heroes.indices.prefix(3) {
-            if let meta = await metadata.metadata(for: heroes[index].entry.drama) {
-                heroes[index] = PXHeroItem(entry: heroes[index].entry, metadata: meta)
-            }
-        }
+        let heroes = all.prefix(6).map { PXHeroItem(entry: $0) }
         guard current == generation else { return }
+        // 先出首屏，再逐个补 TMDB 背景；网络慢时用户仍能立即滚动和点开内容。
         heroItems = heroes
         rails = built
         isLoading = false
+        for index in heroItems.indices.prefix(3) {
+            guard current == generation else { return }
+            let entry = heroItems[index].entry
+            if let meta = await metadata.metadata(for: entry.drama) {
+                guard current == generation, heroItems.indices.contains(index) else { return }
+                heroItems[index] = PXHeroItem(entry: entry, metadata: meta)
+            }
+        }
     }
 
     private func kindRailSubtitle(_ kind: PXMediaKind) -> String {

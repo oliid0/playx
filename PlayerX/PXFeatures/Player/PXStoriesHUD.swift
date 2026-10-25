@@ -168,14 +168,14 @@ struct PXStoriesTapZones: View {
                 Color.black.opacity(0.001)
                     .frame(width: proxy.size.width * 0.28)
                     .contentShape(Rectangle())
-                    .onTapGesture { if enabled { onPrevious() } else { onToggleControls() } }
+                    .onTapGesture { onPrevious() }
                 Color.black.opacity(0.001)
                     .contentShape(Rectangle())
                     .onTapGesture { onToggleControls() }
                 Color.black.opacity(0.001)
                     .frame(width: proxy.size.width * 0.28)
                     .contentShape(Rectangle())
-                    .onTapGesture { if enabled { onNext() } else { onToggleControls() } }
+                    .onTapGesture { onNext() }
             }
         }
         .ignoresSafeArea()
