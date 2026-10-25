@@ -204,6 +204,10 @@ final class PXDetailViewModel: ObservableObject {
     }
 
     func downloadCurrent() async {
+        guard provider.sourceKind == .station else {
+            errorMessage = "外部媒体源暂不支持离线下载"
+            return
+        }
         guard chapters.indices.contains(selectedChapter) else { return }
         _ = await downloads.enqueue(
             drama: drama,
@@ -213,6 +217,10 @@ final class PXDetailViewModel: ObservableObject {
     }
 
     func downloadAll() async {
+        guard provider.sourceKind == .station else {
+            errorMessage = "外部媒体源暂不支持离线下载"
+            return
+        }
         let episodes = chapters.enumerated().map { ($0.element, $0.offset + 1) }
         _ = await downloads.enqueue(drama: drama, episodes: episodes,
                                     quality: selectedQuality > 0 ? selectedQuality : nil)

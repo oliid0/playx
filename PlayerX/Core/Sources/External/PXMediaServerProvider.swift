@@ -103,11 +103,10 @@ final class PXMediaServerProvider: ContentProvider {
             throw PXMediaServerError.transport("无法生成播放地址")
         }
         return PlaybackPlan(
-            url: streamURL.absoluteString,
+            streamURL: streamURL.absoluteString,
             headers: client.requestHeaders,
             quality: quality ?? 1080,
-            qualities: [2160, 1080, 720],
-            local: false
+            qualities: [2160, 1080, 720]
         )
     }
 

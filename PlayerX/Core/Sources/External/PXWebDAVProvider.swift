@@ -127,11 +127,10 @@ final class PXWebDAVProvider: ContentProvider {
             throw PXWebDAVError.transport("无效的视频地址")
         }
         return PlaybackPlan(
-            url: url.absoluteString,
+            streamURL: url.absoluteString,
             headers: client.headers,
             quality: quality ?? 0,
-            qualities: [],
-            local: false
+            qualities: []
         )
     }
 

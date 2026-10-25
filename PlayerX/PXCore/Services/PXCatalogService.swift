@@ -223,9 +223,9 @@ final class PXCatalogService {
         let keywords: [String]
         switch kind {
         case .movie: keywords = ["电影", "影片", "片库", "movie"]
-        case .series: keywords = ["电视剧", "剧集", "连续剧", "剧", "tv"]
-        case .anime: keywords = ["动漫", "动画", "番剧", "二次元", "anime"]
-        case .shortDrama: keywords = ["短剧", "竖屏", "微短剧"]
+        case .series: keywords = ["电视剧", "剧集", "连续剧", "剧", "tv", "series"]
+        case .anime: keywords = ["动漫", "动画", "番剧", "二次元", "anime", "剧集", "tv", "series"]
+        case .shortDrama: keywords = ["短剧", "竖屏", "微短剧", "剧集", "tv"]
         case .variety: keywords = ["综艺", "真人秀"]
         case .documentary: keywords = ["纪录", "纪实"]
         }
@@ -234,7 +234,7 @@ final class PXCatalogService {
                 $0.name.localizedCaseInsensitiveContains(keyword)
             }) { return match.id }
         }
-        return categories.first(where: { !$0.id.isEmpty })?.id ?? ""
+        return ""
     }
 
     nonisolated static func section(for kind: PXMediaKind) -> PXCatalogSection {

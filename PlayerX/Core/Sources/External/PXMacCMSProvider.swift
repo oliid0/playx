@@ -68,11 +68,10 @@ final class PXMacCMSProvider: ContentProvider {
         var headers = client.headers
         if let referer = chapter.referer, !referer.isEmpty { headers["Referer"] = referer }
         return PlaybackPlan(
-            url: url.absoluteString,
+            streamURL: url.absoluteString,
             headers: headers,
             quality: quality ?? 0,
-            qualities: [],
-            local: false
+            qualities: []
         )
     }
 

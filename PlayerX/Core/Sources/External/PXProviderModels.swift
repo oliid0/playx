@@ -61,37 +61,7 @@ extension Chapter {
     }
 }
 
-extension PlaybackPlan {
-    init(
-        url: String,
-        headers: [String: String]? = nil,
-        decryptionKey: String? = nil,
-        quality: Int? = nil,
-        qualities: [Int]? = nil,
-        session: String? = nil,
-        local: Bool? = false,
-        danmakuId: String? = nil,
-        expiresAt: Int64? = nil,
-        prefetchedBytes: Int64? = nil,
-        routeIndex: Int? = nil,
-        routeCount: Int? = nil
-    ) {
-        self.init(
-            url: url,
-            headers: headers,
-            decryptionKey: decryptionKey,
-            quality: quality,
-            qualities: qualities,
-            session: session,
-            local: local,
-            danmakuId: danmakuId,
-            expiresAt: expiresAt,
-            prefetchedBytes: prefetchedBytes,
-            routeIndex: routeIndex,
-            routeCount: routeCount
-        )
-    }
-}
+
 
 enum PXProviderSupport {
     static let videoExtensions: Set<String> = [

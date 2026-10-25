@@ -46,7 +46,7 @@ enum PXSourceLoginService {
             }
             return PXSourceTestResult(title: info.serverName ?? "媒体服务器", detail: "连接成功 · \(info.version ?? "")")
         case .webdav, .nas, .alist:
-            let entries = try await PXWebDAVClient(configuration: configuration).list(path: configuration.rootPath)
+            let entries = try await PXWebDAVClient(configuration: configuration).listRoot()
             return PXSourceTestResult(title: "WebDAV 连接成功", detail: "\(entries.count) 个项目")
         case .maccms:
             let categories = try await PXMacCMSClient(configuration: configuration).categories()

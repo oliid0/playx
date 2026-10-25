@@ -61,11 +61,13 @@ struct PXDetailHeader: View {
                     .buttonStyle(PXIconButtonStyle(size: 44))
                     .foregroundStyle(model.followStatus == nil ? PXTheme.textPrimary : PXTheme.rose)
 
-                    Button(action: onDownload) {
-                        Image(systemName: "arrow.down.circle")
-                            .frame(width: 42, height: 42)
+                    if model.provider.sourceKind == .station {
+                        Button(action: onDownload) {
+                            Image(systemName: "arrow.down.circle")
+                                .frame(width: 42, height: 42)
+                        }
+                        .buttonStyle(PXIconButtonStyle(size: 44))
                     }
-                    .buttonStyle(PXIconButtonStyle(size: 44))
 
                     Menu {
                         Button { onMatch() } label: { Label("匹配 TMDB 元数据", systemImage: "sparkles.tv") }

@@ -5,10 +5,11 @@ struct PXSourcePickerView: View {
     @EnvironmentObject private var app: PXAppState
     @State private var selected: Set<String> = []
     @State private var showingLock = false
+    @State private var showingExternal = false
 
-    private var all: [SourceDescriptor] { SourceRegistry.all }
+    private var all: [SourceDescriptor] { SourceRegistry.stationSources }
     private var visible: Set<String> {
-        Set(app.catalog.visibleSources.map(\.id))
+        Set(app.catalog.visibleSources.filter { !$0.isExternal }.map(\.id))
     }
 
     var body: some View {
@@ -45,9 +46,14 @@ struct PXSourcePickerView: View {
                 } header: {
                     Text("启用站源")
                 } footer: {
-                    Text("站源是内容库；首页与片库会聚合启用站源的内容。隐藏站源需要先解锁。")
+                    Text("站源是内容库；首页与片库会聚合所有启用源。外部媒体源在“设置 → 媒体源”中添加。")
                 }
                 Section {
+                    Button {
+                        showingExternal = true
+                    } label: {
+                        Label("外部媒体源（Emby / Jellyfin / WebDAV / MacCMS）", systemImage: "externaldrive.connected.to.line.below")
+                    }
                     Button {
                         showingLock = true
                     } label: {
@@ -75,6 +81,10 @@ struct PXSourcePickerView: View {
             }
             .sheet(isPresented: $showingLock) {
                 SourceLockView()
+            }
+            .sheet(isPresented: $showingExternal) {
+                NavigationStack { PXSourceSettingsView() }
+                    .environmentObject(app)
             }
         }
         .preferredColorScheme(.dark)
