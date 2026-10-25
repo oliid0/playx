@@ -38,7 +38,9 @@ jobs:
           key: erika-v0.2.1-${{ runner.os }}-${{ runner.arch }}
 
       - name: Fetch Erika playback kernel (FFmpeg + libass)
-        run: bash Packages/ErikaKit/Scripts/fetch-erika.sh v0.2.1
+        run: |
+          mkdir -p build
+          bash Packages/ErikaKit/Scripts/fetch-erika.sh v0.2.1 2>&1 | tee build/erika.log
 
       - name: Show Xcode version
         run: xcodebuild -version
@@ -118,8 +120,9 @@ jobs:
           {
             echo "run: $GITHUB_RUN_ID job: $GITHUB_JOB"
             echo "--- error lines ---"
-            grep -nE "error:|fatal error:|The following build commands failed|BUILD FAILED|No such file|xcodegen:|Could not resolve" build/xcodebuild-ios.log 2>/dev/null | tail -400
+            grep -nE "error:|fatal error:|The following build commands failed|BUILD FAILED|No such file|✗|xcodegen:|Could not resolve" build/erika.log build/xcodebuild-ios.log 2>/dev/null | tail -400
             echo "--- tail ---"
+            tail -120 build/erika.log 2>/dev/null
             tail -200 build/xcodebuild-ios.log 2>/dev/null
           } > ci-logs/ios.txt
           git config user.name "PlayerX CI"
@@ -152,7 +155,9 @@ jobs:
           key: erika-v0.2.1-${{ runner.os }}-${{ runner.arch }}
 
       - name: Fetch Erika playback kernel (FFmpeg + libass)
-        run: bash Packages/ErikaKit/Scripts/fetch-erika.sh v0.2.1
+        run: |
+          mkdir -p build
+          bash Packages/ErikaKit/Scripts/fetch-erika.sh v0.2.1 2>&1 | tee build/erika.log
 
       - name: Show Xcode version
         run: xcodebuild -version
@@ -233,8 +238,9 @@ jobs:
           {
             echo "run: $GITHUB_RUN_ID job: $GITHUB_JOB"
             echo "--- error lines ---"
-            grep -nE "error:|fatal error:|The following build commands failed|BUILD FAILED|No such file|xcodegen:|Could not resolve" build/xcodebuild-macos.log 2>/dev/null | tail -400
+            grep -nE "error:|fatal error:|The following build commands failed|BUILD FAILED|No such file|✗|xcodegen:|Could not resolve" build/erika.log build/xcodebuild-macos.log 2>/dev/null | tail -400
             echo "--- tail ---"
+            tail -120 build/erika.log 2>/dev/null
             tail -200 build/xcodebuild-macos.log 2>/dev/null
           } > ci-logs/macos.txt
           git config user.name "PlayerX CI"
