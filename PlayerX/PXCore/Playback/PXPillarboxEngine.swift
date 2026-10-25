@@ -45,7 +45,12 @@ final class PXPillarboxEngine: PXBasePlaybackEngine {
 
     override func load(url: URL, headers: [String: String], startAt: Double, autoplay: Bool) {
         autoPlay = autoplay
-        player.currentItem = .simple(url: url)
+        player.currentItem = PillarboxPlayback.makeItem(
+            url: url,
+            headers: headers,
+            identifier: url.absoluteString,
+            title: url.lastPathComponent
+        )
         player.becomeActive()
         #if os(iOS) || os(tvOS)
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback, options: [.allowAirPlay, .allowBluetooth])

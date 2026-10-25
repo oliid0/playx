@@ -18,6 +18,7 @@ final class PXAppState: ObservableObject {
     @Published var libraryDestination: PXCatalogSection?
 
     let catalog = PXCatalogService.shared
+    let sourceStore = PXSourceConfigurationStore.shared
     let metadata = PXMetadataCoordinator.shared
     let settings = PXAppSettings.shared
     let playerPreferences = PXPlayerPreferences.shared

@@ -10,6 +10,9 @@ import Foundation
 struct RemoteSourceProvider: ContentProvider {
     let sourceId: String
     let displayName: String
+    var sourceKind: PXSourceKind { .station }
+    var sourceSubtitle: String? { nil }
+    var configurationID: String? { nil }
 
     func categories() async throws -> [SourceCategory] {
         struct Response: Decodable { let items: [SourceCategory] }

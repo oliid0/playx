@@ -27,7 +27,7 @@ struct PXSourceCard: View {
                     Text(descriptor.displayName)
                         .font(PXFont.title(17))
                         .foregroundStyle(PXTheme.textPrimary)
-                    Text(PXCatalogService.sourceTagline(descriptor.id))
+                    Text(descriptor.subtitle ?? PXCatalogService.sourceTagline(descriptor.id))
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(PXTheme.textTertiary)
                         .lineLimit(1)

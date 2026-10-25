@@ -22,7 +22,8 @@ final class PXCatalogService {
         }
         let selected = settings.preferredSourceIDs
         if !selected.isEmpty {
-            sources = sources.filter { selected.contains($0.id) }
+            // 站源开关只过滤内置站源；用户显式添加的外部媒体源由配置的 enabled 控制。
+            sources = sources.filter { $0.isExternal || selected.contains($0.id) }
         }
         return sources
     }
@@ -248,6 +249,9 @@ final class PXCatalogService {
     }
 
     nonisolated static func sourceTagline(_ id: String) -> String {
+        if let descriptor = SourceRegistry.descriptor(for: id), descriptor.isExternal {
+            return descriptor.subtitle ?? descriptor.kind.title
+        }
         switch id {
         case "hongguo": "竖屏热播 · 每日更新"
         case "hanxiaoquan": "韩剧 / 韩综精选"

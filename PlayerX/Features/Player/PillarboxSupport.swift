@@ -111,6 +111,33 @@ enum PlayerXAssetProvider: URLAssetLoaderProvider {
 
 @MainActor
 enum PillarboxPlayback {
+    /// 外部媒体源（Emby / Jellyfin / WebDAV / MacCMS）的直链通常要带
+    /// Authorization / Referer。Pillarbox 的 `.simple` 不支持 header，这里复用
+    /// 同一套 custom URL scheme + resource loader。
+    static func makeItem(
+        url: URL,
+        headers: [String: String],
+        identifier: String,
+        title: String
+    ) -> PillarboxPlayer.PlayerItem {
+        guard !headers.isEmpty,
+              var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return .simple(url: url)
+        }
+        switch components.scheme {
+        case "https": components.scheme = "pxs"
+        case "http": components.scheme = "pxh"
+        default: return .simple(url: url)
+        }
+        guard let customURL = components.url else { return .simple(url: url) }
+        let metadata = AssetMetadata<PlayerXStreamData>(
+            identifier: identifier,
+            title: title,
+            customData: PlayerXStreamData(headers: headers)
+        )
+        return .custom(assetProviderType: PlayerXAssetProvider.self, url: customURL, metadata: metadata)
+    }
+
     static func makeItem(drama: Drama, chapter: Chapter?, plan: PlaybackPlan) -> PillarboxPlayer.PlayerItem? {
         guard let url = URL(string: plan.url) else { return nil }
         let metadata = AssetMetadata<PlayerXStreamData>(

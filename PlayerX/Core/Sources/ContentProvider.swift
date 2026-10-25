@@ -9,12 +9,25 @@ import Foundation
 /// 不重写这部分逻辑——跑通基础架构、真机测过内存情况后再和用户商量要不要把某个站源
 /// 改写成纯 Swift。
 protocol ContentProvider {
-    /// 对应 Go 侧 `source` 字段，如 `"hongguo"`。
+    /// 对应 Go 侧 `source` 字段；外部源使用配置 UUID。
     var sourceId: String { get }
     var displayName: String { get }
+    /// 源类型：站源 / Jellyfin / Emby / WebDAV / NAS / Alist / MacCMS。
+    var sourceKind: PXSourceKind { get }
+    /// 设置页和卡片上的补充说明。
+    var sourceSubtitle: String? { get }
+    /// 外部源配置 id；站源为 nil。
+    var configurationID: String? { get }
 
     func categories() async throws -> [SourceCategory]
     func catalog(category: String, page: Int, query: String?) async throws -> CatalogResult
     func detail(for drama: Drama) async throws -> DetailResult
     func resolve(drama: Drama, chapter: Chapter, index: Int, quality: Int?) async throws -> PlaybackPlan
+}
+
+extension ContentProvider {
+    var sourceKind: PXSourceKind { .station }
+    var sourceSubtitle: String? { nil }
+    var configurationID: String? { nil }
+    var supportsDownloads: Bool { sourceKind == .station }
 }

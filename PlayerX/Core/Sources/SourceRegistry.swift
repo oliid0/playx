@@ -8,6 +8,11 @@ struct SourceDescriptor: Identifiable {
     let defaultVisible: Bool
     var id: String { provider.sourceId }
     var displayName: String { provider.displayName }
+    var kind: PXSourceKind { provider.sourceKind }
+    var subtitle: String? { provider.sourceSubtitle }
+    var symbol: String { provider.sourceKind.symbol }
+    var isExternal: Bool { provider.sourceKind != .station }
+    var configurationID: String? { provider.configurationID }
 }
 
 /// 当前接入的全部站源。Go 核心编译时已经把所有站源都打进了 `DuanjuCore.xcframework`
@@ -17,7 +22,7 @@ struct SourceDescriptor: Identifiable {
 ///
 /// 站源 id 必须和 Go 侧 `provider_huangguo.go` 里的 `source*` 常量字符串完全一致。
 enum SourceRegistry {
-    static let all: [SourceDescriptor] = [
+    static let stationSources: [SourceDescriptor] = [
         .init(provider: RemoteSourceProvider(sourceId: "hongguo", displayName: "红果"), defaultVisible: true),
         .init(provider: RemoteSourceProvider(sourceId: "hanxiaoquan", displayName: "韩小圈"), defaultVisible: true),
         .init(provider: RemoteSourceProvider(sourceId: "guipian", displayName: "鬼片"), defaultVisible: true),
@@ -31,7 +36,16 @@ enum SourceRegistry {
         .init(provider: RemoteSourceProvider(sourceId: "cloudfront", displayName: "黄果旧版"), defaultVisible: false),
     ]
 
+    /// 内置站源 + 用户配置的外部媒体源。外部源快照由配置存储在保存后刷新。
+    static var all: [SourceDescriptor] {
+        stationSources + PXExternalSourceRegistry.descriptors
+    }
+
     static func descriptor(for sourceId: String) -> SourceDescriptor? {
         all.first { $0.id == sourceId }
+    }
+
+    @MainActor static func reloadExternalSources() {
+        PXExternalSourceRegistry.reload(PXSourceConfigurationStore.shared.configurations)
     }
 }
