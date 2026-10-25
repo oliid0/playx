@@ -57,7 +57,7 @@ final class PXPlayerModel: ObservableObject {
     var isPortraitVideo: Bool { snapshot.isPortraitVideo || request.drama.pxKind == .shortDrama }
     var selectedQuality: Int { plan.quality ?? request.preferredQuality ?? 0 }
     var qualityLabel: String {
-        selectedQuality > 0 ? PlaybackPreferences.qualityTitle(selectedQuality) : "自动"
+        selectedQuality > 0 ? PXFormat.quality(selectedQuality) : "自动"
     }
     var danmakuCount: Int { danmaku.comments.count }
 
@@ -158,6 +158,11 @@ final class PXPlayerModel: ObservableObject {
     func playPrevious() {
         guard hasPrevious else { return }
         Task { await loadEpisode(index: currentIndex - 1) }
+    }
+
+    func dismissNextPrompt() {
+        nextTask?.cancel()
+        showsNextPrompt = false
     }
 
     func playEpisode(_ index: Int) {

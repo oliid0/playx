@@ -14,7 +14,7 @@ struct PXFollowView: View {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(spacing: 7) {
                     chip(nil, title: "全部")
-                    chip(.wish, title: "想看")
+                    chip(.planned, title: "想看")
                     chip(.watching, title: "在看")
                     chip(.watched, title: "已看")
                 }

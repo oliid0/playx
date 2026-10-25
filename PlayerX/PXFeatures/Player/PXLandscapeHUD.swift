@@ -117,7 +117,7 @@ struct PXNextUpOverlay: View {
                         .buttonStyle(PXPrimaryButtonStyle(compact: true))
                 }
                 Button {
-                    model.showsNextPrompt = false
+                    model.dismissNextPrompt()
                 } label: {
                     Image(systemName: "xmark").font(.system(size: 10, weight: .bold))
                 }

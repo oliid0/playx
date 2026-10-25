@@ -128,6 +128,10 @@ targets:
       - path: PlayerXTV
         excludes:
           - "Info.plist"
+      - path: PlayerX/Core/Model/Models.swift
+      - path: PlayerX/PXCore/Models/PXDrama+Taxonomy.swift
+      - path: PlayerX/PXFeatures/Home/PXLogoMark.swift
+      - path: PlayerX/PXFeatures/Browse/PXFlowLayout.swift
       - path: PlayerX/PXCore/Models
         excludes:
           - "PXCatalogEntry.swift"
@@ -172,7 +176,6 @@ targets:
         ENABLE_PREVIEWS: NO
         SUPPORTS_MACCATALYST: NO
         ENABLE_USER_SCRIPT_SANDBOXING: NO
-        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: ""
 
 schemes:
   PlayerX:

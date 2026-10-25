@@ -19,9 +19,7 @@ actor PXBangumiClient {
             ]
             self.session = URLSession(configuration: configuration)
         }
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        self.decoder = decoder
+        self.decoder = JSONDecoder()
     }
 
     func calendar() async throws -> [PXBangumiCalendarDay] {

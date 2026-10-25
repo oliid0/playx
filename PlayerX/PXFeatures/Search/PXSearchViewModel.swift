@@ -26,9 +26,12 @@ final class PXSearchViewModel: ObservableObject {
         results = []
         task = Task { @MainActor [weak self] in
             guard let self else { return }
-            async let sourceTask = self.catalog.search(query: text, scope: self.scope)
-            async let tmdbTask: [PXTMDbSearchResult] = self.scope == .sources ? [] : self.metadata.searchMulti(query: text)
-            async let bangumiTask: [PXBangumiSubject] = (self.scope == .sources || self.scope == .tmdb)
+            let scope = self.scope
+            let catalog = self.catalog
+            let metadata = self.metadata
+            async let sourceTask = catalog.search(query: text, scope: scope)
+            async let tmdbTask: [PXTMDbSearchResult] = scope == .sources ? [] : metadata.searchMulti(query: text)
+            async let bangumiTask: [PXBangumiSubject] = (scope == .sources || scope == .tmdb)
                 ? [] : self.searchBangumi(text)
             let (sources, tmdb, bgm) = await (sourceTask, tmdbTask, bangumiTask)
             guard current == self.generation, !Task.isCancelled else { return }

@@ -31,6 +31,18 @@ enum PXFormat {
         return formatter.string(fromByteCount: max(0, value))
     }
 
+    static func quality(_ value: Int) -> String {
+        switch value {
+        case 0: return "自动"
+        case 2160: return "4K"
+        case 1440: return "2K"
+        case 1080: return "1080P"
+        case 720: return "720P"
+        case 480: return "480P"
+        default: return "\(value)P"
+        }
+    }
+
     static func rating(_ value: Double?) -> String {
         guard let value, value > 0 else { return "暂无评分" }
         return String(format: "%.1f", value)

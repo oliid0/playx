@@ -103,7 +103,7 @@ struct PXBangumiDetailView: View {
                                                 Text(episode.displayName)
                                                     .font(.system(size: 12, weight: .medium))
                                                     .foregroundStyle(PXTheme.textPrimary)
-                                                if let airdate = episode.airdate, !airdate.isEmpty {
+                                                if let airdate = episode.airDate, !airdate.isEmpty {
                                                     Text(PXFormat.airDate(airdate))
                                                         .font(.system(size: 9))
                                                         .foregroundStyle(PXTheme.textTertiary)

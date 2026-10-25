@@ -127,7 +127,7 @@ struct PXPlayerSettingsSheet: View {
                 Menu(model.qualityLabel) {
                     Button("自动") { Task { await model.changeQuality(0) } }
                     ForEach(model.plan.qualities ?? [], id: \.self) { q in
-                        Button(PlaybackPreferences.qualityTitle(q)) { Task { await model.changeQuality(q) } }
+                        Button(PXFormat.quality(q)) { Task { await model.changeQuality(q) } }
                     }
                 }
                 .font(.system(size: 12, weight: .semibold))

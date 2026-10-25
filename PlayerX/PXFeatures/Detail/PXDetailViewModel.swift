@@ -126,8 +126,8 @@ final class PXDetailViewModel: ObservableObject {
     func reloadMetadata() async {
         isLoadingMetadata = true
         defer { isLoadingMetadata = false }
-        let fresh = await metaCoordinator.refresh(drama: drama, metadata: metadata)
-            ?? await metaCoordinator.metadata(for: drama)
+        var fresh = await metaCoordinator.refresh(drama: drama, metadata: metadata)
+        if fresh == nil { fresh = await metaCoordinator.metadata(for: drama) }
         apply(metadata: fresh)
     }
 

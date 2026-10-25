@@ -41,7 +41,7 @@ struct PXMediaTechnicalInfo: Codable, Hashable, Sendable {
             info.fileSize = PXFormat.byteCount(size)
         }
         if let quality = plan?.quality, quality > 0 {
-            info.quality = PlaybackPreferences.qualityTitle(quality)
+            info.quality = PXFormat.quality(quality)
             info.resolution = "\(quality)P"
         }
         if let url = plan?.url.lowercased(), url.contains(".m3u8") {

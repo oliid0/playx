@@ -65,7 +65,7 @@ final class PXMetadataCoordinator: ObservableObject {
         } else {
             resolvedLink = await cache.link(for: drama.id)
         }
-        guard let link = resolvedLink else { return await metadata(for: drama) }
+        guard let link = resolvedLink else { return await self.metadata(for: drama) }
         do {
             let detail = try await client.detail(
                 tmdbID: link.0,

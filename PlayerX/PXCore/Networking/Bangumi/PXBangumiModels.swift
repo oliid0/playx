@@ -163,10 +163,9 @@ struct PXBangumiEpisode: Codable, Identifiable, Hashable, Sendable {
     var airDate: String?
     var duration: String?
     var desc: String?
-    var airdate: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, type, name, sort, ep, duration, desc, airdate
+        case id, type, name, sort, ep, duration, desc
         case nameCN = "name_cn"
         case airDate = "airdate"
     }
