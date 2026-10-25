@@ -114,6 +114,60 @@ targets:
         SWIFT_OBJC_BRIDGING_HEADER: PlayerX/Core/Bridge/PlayerX-Bridging-Header.h
         HEADER_SEARCH_PATHS: "$(SRCROOT)/native/build/macos/Headers"
 
+  PlayerX-tvOS:
+    type: application
+    platform: tvOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: PlayerXTV
+        excludes:
+          - "Info.plist"
+      - path: PlayerX/PXCore/Models
+        excludes:
+          - "PXCatalogEntry.swift"
+          - "PXCatalogFilter.swift"
+          - "PXCatalogSection.swift"
+          - "PXDrama+Taxonomy.swift"
+          - "PXHeroItem.swift"
+          - "PXHomeRail.swift"
+          - "PXMediaTechnicalInfo.swift"
+          - "PXPlaybackChapter.swift"
+          - "PXPlaybackRequest.swift"
+          - "PXPlaybackState.swift"
+          - "PXPlaybackTrack.swift"
+          - "PXPlayerSnapshot.swift"
+          - "PXSearchResult.swift"
+          - "PXSearchScope.swift"
+      - path: PlayerX/PXCore/Utilities
+      - path: PlayerX/PXCore/Networking/PXTMDbClient.swift
+      - path: PlayerX/PXCore/Networking/PXTMDbError.swift
+      - path: PlayerX/PXCore/Networking/PXTMDbMapper.swift
+      - path: PlayerX/PXCore/Networking/PXTMDbMatcher.swift
+      - path: PlayerX/PXCore/Networking/PXTMDbModels.swift
+      - path: PlayerX/PXCore/Networking/PXTMDbCache.swift
+      - path: PlayerX/PXCore/Networking/PXMetadataCoordinator.swift
+      - path: PlayerX/PXCore/Networking/Bangumi
+      - path: PlayerX/PXCore/Networking/MoviePilot
+      - path: PlayerX/PXCore/Networking/Danmaku
+      - path: PlayerX/PXDesign/Tokens
+      - path: PlayerX/PXDesign/Components
+    dependencies:
+      - package: Pillarbox
+        product: PillarboxPlayer
+      - sdk: Security.framework
+    settings:
+      base:
+        PRODUCT_NAME: PlayerX
+        PRODUCT_BUNDLE_IDENTIFIER: com.oliid0.playerx.tv
+        INFOPLIST_FILE: PlayerXTV/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        TARGETED_DEVICE_FAMILY: "3"
+        SWIFT_VERSION: "5.0"
+        ENABLE_PREVIEWS: NO
+        SUPPORTS_MACCATALYST: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: ""
+
 schemes:
   PlayerX:
     build:
@@ -132,6 +186,19 @@ schemes:
     build:
       targets:
         PlayerX-macOS: all
+    run:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
+
+  PlayerX-tvOS:
+    build:
+      targets:
+        PlayerX-tvOS: all
     run:
       config: Debug
     profile:

@@ -259,3 +259,94 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  tvos:
+    name: Apple TV · unsigned app
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Cache Swift Package Manager
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/org.swift.swiftpm
+            ~/Library/Developer/Xcode/DerivedData/**/SourcePackages
+          key: ${{ runner.os }}-spm-tv-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: |
+          mkdir -p build
+          xcodegen generate --spec project.yml 2>&1 | tee build/xcodegen-tvos.log
+
+      - name: Archive tvOS app (unsigned)
+        run: |
+          set -euo pipefail
+          defaults write com.apple.dt.Xcode IDESkipPackagePluginFingerprintValidatation -bool YES || true
+          defaults write com.apple.dt.Xcode IDESkipMacroFingerprintValidation -bool YES || true
+          xcodebuild clean archive \
+            -project "$XCODE_PROJECT" \
+            -scheme PlayerX-tvOS \
+            -configuration Release \
+            -destination 'generic/platform=tvOS' \
+            -archivePath build/PlayerX-tvOS.xcarchive \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            2>&1 | tee build/xcodebuild-tvos.log
+
+      - name: Package tvOS app
+        run: |
+          set -euo pipefail
+          APP="build/PlayerX-tvOS.xcarchive/Products/Applications/PlayerX.app"
+          test -d "$APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" build/PlayerX-tvOS.zip
+          ls -lh build/PlayerX-tvOS.zip
+
+      - name: Upload tvOS app
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlayerX-tvOS-unsigned
+          path: build/PlayerX-tvOS.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish tvOS failure log
+        if: failure()
+        run: |
+          set +e
+          mkdir -p ci-logs
+          {
+            echo "run: $GITHUB_RUN_ID job: $GITHUB_JOB"
+            echo "--- error lines ---"
+            grep -nE "error:|fatal error:|The following build commands failed|BUILD FAILED|No such file|✗|xcodegen:|Could not resolve" build/xcodegen-tvos.log build/xcodebuild-tvos.log 2>/dev/null | tail -500
+            echo "--- tail ---"
+            tail -220 build/xcodebuild-tvos.log 2>/dev/null
+          } > ci-logs/tvos.txt
+          git config user.name "PlayerX CI"
+          git config user.email "ci@playerx.local"
+          git checkout -B "ci-logs-tvos"
+          git add -f ci-logs/tvos.txt
+          git commit -m "ci: tvOS failure log [skip ci]"
+          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:ci-logs-tvos"
+
+      - name: Upload tvOS build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: PlayerX-tvOS-build-log
+          path: build/xcodebuild-tvos.log
+          if-no-files-found: ignore
+          retention-days: 7
