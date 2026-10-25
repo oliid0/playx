@@ -20,8 +20,9 @@ options:
   xcodeVersion: "27.0"
   projectFormat: xcode16_0
   deploymentTarget:
-    iOS: "16.0"
-    macOS: "13.0"
+    iOS: "17.0"
+    macOS: "14.0"
+    tvOS: "17.0"
 
 settings:
   base:
@@ -36,6 +37,8 @@ packages:
   Pillarbox:
     url: https://github.com/SRGSSR/pillarbox-apple.git
     branch: main
+  ErikaKit:
+    path: Packages/ErikaKit
 
 targets:
   PlayerX:
@@ -49,6 +52,8 @@ targets:
     dependencies:
       - package: Pillarbox
         product: PillarboxPlayer
+      - package: ErikaKit
+        product: ErikaKit
       - framework: native/build/DuanjuCore.xcframework
         embed: false
       - sdk: Security.framework
@@ -83,6 +88,8 @@ targets:
           - "Info.plist"
           - "Info-macOS.plist"
     dependencies:
+      - package: ErikaKit
+        product: ErikaKit
       - framework: native/build/DuanjuCore.xcframework
         embed: false
       - sdk: Security.framework
@@ -94,7 +101,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.oliid0.playerx.mac
         INFOPLIST_FILE: PlayerX/Info-macOS.plist
         GENERATE_INFOPLIST_FILE: NO
-        MACOSX_DEPLOYMENT_TARGET: "13.0"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
         COMBINE_HIDPI_IMAGES: YES
         ENABLE_HARDENED_RUNTIME: NO
         ENABLE_PREVIEWS: NO

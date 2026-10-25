@@ -1,222 +1,216 @@
 import SwiftUI
-import Combine
-import Foundation
 
-#if os(iOS)
-import UIKit
-#endif
-
-/// App 的四个一级页面。iPhone 用系统 TabView，iPad 常规宽度和 macOS 用侧边栏。
-/// 先用系统容器，不重写导航：iPad 分屏、macOS 窗口、键盘焦点、无障碍全都由系统负责。
-enum AppSection: String, CaseIterable, Identifiable, Hashable {
-    case home
-    case follow
-    case downloads
-    case me
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .home: return "发现"
-        case .follow: return "追剧"
-        case .downloads: return "下载"
-        case .me: return "设置"
-        }
-    }
-
-    var subtitle: String {
-        switch self {
-        case .home: return "推荐与站源"
-        case .follow: return "想看 / 在看 / 已看"
-        case .downloads: return "离线缓存"
-        case .me: return "播放、弹幕与数据"
-        }
-    }
-
-    var icon: String {
-        switch self {
-        case .home: return "sparkles.tv"
-        case .follow: return "heart.text.square"
-        case .downloads: return "arrow.down.circle"
-        case .me: return "gearshape"
-        }
+/// PlayerX 的新根视图。旧版 RootView 的导航逻辑已经迁到 `PXRootView`：
+/// iPhone / iPad 用底部 Tab，macOS 用侧边栏；播放器永远是根覆盖层，
+/// 因此详情页、Bangumi、MoviePilot 都可以直接起播，不会被 sheet 裁剪。
+struct RootView: View {
+    var body: some View {
+        PXRootView()
     }
 }
 
-struct RootView: View {
-    #if os(iOS)
-    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    #endif
-
-    @State private var showingSearch = false
-    @State private var showingOnboarding = false
-    @AppStorage("playerx.onboarding.completed.v1") private var onboardingCompleted = false
+struct PXRootView: View {
+    @StateObject private var app = PXAppState()
+    @ObservedObject private var settings = PXAppSettings.shared
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         Group {
             #if os(macOS)
-            SidebarShell()
+            macShell
             #else
-            if Platform.isPad && horizontalSizeClass == .regular {
-                SidebarShell()
-            } else {
-                PhoneTabShell()
-            }
+            phoneShell
             #endif
         }
-        .tint(.primary)
-        .sheet(isPresented: $showingSearch) {
-            GlobalSearchView()
+        .environmentObject(app)
+        .tint(PXTheme.accent)
+        .preferredColorScheme(.dark)
+        .sheet(isPresented: $app.searchPresented) {
+            PXGlobalSearchView()
+                .environmentObject(app)
         }
-        .sheet(isPresented: $showingOnboarding, onDismiss: { onboardingCompleted = true }) {
-            OnboardingView {
-                onboardingCompleted = true
-                showingOnboarding = false
+        .overlay(alignment: .top) {
+            if let toast = app.toast {
+                PXToast(message: toast)
+                    .padding(.top, PXPlatform.isMac ? 12 : 54)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                    .task(id: toast) {
+                        try? await Task.sleep(nanoseconds: 2_500_000_000)
+                        if !Task.isCancelled { app.toast = nil }
+                    }
             }
         }
-        .onAppear {
-            if !onboardingCompleted {
-                showingOnboarding = true
-            }
-        }
+        .animation(PXTheme.standard, value: app.toast)
         .onReceive(NotificationCenter.default.publisher(for: .playerXOpenSearch)) { _ in
-            showingSearch = true
+            app.searchPresented = true
         }
-    }
-}
-
-// MARK: - iPhone：系统 TabView
-
-#if os(iOS)
-private struct PhoneTabShell: View {
-    var body: some View {
-        TabView {
-            NavigationStack { HomeView() }
-                .tabItem { Label("发现", systemImage: "sparkles.tv") }
-
-            NavigationStack { FollowView() }
-                .tabItem { Label("追剧", systemImage: "heart.text.square") }
-
-            NavigationStack { DownloadsView() }
-                .tabItem { Label("下载", systemImage: "arrow.down.circle") }
-
-            NavigationStack { MeView() }
-                .tabItem { Label("设置", systemImage: "gearshape") }
+        .onOpenURL { app.handleDeepLink($0) }
+        #if os(iOS)
+        .fullScreenCover(item: $app.presentedPlayer) { request in
+            PXPlayerScreen(request: request)
+                .environmentObject(app)
         }
+        #else
+        .sheet(item: $app.presentedPlayer) { request in
+            PXPlayerScreen(request: request)
+                .environmentObject(app)
+                .frame(minWidth: 980, minHeight: 620)
+        }
+        #endif
     }
 
+    // MARK: - iPhone / iPad
 
-}
-#endif
+    @ViewBuilder
+    private var phoneShell: some View {
+        TabView(selection: Binding(
+            get: { app.selectedSection },
+            set: { app.select($0) }
+        )) {
+            NavigationStack {
+                PXHomeView()
+            }
+            .tabItem { Label(PXCatalogSection.home.title, systemImage: PXCatalogSection.home.symbol) }
+            .tag(PXCatalogSection.home)
 
-// MARK: - iPad 常规宽度 / macOS：侧边栏
+            NavigationStack {
+                PXLibraryLandingView()
+            }
+            .tabItem { Label(PXCatalogSection.library.title, systemImage: PXCatalogSection.library.symbol) }
+            .tag(PXCatalogSection.library)
 
-private struct SidebarShell: View {
-    @State private var selection: AppSection? = .home
+            if settings.bangumiEnabled {
+                NavigationStack {
+                    PXBangumiHomeView()
+                }
+                .tabItem { Label(PXCatalogSection.bangumi.title, systemImage: PXCatalogSection.bangumi.symbol) }
+                .tag(PXCatalogSection.bangumi)
+            }
 
-    var body: some View {
+            if settings.moviePilotEnabled {
+                NavigationStack {
+                    PXMoviePilotHomeView()
+                }
+                .tabItem { Label(PXCatalogSection.moviepilot.title, systemImage: PXCatalogSection.moviepilot.symbol) }
+                .tag(PXCatalogSection.moviepilot)
+            }
+
+            NavigationStack {
+                PXProfileView()
+            }
+            .tabItem { Label(PXCatalogSection.profile.title, systemImage: PXCatalogSection.profile.symbol) }
+            .tag(PXCatalogSection.profile)
+        }
+        .tint(PXTheme.accent)
+        .onChange(of: settings.bangumiEnabled) { enabled in
+            if !enabled, app.selectedSection == .bangumi { app.selectedSection = .home }
+        }
+        .onChange(of: settings.moviePilotEnabled) { enabled in
+            if !enabled, app.selectedSection == .moviepilot { app.selectedSection = .home }
+        }
+    }
+
+    // MARK: - macOS
+
+    #if os(macOS)
+    private var macShell: some View {
         NavigationSplitView {
-            SidebarView(selection: $selection)
-                .navigationSplitViewColumnWidth(min: 218, ideal: 244, max: 292)
+            PXMacSidebar(selection: Binding(
+                get: { app.selectedSection },
+                set: { app.select($0) }
+            ))
+            .navigationSplitViewColumnWidth(min: 218, ideal: 246, max: 300)
         } detail: {
             NavigationStack {
-                detail(for: selection ?? .home)
+                macDetail(for: app.selectedSection)
             }
         }
         .navigationSplitViewStyle(.balanced)
-        .background(AppTheme.background)
+        .background(PXTheme.background)
     }
 
     @ViewBuilder
-    private func detail(for section: AppSection) -> some View {
+    private func macDetail(for section: PXCatalogSection) -> some View {
         switch section {
-        case .home: HomeView()
-        case .follow: FollowView()
-        case .downloads: DownloadsView()
-        case .me: MeView()
+        case .home: PXHomeView()
+        case .movies, .series, .anime, .shorts, .variety, .documentary:
+            PXBrowseView(section: section)
+        case .library: PXLibraryLandingView()
+        case .bangumi: PXBangumiHomeView()
+        case .moviepilot: PXMoviePilotHomeView()
+        case .downloads: PXDownloadsView()
+        case .profile: PXProfileView()
         }
     }
+    #endif
 }
 
-private struct SidebarView: View {
-    @Binding var selection: AppSection?
+#if os(macOS)
+private struct PXMacSidebar: View {
+    @Binding var selection: PXCatalogSection
+    @ObservedObject private var settings = PXAppSettings.shared
+
+    private var sections: [PXCatalogSection] {
+        var values: [PXCatalogSection] = [.home, .library, .movies, .series, .anime, .shorts]
+        if settings.bangumiEnabled { values.append(.bangumi) }
+        if settings.moviePilotEnabled { values.append(.moviepilot) }
+        values.append(contentsOf: [.downloads, .profile])
+        return values
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            brandHeader
-            List(selection: $selection) {
-                Section {
-                    ForEach(AppSection.allCases) { section in
-                        Label {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(section.title)
-                                    .font(.system(size: 13, weight: .semibold))
-                                Text(section.subtitle)
-                                    .font(.system(size: 10, weight: .medium))
-                                    .foregroundStyle(AppTheme.textTertiary)
-                            }
-                        } icon: {
-                            Image(systemName: section.icon)
-                                .foregroundStyle(selection == section ? AppTheme.brand : AppTheme.textSecondary)
-                        }
-                        .padding(.vertical, 3)
-                        .tag(section)
-                    }
-                } header: {
-                    Text("浏览")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(AppTheme.textTertiary)
+            HStack(spacing: 10) {
+                PXLogoMark(size: 36)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("PlayerX")
+                        .font(.system(size: 15, weight: .heavy, design: .rounded))
+                        .foregroundStyle(PXTheme.textPrimary)
+                    Text("多站源影院")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(PXTheme.textTertiary)
                 }
-            }
-            #if os(macOS)
-            .listStyle(.sidebar)
-            #else
-            .listStyle(.insetGrouped)
-            #endif
-            .scrollContentBackground(.hidden)
-
-            sidebarFooter
-        }
-        .background(AppBackground())
-        .navigationTitle("PlayerX")
-    }
-
-    private var brandHeader: some View {
-        HStack(spacing: 11) {
-            AppMark(size: 42)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("PlayerX")
-                    .font(.system(size: 16, weight: .black, design: .rounded))
-                    .foregroundStyle(AppTheme.textPrimary)
-                Text("原生短剧播放器")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(AppTheme.textTertiary)
-            }
-            Spacer()
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 14)
-        .padding(.bottom, 12)
-    }
-
-    private var sidebarFooter: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Divider().overlay(AppTheme.stroke)
-            HStack(spacing: 6) {
-                Image(systemName: "airplayvideo")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(AppTheme.mint)
-                Text("AVPlayer 原生播放")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(AppTheme.textTertiary)
                 Spacer()
             }
-            Text("v\(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0")")
-                .font(.system(size: 9, weight: .medium, design: .monospaced))
-                .foregroundStyle(AppTheme.textTertiary.opacity(0.7))
+            .padding(.horizontal, 16)
+            .padding(.top, 14)
+            .padding(.bottom, 12)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(sections) { section in
+                        Button {
+                            selection = section
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: section.symbol)
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .frame(width: 20)
+                                Text(section.title)
+                                    .font(.system(size: 12, weight: .semibold))
+                                Spacer()
+                            }
+                            .foregroundStyle(selection == section ? PXTheme.accent : PXTheme.textSecondary)
+                            .padding(.horizontal, 12)
+                            .frame(height: 36)
+                            .background(
+                                selection == section ? PXTheme.accent.opacity(0.10) : .clear,
+                                in: RoundedRectangle(cornerRadius: 9)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 10)
+            }
+            Spacer()
+            Text("Pillarbox / Erika / AVPlayer")
+                .font(.system(size: 8, weight: .medium))
+                .foregroundStyle(PXTheme.textTertiary)
+                .padding(.bottom, 12)
         }
-        .padding(.horizontal, 16)
-        .padding(.bottom, 12)
+        .background(PXTheme.backgroundLift.opacity(0.42))
+        .navigationTitle("PlayerX")
     }
 }
+#endif

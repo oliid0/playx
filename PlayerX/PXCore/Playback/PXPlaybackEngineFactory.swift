@@ -1,0 +1,32 @@
+import SwiftUI
+
+enum PXPlaybackEngineFactory {
+    @MainActor
+    static func make(_ kind: PXPlayerEngineKind) -> (any PXPlaybackEngine)? {
+        switch kind {
+        case .pillarbox:
+            #if canImport(PillarboxPlayer)
+            return PXPillarboxEngine()
+            #else
+            return PXAVPlayerEngine()
+            #endif
+        case .erika:
+            #if canImport(ErikaKit)
+            let engine = PXErikaEngine()
+            if engine.snapshot.state != .failed("") { return engine }
+            return PXAVPlayerEngine()
+            #else
+            return PXAVPlayerEngine()
+            #endif
+        case .native:
+            return PXAVPlayerEngine()
+        }
+    }
+
+    @MainActor
+    static func resolve(_ requested: PXPlayerEngineKind) -> (any PXPlaybackEngine)? {
+        if let engine = make(requested) { return engine }
+        if requested != .native { return PXAVPlayerEngine() }
+        return nil
+    }
+}

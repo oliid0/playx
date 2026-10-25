@@ -51,6 +51,7 @@ struct PlayerXApp: App {
         #else
         WindowGroup {
             RootView()
+                .preferredColorScheme(.dark)
         }
         #endif
     }

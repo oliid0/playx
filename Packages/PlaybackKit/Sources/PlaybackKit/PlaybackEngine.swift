@@ -1,0 +1,271 @@
+import DiagnosticsKit
+import Foundation
+import SwiftUI
+
+/// 一个播放内核的统一接口。App 层只认这个协议，不认具体内核。
+///
+/// ## 边界画在哪
+///
+/// **画面承载的边界是「整个视图」（`makeSurfaceView()`），不是「layer + 每帧 tick」。**
+/// 这是唯一能同时容纳多种内核的粒度：当前 Erika 由宿主建 `CAMetalLayer` 并由
+/// 宿主经 `CADisplayLink` 驱动 `render_tick`。
+///
+/// 所以 attach / resize / detach / 帧驱动 / 呈现时间语义全部是**适配器内部实现**，
+/// 一个都不出现在这个协议里。连续 resize 合并、DPI 变化处理同理。
+///
+/// ## 刻意不放进协议的东西
+///
+/// - `close()`：Erika 的 close 是终态（close 后不能 reopen）。
+///   把它抽象出来只会把一个内核的地雷变成所有内核的地雷。要用就 downcast。
+/// - `audioOnlyTick()`：只有宿主驱动帧的内核需要，且 App 层从未调用过。
+/// - HDR output mode / EDR headroom / ArtCNN upscaler / 字幕样式覆盖 / 内存字体：
+///   Erika 有，App 从未使用。**抽象取交集，不取并集**——否则新适配器要写一堆空实现。
+///
+/// ## 线程约定
+///
+/// 协议**不要求**内核内部同步：串行化（如果需要）是适配器的责任。
+/// Erika 的句柄没有内部同步，`ErikaEngine` 用锁串起来。
+/// 调用方可以从任意线程调用本协议的方法。
+public protocol PlaybackEngine: AnyObject, Sendable {
+
+    // MARK: - 身份
+
+    /// 这个引擎实例对应的内核描述（设置页显示、诊断日志用）。
+    static var descriptor: PlaybackEngineDescriptor { get }
+
+    // MARK: - 事件与采样
+
+    /// 内核事件流。**单播**——由 `PlayerState` 独占消费。
+    var events: AsyncStream<PlayerEvent> { get }
+
+    /// 最近一次内核位置事件的媒体时间（任意线程可读）。
+    ///
+    /// App 层弹幕 overlay 用自己的采样时钟读它决定「谁该出场」：暂停 / 缓冲时
+    /// 媒体时间冻结，采样值跟着冻结。**适配器必须保证这个读取不会和渲染 / 解码
+    /// 抢同一把重锁**——overlay 是 30Hz 采样，被一整帧阻塞会表现成视频掉帧。
+    var latestMediaTime: Duration { get }
+
+    /// 最近一次的调试计数器快照（任意线程可读）。
+    var latestStats: PlaybackStats { get }
+
+    /// 内核当前的输出编码（SDR / Apple EDR / HDR10 PQ）。任意线程可读；
+    /// 内核没报或此刻不适用时为 `.unknown`。
+    /// ⚠️ 必须是协议要求（同 `hasRenderedFirstFrame` 的坑），扩展默认值恒 `.unknown`。
+    var latestOutputEncoding: PlaybackOutputEncoding { get }
+
+    /// 输出细节：面格式、回退原因、有效 headroom。`latestOutputEncoding` 报「是什么」，
+    /// 这里报「为什么」——排查「源是 HDR 却出 SDR / 8bit」时缺的就是后半句。
+    /// 任意线程可读；内核没报或此刻不适用时是 `PlaybackOutputSnapshot.unknown`。
+    /// ⚠️ 必须是协议要求（同 `latestOutputEncoding` 的坑）。
+    var latestOutputSnapshot: PlaybackOutputSnapshot { get }
+
+    /// 内核特有的原始诊断计数器（选填能力：默认空字典，表示「这个内核不提供」）。
+    ///
+    /// 供**诊断日志**落盘，不做 UI。字段名一律 snake_case、与内核的 C 字段同名，
+    /// 以便和内核自己的 stderr trace 对照。注意每个内核各报各的：某些字段在
+    /// 特定平台上恒为 0（例如 Erika 的 `audio_recovery_*` 只在 Windows / Android /
+    /// OHOS 后端实现，Apple 后端恒 stable），**不要拿它做平台无关的判断**。
+    func kernelDiagnosticsFields() -> [String: DiagnosticValue]
+
+    /// 运行时切换亮度上采样（画质增强）。不支持的引擎是空操作。
+    ///
+    /// 免抛：这是**提示性**能力——目标后端不支持时内核不会失败，而是保留原生
+    /// 亮度采样并报 `inactive`（用 `lumaUpscalerState` 查）。为此打断播放不划算。
+    func setLumaUpscaler(_ mode: PlaybackUpscalerMode)
+
+    /// 上采样当前的实际状态（`requested != .off && backend == .inactive` 表示已回落）。
+    /// ⚠️ 必须是协议要求（同 `latestOutputEncoding` 的坑），扩展默认值恒中性。
+    var lumaUpscalerState: PlaybackUpscalerState { get }
+
+    /// 宿主把显示器当前 EDR headroom（SDR 参考白的倍数：SDR 屏 ≈ 1.0，
+    /// 内置 XDR ≈ 8）推给内核。不感知显示器的内核靠它决定 HDR 源是否真出
+    /// EDR；换屏 / 显示配置变化时宿主要重推。非抛——提示性调用，失败不打断播放。
+    /// ⚠️ 必须是协议要求（同 `hasRenderedFirstFrame` 的坑），扩展默认空实现。
+    func updateDisplayEDRHeadroom(_ headroom: Double)
+
+    /// 首帧是否已经出画（播放 loading 覆盖层撤掉的判据）。
+    ///
+    /// ⚠️ **必须是协议要求，不能只放在扩展里**：调用点持有的是 `any PlaybackEngine`，
+    /// 扩展里的实现是静态派发，适配器的重写永远不会被调到。
+    /// 实测踩过：适配器重写了它，但通过协议调用时仍然走默认实现（恒 false），
+    /// loading 覆盖层永远不撤。
+    var hasRenderedFirstFrame: Bool { get }
+
+    /// 播放页调试行。同上——必须是协议要求才能被适配器重写。
+    func debugStatsLine() -> String
+
+    // MARK: - 画面
+
+    /// 造一个承载画面的 SwiftUI 视图。
+    ///
+    /// 调用方按引擎身份给它 `.id(...)`：换片会换引擎实例，SwiftUI 复用旧视图时
+    /// 新引擎不会 attach（无渲染循环 → 无状态事件 → UI 卡在 idle）。
+    @MainActor func makeSurfaceView() -> AnyView
+
+    // MARK: - 播放控制
+
+    func open(_ source: PlaybackSource) throws
+    /// open 返回后：本次 open 的成果是否已被让位（open 期间宿主请求过 stop /
+    /// surface 拆卸，引擎收尾已补 stop）。宿主据此跳过 play / 参数设置——
+    /// stop 之后 play 是合法的重播，不跳过会让已放弃的源幽灵出声。
+    /// ⚠️ 必须是协议要求（同 `hasRenderedFirstFrame` 的坑），扩展默认值恒 false。
+    var openWasInterrupted: Bool { get }
+    func play() throws
+    func pause() throws
+    func stop() throws
+    func seek(to position: Duration) throws
+    func setRate(_ rate: Double) throws
+    func setVolume(_ volume: Double) throws
+
+    // MARK: - 后台档位（可选能力）
+
+    /// 内核是否支持「后台仅音频推进」档位（`setBackgroundAudioOnly`）。
+    ///
+    /// `false` 时宿主进后台只能主动 `pause()`：进程被挂起后音频出口撑不过往返，
+    /// 回来只能重建。支持的内核（Erika）可以在后台继续出声，回前台无缝续上画面。
+    /// 设置页 / 播放器不直接读它，`PlaybackController` 据它选进后台的策略。
+    static var supportsBackgroundAudio: Bool { get }
+
+    /// 进后台（`true`）/ 回前台（`false`）切换帧驱动档位。
+    ///
+    /// `true`：宿主停掉画面帧驱动（后台没有 vsync，`CADisplayLink` 不会再来），
+    /// 改用定时器只推进音频；内核在这一档里**自行挂起视频解码**，避免解码会话
+    /// 跨挂起往返后把第一包数据喂炸。
+    /// `false`：切回画面帧驱动；内核在渲染帧里 flush 解码器 + 回关键帧恢复视频，
+    /// 因此切回时 **surface 必须已 attach 且尺寸 > 0**，否则视频会静默保持挂起。
+    ///
+    /// 非抛：这是提示性调用，失败不打断播放（内核侧只记日志）。
+    /// ⚠️ 必须是协议要求（同 `hasRenderedFirstFrame` 的坑），扩展默认空实现。
+    func setBackgroundAudioOnly(_ active: Bool)
+
+    // MARK: - 轨道与字幕
+
+    func tracks() throws -> [TrackInfo]
+    func selectAudioTrack(_ id: Int64) throws
+    /// `nil` 关闭字幕。
+    func selectSubtitleTrack(_ id: Int64?) throws
+    /// 外挂字幕（本地路径 / URL），返回新轨道 id。
+    @discardableResult func addExternalSubtitle(_ uri: String) throws -> Int64
+    /// 移除一条字幕轨（外挂字幕删掉后从轨道列表消失）。
+    ///
+    /// UI 的闸门是 `TrackInfo.canRemove`（默认 false）——不支持的引擎这里是空操作，
+    /// 无条件调用等于「点了没反应」，所以调用方必须先看 `canRemove`。
+    /// 内嵌轨内核不允许移除，`canRemove` 会是 false。
+    func removeSubtitleTrack(_ id: Int64) throws
+    /// 字幕整体缩放（1.0 = 默认字号）。
+    func setSubtitleScale(_ scale: Double) throws
+
+    /// 设置字幕外观（颜色 / 描边 / 位置 / 边距 / 加粗）。
+    ///
+    /// `overrides` 为**空**（默认）时这些值只是「填充脚本没指定的部分」——片源自带
+    /// 的 ASS 排版与特效字体原样保留；只有用户显式要求覆盖时，才把对应项变成替换。
+    /// 不做样式覆盖的内核是空操作。
+    func setSubtitleStyle(_ style: SubtitleStyle, overrides: SubtitleStyleOverrides)
+
+    /// 内核是否支持字幕外观设置。
+    ///
+    /// 设置页据此决定要不要提示「当前内核不支持，这些选项不会生效」——比按内核 id
+    /// 硬编码判断可靠（换内核 / 加内核时不会漏改），也让「支持」成为适配器自报的能力。
+    static var supportsSubtitleStyle: Bool { get }
+
+    // MARK: - 截图
+
+    /// 离屏截当前合成帧（视频 + 字幕，**不含弹幕**——内核的截图契约就是排除在屏评论），RGBA8。
+    /// 尺寸传视频物理分辨率。
+    func captureFrameRGBA(width: Int, height: Int) throws -> [UInt8]
+
+    // MARK: - 内核内置弹幕（可选能力）
+
+    /// 内核是否自带弹幕渲染器。
+    ///
+    /// `false` 时下面那组方法全部走本协议的默认空实现，适配器什么都不用写；
+    /// 设置页也据此隐藏「内核弹幕渲染」开关。App 层 overlay 路线不依赖这组能力。
+    static var supportsKernelDanmaku: Bool { get }
+
+    func clearDanmaku() throws
+    @discardableResult
+    func addDanmakuTrack(json: String, name: String, offset: Duration) throws -> UInt64
+    func danmakuTracks() throws -> [DanmakuTrackInfo]
+    func setDanmakuEnabled(_ enabled: Bool) throws
+    func danmakuConfig() throws -> DanmakuConfig
+    func setDanmakuConfig(_ config: DanmakuConfig) throws
+    func setDanmakuGlobalOffset(_ offset: Duration) throws
+}
+
+// MARK: - 默认实现
+
+public extension PlaybackEngine {
+
+    /// 实例侧的便捷读取（`type(of:).descriptor` 写起来太吵）。
+    var descriptor: PlaybackEngineDescriptor { Self.descriptor }
+    var supportsKernelDanmaku: Bool { Self.supportsKernelDanmaku }
+    var supportsSubtitleStyle: Bool { Self.supportsSubtitleStyle }
+
+    /// 不支持让位语义的内核：open 期间不存在让位，恒 false。
+    var openWasInterrupted: Bool { false }
+
+    /// 不暴露输出编码概念的内核：恒 `.unknown`，动态范围标注退回纯源侧判定。
+    var latestOutputEncoding: PlaybackOutputEncoding { .unknown }
+
+    /// 不暴露输出细节的内核：中性值。HUD 的「输出」行据此隐藏（而不是显示一行假数据）。
+    var latestOutputSnapshot: PlaybackOutputSnapshot { .unknown }
+
+    /// 不提供原始诊断计数器的内核：空字典，诊断日志里就没有这段字段。
+    func kernelDiagnosticsFields() -> [String: DiagnosticValue] { [:] }
+
+    /// 不做画质增强的内核：空操作 + 中性状态（设置页据此不显示增强项）。
+    func setLumaUpscaler(_ mode: PlaybackUpscalerMode) {}
+    var lumaUpscalerState: PlaybackUpscalerState { .unknown }
+
+    /// 不接收显示器 headroom 更新的内核：空操作。headroom 只由创建参数决定
+    /// （或内核自己探测显示器）。
+    func updateDisplayEDRHeadroom(_ headroom: Double) {}
+
+    /// 不支持这个档位的内核：空操作。它们的音频输出不靠宿主驱动帧，
+    /// 进后台的行为由 `PlaybackController` 退回「主动暂停」承担。
+    func setBackgroundAudioOnly(_ active: Bool) {}
+
+    /// 没有后台档的内核（默认）。
+    static var supportsBackgroundAudio: Bool { false }
+
+    /// 不支持轨移除的内核（默认）：空操作。调用方按 `TrackInfo.canRemove` 决定
+    /// 要不要给用户这个入口，所以这里的静默不会有「点了没反应」的观感。
+    func removeSubtitleTrack(_ id: Int64) throws {}
+
+    /// 不做字幕外观覆盖的内核：空操作（设置页会按 `supportsSubtitleStyle` 给出提示，
+    /// 但那本来就是**可选能力**，不该逼所有内核实现）。
+    func setSubtitleStyle(_ style: SubtitleStyle, overrides: SubtitleStyleOverrides) {}
+
+    /// 不支持字幕外观设置的内核（默认）。
+    static var supportsSubtitleStyle: Bool { false }
+
+    /// 首帧是否已经出画。播放 loading 覆盖层撤掉的判据——
+    /// 内核报了 ready 不代表屏幕上有东西，必须等真正渲染过一帧，
+    /// 否则 loading 撤得太早会露出黑屏（两段式等待）。
+    var hasRenderedFirstFrame: Bool { latestStats.renderedVideoFrames >= 1 }
+
+    /// 播放页调试行。列固定，拿不到的内核填 0。
+    func debugStatsLine() -> String {
+        let s = latestStats
+        return """
+        解码 \(s.decodedVideoFrames) · 渲染 \(s.renderedVideoFrames) · \
+        硬解 \(s.hardwareVideoFrames) · 软解 \(s.softwareVideoFrames) · \
+        零拷贝 \(s.zeroCopyVideoFrames) · 音频 \(s.pushedAudioFrames) · \
+        渲染失败 \(s.renderFailures) · 音频失败 \(s.audioFailures)
+        """
+    }
+
+    // 没有内核弹幕的引擎：全部安静地什么都不做。
+    // 故意不抛错——调用点（`PlaybackController`）在 overlay 路线下也会顺手调
+    // `clearDanmaku()` 保证内核轨道为空，那条路径上抛错只会产生噪音。
+    static var supportsKernelDanmaku: Bool { false }
+
+    func clearDanmaku() throws {}
+    @discardableResult
+    func addDanmakuTrack(json: String, name: String, offset: Duration) throws -> UInt64 { 0 }
+    func danmakuTracks() throws -> [DanmakuTrackInfo] { [] }
+    func setDanmakuEnabled(_ enabled: Bool) throws {}
+    func danmakuConfig() throws -> DanmakuConfig { DanmakuConfig() }
+    func setDanmakuConfig(_ config: DanmakuConfig) throws {}
+    func setDanmakuGlobalOffset(_ offset: Duration) throws {}
+}

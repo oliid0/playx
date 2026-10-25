@@ -31,6 +31,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Restore Erika kernel cache
+        uses: actions/cache@v4
+        with:
+          path: Packages/ErikaKit/Vendor/downloads
+          key: erika-v0.2.1-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Fetch Erika playback kernel (FFmpeg + libass)
+        run: bash Packages/ErikaKit/Scripts/fetch-erika.sh v0.2.1
+
       - name: Show Xcode version
         run: xcodebuild -version
 
@@ -115,6 +124,15 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+
+      - name: Restore Erika kernel cache
+        uses: actions/cache@v4
+        with:
+          path: Packages/ErikaKit/Vendor/downloads
+          key: erika-v0.2.1-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Fetch Erika playback kernel (FFmpeg + libass)
+        run: bash Packages/ErikaKit/Scripts/fetch-erika.sh v0.2.1
 
       - name: Show Xcode version
         run: xcodebuild -version

@@ -1,0 +1,69 @@
+import DiagnosticsKit
+import Foundation
+
+/// 播放链路日志入口（内核适配器 + App 播放层共用）。
+///
+/// 基于 `DiagnosticsKit`：JSONL 落盘（`~/Library/Logs/OcPlayer/diagnostics.jsonl`，
+/// 单文件 20 MB / 保留 10 份 / 总量 50 MB / 30 天）+ OSLog 镜像。所有播放相关模块（PlaybackKit / 各内核适配器 /
+/// App 层）都往同一个文件追加，时间线上无缝；token / Authorization 头等敏感字段
+/// 由 DiagnosticsKit 统一脱敏，不进任何 sink。
+public enum PlaybackLog {
+    private static let logger = DiagnosticLogger(subsystem: "dev.jumusu.OcPlayer", category: "Playback")
+
+    public static var fileURL: URL { logger.fileURL }
+
+    /// 等所有排队的 JSONL 写盘完成（App 退出前调用，别让最后几条丢）。
+    ///
+    /// ⚠️ **无界版本，进程终止路径别用它** —— 用下面的 `flush(timeout:)`。
+    public static func flush() {
+        logger.flush()
+    }
+
+    /// 有界等待版 flush（进程终止路径用）：先把各节流键的抑制计数汇总落盘，再排空。
+    ///
+    /// **只 flush `AppDiagnostics` 不够**：抑制计数存在**各自的** `DiagnosticLogger`
+    /// 实例里（两个实例共用同一个文件 backend，但 `throttles` 各一份），而 App 退出
+    /// 时只调了 `AppDiagnostics.flush(timeout:)`。于是本文件此前根本没有调用点，
+    /// Playback 侧所有节流键的 `suppressed=N` 一直是丢的 —— 「render_tick 失败了多少
+    /// 次」查不到，只看得到首条。加节流前必须先补上这条，否则节流等于把 59/60 的证据
+    /// 悄悄扔掉。
+    @discardableResult
+    public static func flush(timeout: TimeInterval) -> Bool {
+        logger.flush(timeout: timeout)
+    }
+
+    /// 追加一条 debug 级链路日志（守卫拒绝、中间态；默认档被最低级别过滤，
+    /// 排障时在设置页打开「详细日志」可见）。
+    public static func append(_ message: @autoclosure () -> String) {
+        logger.debug(message())
+    }
+
+    /// 追加一条 info 级日志（状态迁移 / 一次操作的结果这类默认档必须可见的记录）。
+    public static func info(_ message: @autoclosure () -> String, fields: [String: DiagnosticValue] = [:]) {
+        logger.info(message(), fields: fields)
+    }
+
+    /// 追加一条 warning 级日志（值得注意但非致命，如弹幕爆发补发、续播定位失败）。
+    public static func warning(_ message: @autoclosure () -> String, fields: [String: DiagnosticValue] = [:]) {
+        logger.warning(message(), fields: fields)
+    }
+
+    /// 追加一条 error 级日志（渲染线程 / 内核错误事件这类真正要捞出来的）。
+    public static func error(_ message: @autoclosure () -> String,
+                             fields: [String: DiagnosticValue] = [:],
+                             throttle: DiagnosticThrottle? = nil) {
+        logger.error(message(), fields: fields, throttle: throttle)
+    }
+
+    /// 记一条播放生命周期事件（名字与字段约定见 `PlaybackEvent`）。
+    ///
+    /// message 固定 `播放事件 <name>`，字段必带 `event=<name>`；排障时按
+    /// `"event":"buffer.start"` 直接过滤，就能把一次播放的时间线拉直。
+    public static func event(_ event: PlaybackEvent,
+                             fields: [String: DiagnosticValue] = [:],
+                             level: DiagnosticLevel = .info) {
+        var payload = fields
+        payload["event"] = .string(event.rawValue)
+        logger.log(level: level, "播放事件 \(event.rawValue)", fields: payload)
+    }
+}

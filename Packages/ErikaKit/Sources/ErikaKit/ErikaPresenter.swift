@@ -1,0 +1,252 @@
+import CErika
+import Foundation
+import PlaybackKit
+
+/// Erika 内核的错误。`ErikaStatus` 非 Ok/NoEvent 时，内核把可读信息写在**线程局部**槽位里，
+/// 必须在发生错误的那条线程上立即读取。
+public struct ErikaError: Error, CustomStringConvertible {
+    public let status: ErikaStatus
+    public let message: String?
+
+    public var description: String {
+        "ErikaError(status: \(status.rawValue)\(message.map { ", \($0)" } ?? ""))"
+    }
+
+    /// 读取并清空当前线程的最后一条内核错误信息。
+    static func takeLastMessage() -> String? {
+        guard let raw = erika_last_error_message() else { return nil }
+        defer { erika_string_free(raw) }
+        let text = String(cString: raw)
+        return text.isEmpty ? nil : text
+    }
+
+    static func check(_ status: ErikaStatus) throws {
+        guard status != ErikaStatus_Ok, status != ErikaStatus_NoEvent else { return }
+        throw ErikaError(status: status, message: takeLastMessage())
+    }
+}
+
+/// 一个 `ErikaPresenterHandle` 的持有者。
+///
+/// 内核句柄**没有内部同步**：同一 handle 的所有调用必须串行。本类型只负责生命周期与
+/// 逐个 C 调用的薄封装，串行化与显示回调驱动由 `ErikaEngine` 负责，
+/// 因此这里刻意不声明 `Sendable`。
+public final class ErikaPresenter {
+    let handle: OpaquePointer
+
+    /// 创建 presenter。失败时抛错，原因取自内核的线程局部错误槽。
+    public init(outputMode: ErikaPresenterOutputMode = ErikaPresenterOutputMode_Auto,
+                edrHeadroom: Float = 0,
+                upscaler: PlaybackUpscalerMode = .off) throws {
+        let config = ErikaPresenterConfig(
+            output_mode: Int32(outputMode.rawValue),
+            edr_headroom: edrHeadroom,
+            luma_upscaler: Int32(upscaler.erikaValue.rawValue),
+            // v0.1.7+dolby.2 新增（透明视频合成）；普通播放固定不透明。
+            video_alpha_mode: Int32(ErikaVideoAlphaMode_Opaque.rawValue)
+        )
+        guard let handle = erika_presenter_create_with_config(config) else {
+            throw ErikaError(status: ErikaStatus_PlayerError, message: ErikaError.takeLastMessage())
+        }
+        self.handle = handle
+    }
+
+    deinit {
+        erika_presenter_destroy(handle)
+    }
+
+    // MARK: - 媒体
+
+    /// 打开媒体源。`headers` 非空或 `readAheadBytes`/`backBufferBytes` 非空时走
+    /// `open_with_options`（两个字段都只影响 HTTP(S) 源：`readAheadBytes` 是前向
+    /// 预取窗口、`backBufferBytes` 是回退预算，0/nil = 内核默认）。
+    public func open(_ source: PlaybackSource) throws {
+        guard !source.headers.isEmpty || source.readAheadBytes != nil || source.backBufferBytes != nil else {
+            try ErikaError.check(erika_presenter_open(handle, source.uri))
+            return
+        }
+        // C 侧要求 header 数组与 options 结构在调用期间存活：先把所有键值转成
+        // C 字符串，调完再释放。
+        var owned: [UnsafeMutablePointer<CChar>] = []
+        defer { owned.forEach { free($0) } }
+        func dup(_ text: String) -> UnsafePointer<CChar> {
+            let copy = strdup(text)!
+            owned.append(copy)
+            return UnsafePointer(copy)
+        }
+        let raw = source.headers.map { ErikaHttpHeader(name: dup($0.key), value: dup($0.value)) }
+        try raw.withUnsafeBufferPointer { buffer in
+            var options = ErikaOpenOptions(
+                headers: buffer.baseAddress,
+                header_count: UInt(buffer.count),
+                http_read_ahead_bytes: source.readAheadBytes ?? 0,
+                http_back_buffer_bytes: source.backBufferBytes ?? 0,
+                reserved: (0, 0)
+            )
+            try withUnsafePointer(to: &options) { optionsPtr in
+                try ErikaError.check(
+                    erika_presenter_open_with_options(handle, source.uri, optionsPtr)
+                )
+            }
+        }
+    }
+
+    public func play() throws { try ErikaError.check(erika_presenter_play(handle)) }
+    public func pause() throws { try ErikaError.check(erika_presenter_pause(handle)) }
+    public func stop() throws { try ErikaError.check(erika_presenter_stop(handle)) }
+    public func close() throws { try ErikaError.check(erika_presenter_close(handle)) }
+
+    public func seek(to position: Duration) throws {
+        let micros = max(0, position.microseconds)
+        try ErikaError.check(erika_presenter_seek(handle, UInt64(micros)))
+    }
+
+    public func setRate(_ rate: Double) throws {
+        try ErikaError.check(erika_presenter_set_playback_rate(handle, rate))
+    }
+
+    public func setVolume(_ volume: Double) throws {
+        try ErikaError.check(erika_presenter_set_volume(handle, min(max(volume, 0), 1)))
+    }
+
+    // MARK: - 画面承载
+
+    /// `layer` 是 `CAMetalLayer` 的裸指针；尺寸传**物理像素**，`scale` 传 backingScaleFactor。
+    public func attachMetalLayer(_ layer: UInt64, pixelWidth: Int, pixelHeight: Int, scale: Double) throws {
+        try ErikaError.check(
+            erika_presenter_attach_metal_layer(handle, layer, UInt32(pixelWidth), UInt32(pixelHeight), scale)
+        )
+    }
+
+    /// 尺寸 / DPI 变化后必须在下一次 tick **之前**调用。
+    public func resizeSurface(pixelWidth: Int, pixelHeight: Int, scale: Double) throws {
+        try ErikaError.check(
+            erika_presenter_resize_surface(handle, UInt32(pixelWidth), UInt32(pixelHeight), scale)
+        )
+    }
+
+    public func detachSurface() throws {
+        try ErikaError.check(erika_presenter_detach_surface(handle))
+    }
+
+    // MARK: - 帧驱动与事件
+
+    /// `presentationTime` 必须是该帧的**绝对呈现时间**（秒，`CACurrentMediaTime` 同源），不是 delta。
+    @discardableResult
+    public func renderTick(at presentationTime: Double) throws -> ErikaPresenterStats {
+        try renderTick(at: presentationTime, presentationDelay: nil)
+    }
+
+    /// 带「到显示目标的延迟」的帧推进（`render_tick_with_timing`）。
+    ///
+    /// `presentationDelay` 是 `CADisplayLink.targetTimestamp - CACurrentMediaTime()`：
+    /// 视频、字幕与渲染上下文都按**同一个显示目标时刻**采样播放快照，渲染繁忙时
+    /// 三者不会各采各的时间点。传 nil 等价于 `render_tick`（内核保留的旧语义）。
+    ///
+    /// ⚠️ 值必须是有限数且落在 ±0.25 s 内（`erika.h` 的硬约束）；调用方
+    /// （`RenderLoop.sanitizedPresentationDelay`）已经先夹过，这里不再重复校验。
+    @discardableResult
+    public func renderTick(at presentationTime: Double,
+                           presentationDelay: Double?) throws -> ErikaPresenterStats {
+        var stats = ErikaPresenterStats()
+        guard let presentationDelay else {
+            try ErikaError.check(erika_presenter_render_tick(handle, presentationTime, &stats))
+            return stats
+        }
+        // 内核只借用指针，且在开工前就把值拷走（`erika.h`：no pointer is retained），
+        // 所以这里的 inout 指针生命周期到调用结束为止即可。
+        var delay = presentationDelay
+        try withUnsafePointer(to: &delay) { pointer in
+            try ErikaError.check(
+                erika_presenter_render_tick_with_timing(handle, presentationTime, pointer, &stats)
+            )
+        }
+        return stats
+    }
+
+    /// 没有画面（窗口隐藏 / 纯音频）时推进音频。
+    @discardableResult
+    public func audioOnlyTick() throws -> ErikaPresenterStats {
+        var stats = ErikaPresenterStats()
+        try ErikaError.check(erika_presenter_audio_only_tick(handle, &stats))
+        return stats
+    }
+
+    /// 当前播放统计。
+    public func stats() throws -> ErikaPresenterStats {
+        var stats = ErikaPresenterStats()
+        try ErikaError.check(erika_presenter_get_stats(handle, &stats))
+        return stats
+    }
+
+    /// 内核渲染内存分项（视频帧 / 弹幕图集 / 顶点缓冲 / device 等）。诊断用。
+    public func resourceStatus() throws -> ErikaPresenterResourceStatus {
+        var status = ErikaPresenterResourceStatus()
+        try ErikaError.check(erika_presenter_get_resource_status(handle, &status))
+        return status
+    }
+
+    /// 内核输出状态：当前实际生效的输出编码（SDR / Apple EDR / HDR10 PQ）等。
+    /// 动态范围标注用它区分「源是 HDR 但输出端已被映射成 SDR」和「真的在出 HDR」。
+    public func outputStatus() throws -> ErikaOutputStatus {
+        var status = ErikaOutputStatus()
+        try ErikaError.check(erika_presenter_get_output_status(handle, &status))
+        return status
+    }
+
+    /// 运行时切换亮度上采样档位（创建 config 之外的第二个入口）。
+    /// 目标后端不支持时不报错：内核保留原生亮度采样，状态里报 `inactive`。
+    public func setUpscaler(_ mode: PlaybackUpscalerMode) throws {
+        try ErikaError.check(erika_presenter_set_upscaler(handle, Int32(mode.erikaValue.rawValue)))
+    }
+
+    /// 上采样后端状态：请求了什么、实际跑在什么上、回退过几次、已上采样多少帧。
+    public func upscalerStatus() throws -> PlaybackUpscalerState {
+        var status = ErikaUpscalerStatus()
+        try ErikaError.check(erika_presenter_get_upscaler_status(handle, &status))
+        return PlaybackUpscalerState(status)
+    }
+
+    /// 推送显示器 EDR headroom（SDR 参考白的倍数）。`known: false` 表示宿主
+    /// 不知道显示器能力，内核回落默认。注意 macOS Metal 后端当前未实现运行时
+    /// 更新（调用成功但无效），headroom 实际生效点在创建 config 的 `edr_headroom`；
+    /// 内核侧补齐 `set_output_headroom` 后本调用即生效。
+    public func setOutputHeadroom(_ headroom: Float, known: Bool = true) throws {
+        try ErikaError.check(erika_presenter_set_output_headroom(handle, headroom, known))
+    }
+
+    /// 字幕外观。`override_mask == 0` 时这些值只用来填脚本没指定的部分
+    /// （ASS 自带排版与特效字体保留）；置了位才是替换。
+    public func setSubtitleStyle(_ style: ErikaSubtitleStyle) throws {
+        try ErikaError.check(erika_presenter_set_subtitle_style(handle, style))
+    }
+
+    /// 离屏截当前合成帧（视频 + 字幕，**不含弹幕**），RGBA8。没有可用帧时内核会报错。
+    ///
+    /// 弹幕是刻意排除的（`erika.h` 的 `capture_frame_rgba` 注释：截图代表视频本身，
+    /// 而不是一闪而过的在屏评论）。宽高独立于 surface——想按源分辨率出图就传视频的
+    /// 物理分辨率，不必等于窗口尺寸。此前的行注释写成「视频 + 字幕 + 弹幕」，
+    /// 与内核契约相反，已按 erika.h 更正。
+    /// 后续「截图」功能直接用它；测试里也用它证明画面真的解出来了。
+    public func captureFrameRGBA(width: Int, height: Int) throws -> [UInt8] {
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        try pixels.withUnsafeMutableBufferPointer { buffer in
+            try ErikaError.check(
+                erika_presenter_capture_frame_rgba(handle, UInt32(width), UInt32(height),
+                                                   buffer.baseAddress, UInt(buffer.count))
+            )
+        }
+        return pixels
+    }
+
+    /// 取一条事件；返回 `nil` 表示队列已空（内核给 `NoEvent`）。事件是**轮询**模型，没有回调。
+    public func pollEvent() throws -> PlayerEvent? {
+        var raw = ErikaEvent()
+        let status = erika_presenter_poll_event(handle, &raw)
+        if status == ErikaStatus_NoEvent { return nil }
+        try ErikaError.check(status)
+        if raw.kind == ErikaEventKind_None { return nil }
+        // 错误信息必须在当前线程取，所以在这里就地读掉。
+        return PlayerEvent(raw, errorMessage: ErikaError.takeLastMessage())
+    }
+}
