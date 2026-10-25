@@ -11,15 +11,15 @@ enum PXDanmakuError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .notConfigured: "弹幕网关未配置"
-        case .unauthorized: "弹幕网关校验失败"
-        case .rateLimited: "弹幕请求过于频繁"
-        case .noMatch: "没有找到匹配的弹幕"
+        case .notConfigured: return "弹幕网关未配置"
+        case .unauthorized: return "弹幕网关校验失败"
+        case .rateLimited: return "弹幕请求过于频繁"
+        case .noMatch: return "没有找到匹配的弹幕"
         case .status(let code, let message):
             if let message, !message.isEmpty { return "弹幕 HTTP \(code)：\(message)" }
             return "弹幕 HTTP \(code)"
-        case .decoding: "弹幕响应无法解析"
-        case .transport(let message): message
+        case .decoding: return "弹幕响应无法解析"
+        case .transport(let message): return message
         }
     }
 }

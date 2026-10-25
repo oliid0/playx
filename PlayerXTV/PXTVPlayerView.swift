@@ -34,6 +34,5 @@ struct PXTVPlayerView: View {
             player.resignActive()
         }
         .onExitCommand { dismiss() }
-        .persistentSystemOverlays(.hidden)
     }
 }

@@ -9,13 +9,13 @@ enum PXHTTPError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .invalidURL: "地址无效"
+        case .invalidURL: return "地址无效"
         case .status(let code, let message):
             if let message, !message.isEmpty { return "HTTP \(code)：\(message)" }
             return "HTTP \(code)"
-        case .transport(let message): message
-        case .decoding(let message): "响应解析失败：\(message)"
-        case .cancelled: "请求已取消"
+        case .transport(let message): return message
+        case .decoding(let message): return "响应解析失败：\(message)"
+        case .cancelled: return "请求已取消"
         }
     }
 }

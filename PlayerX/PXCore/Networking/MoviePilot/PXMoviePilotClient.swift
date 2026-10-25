@@ -9,13 +9,13 @@ enum PXMoviePilotError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .notConfigured: "MoviePilot 未配置"
-        case .unauthorized: "MoviePilot 登录已失效"
+        case .notConfigured: return "MoviePilot 未配置"
+        case .unauthorized: return "MoviePilot 登录已失效"
         case .status(let code, let message):
             if let message, !message.isEmpty { return "MoviePilot HTTP \(code)：\(message)" }
             return "MoviePilot HTTP \(code)"
-        case .decoding: "MoviePilot 响应无法解析"
-        case .transport(let message): message
+        case .decoding: return "MoviePilot 响应无法解析"
+        case .transport(let message): return message
         }
     }
 }
