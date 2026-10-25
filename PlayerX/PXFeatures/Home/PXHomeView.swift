@@ -198,7 +198,7 @@ struct PXHomeView: View {
                     symbol: rail.symbol,
                     actionTitle: rail.seeAllSection == nil ? nil : "查看全部",
                     action: rail.seeAllSection.map { section in
-                        { app.selectedSection = section }
+                        { app.select(section) }
                     }
                 )
                 .padding(.horizontal, PXTheme.padding(for: width))

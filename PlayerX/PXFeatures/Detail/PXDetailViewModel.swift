@@ -118,7 +118,7 @@ final class PXDetailViewModel: ObservableObject {
         let meta = await metadataTask
         apply(metadata: meta)
         isLoading = false
-        if let meta, meta.seasons.count > 1 {
+        if let meta, !meta.seasons.isEmpty {
             await loadSeason(meta.seasons.first(where: { $0.seasonNumber > 0 })?.seasonNumber ?? meta.seasons[0].seasonNumber)
         }
     }

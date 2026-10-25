@@ -22,14 +22,14 @@ struct PXDanmakuOverlay: View {
             ZStack(alignment: .topLeading) {
                 ForEach(active) { item in
                     if item.isFixed {
-                        FixedDanmakuLine(text: item.text, color: item.color, fontSize: 16)
+                        FixedDanmakuLine(text: item.text, color: item.color, fontSize: CGFloat(PXPlayerPreferences.shared.danmakuFontSize))
                             .frame(maxWidth: .infinity)
                             .offset(y: CGFloat(item.lane) * 32 + 58)
                     } else {
                         ScrollingDanmakuLine(
                             text: item.text,
                             color: item.color,
-                            fontSize: 16,
+                            fontSize: CGFloat(PXPlayerPreferences.shared.danmakuFontSize),
                             travelWidth: proxy.size.width,
                             duration: PXPlayerPreferences.shared.danmakuSpeed
                         )

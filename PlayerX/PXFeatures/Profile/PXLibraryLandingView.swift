@@ -1,5 +1,22 @@
 import SwiftUI
 
+struct PXLibraryRootView: View {
+    @EnvironmentObject private var app: PXAppState
+
+    var body: some View {
+        if let destination = app.libraryDestination {
+            PXBrowseView(section: destination)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("片库") { app.libraryDestination = nil }
+                    }
+                }
+        } else {
+            PXLibraryLandingView()
+        }
+    }
+}
+
 struct PXLibraryLandingView: View {
     @EnvironmentObject private var app: PXAppState
     @State private var featured: [PXCatalogEntry] = []

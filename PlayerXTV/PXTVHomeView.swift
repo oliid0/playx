@@ -3,6 +3,7 @@ import SwiftUI
 struct PXTVHomeView: View {
     @EnvironmentObject private var app: PXTVAppState
     @State private var heroIndex = 0
+    @State private var streamTitle: String?
 
     var body: some View {
         ScrollView(.vertical, showsIndicators: false) {
@@ -11,7 +12,9 @@ struct PXTVHomeView: View {
                     PXTVLoadingView(text: "正在拉取 TMDB 推荐")
                         .frame(height: 460)
                 } else if !app.hero.isEmpty {
-                    PXTVHeroView(items: app.hero, index: $heroIndex)
+                    PXTVHeroView(items: app.hero, index: $heroIndex) { media in
+                        streamTitle = media.title
+                    }
                 } else {
                     PXTVEmptyView(title: "暂时没有推荐", message: app.errorMessage ?? "检查网络后重试。", symbol: "tv.slash")
                 }
@@ -24,13 +27,26 @@ struct PXTVHomeView: View {
             .padding(.bottom, 60)
         }
         .task { await app.loadHomeIfNeeded() }
+        .sheet(item: Binding(
+            get: { streamTitle.map(PXTVStreamTitle.init) },
+            set: { streamTitle = $0?.title }
+        )) { item in
+            PXTVStreamEntryView(title: item.title)
+                .environmentObject(app)
+        }
     }
+}
+
+private struct PXTVStreamTitle: Identifiable {
+    let title: String
+    var id: String { title }
 }
 
 struct PXTVHeroView: View {
     @EnvironmentObject private var app: PXTVAppState
     let items: [PXTVMedia]
     @Binding var index: Int
+    var onPlay: (PXTVMedia) -> Void
 
     var item: PXTVMedia { items.indices.contains(index) ? items[index] : items[0] }
 
@@ -75,9 +91,9 @@ struct PXTVHeroView: View {
                     }
                     .buttonStyle(PXTVPrimaryButtonStyle())
                     Button {
-                        app.path.append(.media(item))
+                        onPlay(item)
                     } label: {
-                        Label("开始播放", systemImage: "play.fill")
+                        Label("直链播放", systemImage: "play.fill")
                     }
                     .buttonStyle(PXTVPrimaryButtonStyle())
                 }

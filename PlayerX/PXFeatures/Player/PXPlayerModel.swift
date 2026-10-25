@@ -40,7 +40,7 @@ final class PXPlayerModel: ObservableObject {
         self.isDanmakuEnabled = PXPlayerPreferences.shared.danmakuEnabled
         let preferred = request.preferredEngine ?? PXPlayerPreferences.shared.engine
         self.engineKind = preferred.isAvailable ? preferred : .native
-        installEngine(kind: engineKind, startAt: request.startPosition, autoplay: false)
+        installEngine(kind: engineKind, startAt: request.startPosition, autoplay: false, loadNow: false)
     }
 
     var currentChapter: Chapter? {
@@ -282,7 +282,7 @@ final class PXPlayerModel: ObservableObject {
         #endif
     }
 
-    private func installEngine(kind: PXPlayerEngineKind, startAt: Double, autoplay: Bool) {
+    private func installEngine(kind: PXPlayerEngineKind, startAt: Double, autoplay: Bool, loadNow: Bool = true) {
         guard let engine = PXPlaybackEngineFactory.resolve(kind) else { return }
         self.engine = engine
         engineKind = engine.kind
@@ -300,13 +300,15 @@ final class PXPlayerModel: ObservableObject {
             self.saveProgress(force: false)
         }
         engine.setVolume(snapshot.volume)
-        engine.load(
-            url: URL(string: plan.url) ?? URL(string: "about:blank")!,
-            headers: plan.headers ?? [:],
-            startAt: startAt,
-            autoplay: autoplay
-        )
-        engine.setRate(currentRate)
+        if loadNow {
+            engine.load(
+                url: URL(string: plan.url) ?? URL(string: "about:blank")!,
+                headers: plan.headers ?? [:],
+                startAt: startAt,
+                autoplay: autoplay
+            )
+            engine.setRate(currentRate)
+        }
     }
 
     private func handleEnded() {

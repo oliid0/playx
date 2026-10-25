@@ -74,7 +74,7 @@ struct PXRootView: View {
             .tag(PXCatalogSection.home)
 
             NavigationStack {
-                PXLibraryLandingView()
+                PXLibraryRootView()
             }
             .tabItem { Label(PXCatalogSection.library.title, systemImage: PXCatalogSection.library.symbol) }
             .tag(PXCatalogSection.library)
@@ -135,7 +135,7 @@ struct PXRootView: View {
         case .home: PXHomeView()
         case .movies, .series, .anime, .shorts, .variety, .documentary:
             PXBrowseView(section: section)
-        case .library: PXLibraryLandingView()
+        case .library: PXLibraryRootView()
         case .bangumi: PXBangumiHomeView()
         case .moviepilot: PXMoviePilotHomeView()
         case .downloads: PXDownloadsView()

@@ -15,6 +15,7 @@ final class PXAppState: ObservableObject {
 
     @Published var favoritesOnly = false
     @Published var selectedLibrarySection: PXCatalogSection = .movies
+    @Published var libraryDestination: PXCatalogSection?
 
     let catalog = PXCatalogService.shared
     let metadata = PXMetadataCoordinator.shared
@@ -48,11 +49,16 @@ final class PXAppState: ObservableObject {
     var selectedSectionTitle: String { selectedSection.title }
 
     func select(_ section: PXCatalogSection) {
-        selectedSection = section
         if let kind = section.mediaKind {
             selectedLibrarySection = section
-            _ = kind
+            libraryDestination = section
+            selectedSection = .library
+            return
         }
+        if section == .library {
+            libraryDestination = nil
+        }
+        selectedSection = section
     }
 
     func handleDeepLink(_ url: URL) {
