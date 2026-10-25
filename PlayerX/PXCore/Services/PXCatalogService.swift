@@ -252,7 +252,7 @@ final class PXCatalogService {
         if let descriptor = SourceRegistry.descriptor(for: id), descriptor.isExternal {
             return descriptor.subtitle ?? descriptor.kind.title
         }
-        switch id {
+        return switch id {
         case "hongguo": "竖屏热播 · 每日更新"
         case "hanxiaoquan": "韩剧 / 韩综精选"
         case "guipian": "恐怖 / 惊悚 / 悬疑"
