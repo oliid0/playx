@@ -14,7 +14,8 @@ struct PXDetailHeader: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             PXDetailBackdrop(
-                url: model.backdropURL,
+                url: model.metadata?.backdropURL,
+                drama: model.drama,
                 logoURL: model.logoURL,
                 title: model.title,
                 height: height

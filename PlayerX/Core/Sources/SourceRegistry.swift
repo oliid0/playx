@@ -3,17 +3,7 @@ import Foundation
 /// 一个站源在 UI 里的描述：provider 本身 + 默认是否直接展示。
 /// 对应 guoapp-src README 里"默认可见站源（红果/韩小圈/鬼片/青空）无需密码；
 /// 其余站源默认隐藏，在站源管理里通过密码锁解锁后显示"。
-struct SourceDescriptor: Identifiable {
-    let provider: ContentProvider
-    let defaultVisible: Bool
-    var id: String { provider.sourceId }
-    var displayName: String { provider.displayName }
-    var kind: PXSourceKind { provider.sourceKind }
-    var subtitle: String? { provider.sourceSubtitle }
-    var symbol: String { provider.sourceKind.symbol }
-    var isExternal: Bool { provider.sourceKind != .station }
-    var configurationID: String? { provider.configurationID }
-}
+
 
 /// 当前接入的全部站源。Go 核心编译时已经把所有站源都打进了 `DuanjuCore.xcframework`
 /// （`scripts/build-core-xcframework.sh --all-sources`），这里只是 UI 要不要默认展示的问题，

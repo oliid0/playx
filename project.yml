@@ -129,6 +129,16 @@ targets:
         excludes:
           - "Info.plist"
       - path: PlayerX/Core/Model/Models.swift
+      - path: PlayerX/Core/Sources/ContentProvider.swift
+      - path: PlayerX/Core/Sources/SourceDescriptor.swift
+      - path: PlayerX/Core/Sources/PXSourceKind.swift
+      - path: PlayerX/Core/Sources/PXSourceConfiguration.swift
+      - path: PlayerX/Core/Sources/PXExternalSourceRegistry.swift
+      - path: PlayerX/Core/Sources/PXSourceProviderFactory.swift
+      - path: PlayerX/Core/Sources/External
+      - path: PlayerX/Features/Player/PillarboxSupport.swift
+      - path: PlayerX/PXFeatures/Settings/PXSettingsRow.swift
+      - path: PlayerX/PXFeatures/Settings/PXSourceEditorView.swift
       - path: PlayerX/PXCore/Models/PXDrama+Taxonomy.swift
       - path: PlayerX/PXFeatures/Home/PXLogoMark.swift
       - path: PlayerX/PXFeatures/Browse/PXFlowLayout.swift

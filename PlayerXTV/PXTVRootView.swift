@@ -16,6 +16,12 @@ struct PXTVRootView: View {
                         PXTVSearchView()
                     case .settings:
                         PXTVSettingsView()
+                    case .sources:
+                        PXTVSourcesView()
+                    case .sourceLibrary(let sourceID):
+                        PXTVSourceLibraryView(sourceID: sourceID)
+                    case .sourceDetail(let sourceID, let drama):
+                        PXTVSourceDetailView(sourceID: sourceID, drama: drama)
                     }
                 }
         }

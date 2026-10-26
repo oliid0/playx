@@ -83,6 +83,7 @@ struct PXTVPlaybackRequest: Identifiable {
     var url: URL
     var title: String
     var subtitle: String?
+    var headers: [String: String] = [:]
 }
 
 enum PXTVRoute: Hashable {
@@ -90,4 +91,7 @@ enum PXTVRoute: Hashable {
     case bangumi(Int)
     case search
     case settings
+    case sources
+    case sourceLibrary(String)
+    case sourceDetail(String, Drama)
 }

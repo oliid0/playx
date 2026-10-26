@@ -17,14 +17,80 @@ final class PXTVAppState: ObservableObject {
     @Published var playback: PXTVPlaybackRequest?
     @Published var browseItems: [PXTVMedia] = []
     @Published var browseLoading = false
+    @Published var sources: [SourceDescriptor] = []
+    @Published var sourceLoading = false
+    @Published var sourceError: String?
+    @Published var sourceCategories: [SourceCategory] = []
+    @Published var sourceItems: [Drama] = []
 
     let metadata = PXMetadataCoordinator.shared
     let bangumi = PXBangumiCoordinator.shared
     let moviePilot = PXMoviePilotCoordinator.shared
     let settings = PXAppSettings.shared
     let preferences = PXPlayerPreferences.shared
+    let sourceStore = PXSourceConfigurationStore.shared
 
     private var didLoad = false
+
+    func refreshSources() {
+        sources = PXExternalSourceRegistry.descriptors
+    }
+
+    func provider(for sourceID: String) -> ContentProvider? {
+        PXExternalSourceRegistry.descriptors.first { $0.id == sourceID }?.provider
+    }
+
+    func loadSourceLibrary(sourceID: String, category: String = "") async {
+        guard let provider = provider(for: sourceID) else {
+            sourceError = "媒体源不存在"
+            return
+        }
+        sourceLoading = true
+        sourceError = nil
+        do {
+            if sourceCategories.isEmpty {
+                sourceCategories = (try? await provider.categories()) ?? []
+            }
+            let target = category.isEmpty ? (sourceCategories.first?.id ?? "") : category
+            let result = try await provider.catalog(category: target, page: 1, query: nil)
+            sourceItems = result.items
+        } catch {
+            sourceError = error.localizedDescription
+            sourceItems = []
+        }
+        sourceLoading = false
+    }
+
+    func sourceDetail(sourceID: String, dramaID: String) async -> DetailResult? {
+        guard let provider = provider(for: sourceID),
+              let drama = sourceItems.first(where: { $0.id == dramaID }) else { return nil }
+        do {
+            return try await provider.detail(for: drama)
+        } catch {
+            sourceError = error.localizedDescription
+            return nil
+        }
+    }
+
+    func play(chapter: Chapter, provider: ContentProvider, drama: Drama) async {
+        do {
+            let plan = try await provider.resolve(
+                drama: drama,
+                chapter: chapter,
+                index: max(1, Int(chapter.currentEpisode ?? "1") ?? 1),
+                quality: nil
+            )
+            guard let url = URL(string: plan.url) else { return }
+            playback = PXTVPlaybackRequest(
+                url: url,
+                title: drama.title,
+                subtitle: chapter.title,
+                headers: plan.headers ?? [:]
+            )
+        } catch {
+            sourceError = error.localizedDescription
+        }
+    }
 
     func loadHomeIfNeeded() async {
         guard !didLoad else { return }
@@ -100,6 +166,10 @@ final class PXTVAppState: ObservableObject {
 
     func open(_ media: PXTVMedia) {
         path.append(.media(media))
+    }
+
+    func switchToSourceLibrary(_ sourceID: String) {
+        path.append(.sourceLibrary(sourceID))
     }
 
     func playTestStream() {

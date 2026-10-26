@@ -14,6 +14,7 @@ struct PXMediaPreviewSheet: View {
                 VStack(alignment: .leading, spacing: 16) {
                     PXDetailBackdrop(
                         url: metadata?.backdropURL ?? PXImageURL.backdrop(recommendation.backdropPath),
+                        drama: nil,
                         logoURL: metadata?.logoURL,
                         title: metadata?.title ?? recommendation.title,
                         height: 340

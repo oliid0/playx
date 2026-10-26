@@ -2,16 +2,25 @@ import SwiftUI
 
 struct PXDetailBackdrop: View {
     var url: URL?
+    var drama: Drama? = nil
     var logoURL: URL?
     var title: String
     var height: CGFloat
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
-            PXRemoteImage(url: url, maxPixel: 2000)
-                .frame(maxWidth: .infinity)
-                .frame(height: height)
-                .clipped()
+            Group {
+                if let url {
+                    PXRemoteImage(url: url, maxPixel: 2000)
+                } else if let drama {
+                    PXCoverImage(drama: drama, maxPixel: 2000)
+                } else {
+                    PXTheme.backgroundLift
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: height)
+            .clipped()
             LinearGradient(
                 stops: [
                     .init(color: .black.opacity(0.10), location: 0),

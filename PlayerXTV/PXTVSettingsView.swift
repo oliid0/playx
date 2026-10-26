@@ -18,6 +18,14 @@ struct PXTVSettingsView: View {
                     Text("tvOS 使用 Pillarbox + 系统播放器，遥控器提供播放/暂停、快进、字幕与音轨菜单。")
                         .font(.caption).foregroundStyle(PXTheme.textTertiary)
                 }
+                group("媒体源") {
+                    NavigationLink(value: PXTVRoute.sources) {
+                        Label("管理 Jellyfin / Emby / WebDAV / MacCMS", systemImage: "externaldrive.connected.to.line.below")
+                    }
+                    .buttonStyle(.card)
+                    Button("刷新媒体源") { app.refreshSources() }
+                        .buttonStyle(.card)
+                }
                 group("元数据") {
                     statusRow("TMDB", settings.tmdbEnabled ? "已启用 · \(settings.tmdbLanguage)" : "已关闭")
                     statusRow("内置只读 Token", settings.effectiveTMDbToken.isEmpty ? "无效" : "已配置")

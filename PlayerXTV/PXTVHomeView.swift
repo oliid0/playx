@@ -21,12 +21,18 @@ struct PXTVHomeView: View {
                 ForEach(app.rails) { rail in
                     PXTVRailView(rail: rail)
                 }
+                if !app.sources.isEmpty {
+                    sourceRail
+                }
             }
             .padding(.horizontal, 56)
             .padding(.top, 46)
             .padding(.bottom, 60)
         }
-        .task { await app.loadHomeIfNeeded() }
+        .task {
+            app.refreshSources()
+            await app.loadHomeIfNeeded()
+        }
         .sheet(item: Binding(
             get: { streamTitle.map(PXTVStreamTitle.init) },
             set: { streamTitle = $0?.title }
@@ -40,6 +46,65 @@ struct PXTVHomeView: View {
 private struct PXTVStreamTitle: Identifiable {
     let title: String
     var id: String { title }
+}
+
+extension PXTVHomeView {
+    private var sourceRail: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("媒体库").font(PXFont.title(26)).foregroundStyle(PXTheme.textPrimary)
+                    Text("Jellyfin / Emby / WebDAV / NAS / Alist / MacCMS")
+                        .font(.caption).foregroundStyle(PXTheme.textTertiary)
+                }
+                Spacer()
+                Button("管理") { app.path.append(.sources) }
+                    .buttonStyle(.card)
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: 20) {
+                    ForEach(app.sources) { source in
+                        NavigationLink(value: PXTVRoute.sourceLibrary(source.id)) {
+                            PXTVSourceRowCard(source: source)
+                        }
+                        .buttonStyle(.card)
+                    }
+                }
+                .padding(.vertical, 18)
+                .padding(.horizontal, 20)
+            }
+            .scrollClipDisabled()
+        }
+    }
+}
+
+private struct PXTVSourceRowCard: View {
+    let source: SourceDescriptor
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ZStack(alignment: .bottomLeading) {
+                LinearGradient(colors: [PXTheme.backgroundLift, PXTheme.backgroundDeep], startPoint: .topLeading, endPoint: .bottomTrailing)
+                RadialGradient(colors: [PXTheme.accent.opacity(0.24), .clear], center: .topTrailing, startRadius: 0, endRadius: 220)
+                Image(systemName: source.kind.symbol)
+                    .font(.system(size: 74, weight: .black))
+                    .foregroundStyle(.white.opacity(0.06))
+                    .offset(x: 110, y: 40)
+                VStack(alignment: .leading, spacing: 4) {
+                    Image(systemName: source.kind.symbol).font(.system(size: 24, weight: .bold)).foregroundStyle(PXTheme.accent)
+                    Text(source.displayName).font(.system(size: 20, weight: .bold)).foregroundStyle(PXTheme.textPrimary).lineLimit(1)
+                    Text(source.subtitle ?? source.kind.title).font(.caption).foregroundStyle(PXTheme.textTertiary).lineLimit(1)
+                }
+                .padding(16)
+            }
+            .frame(width: 320, height: 180)
+            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(PXTheme.stroke))
+            Text(source.kind.title)
+                .font(.caption2).foregroundStyle(PXTheme.textTertiary)
+        }
+        .frame(width: 320, alignment: .leading)
+    }
 }
 
 struct PXTVHeroView: View {

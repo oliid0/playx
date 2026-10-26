@@ -4,11 +4,10 @@ import PillarboxPlayer
 struct PXTVPlayerView: View {
     @Environment(\.dismiss) private var dismiss
     let request: PXTVPlaybackRequest
-    @StateObject private var player: PillarboxPlayer.Player
+    @StateObject private var player = PillarboxPlayer.Player()
 
     init(request: PXTVPlaybackRequest) {
         self.request = request
-        _player = StateObject(wrappedValue: PillarboxPlayer.Player(item: .simple(url: request.url)))
     }
 
     var body: some View {
@@ -26,6 +25,12 @@ struct PXTVPlayerView: View {
             .allowsHitTesting(false)
         }
         .onAppear {
+            player.currentItem = PillarboxPlayback.makeItem(
+                url: request.url,
+                headers: request.headers,
+                identifier: request.url.absoluteString,
+                title: request.title
+            )
             player.becomeActive()
             player.play()
         }

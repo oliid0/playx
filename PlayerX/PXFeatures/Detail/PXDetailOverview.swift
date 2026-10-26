@@ -7,8 +7,14 @@ struct PXDetailOverview: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
             HStack(alignment: .top, spacing: 14) {
-                PXRemoteImage(url: model.posterURL, maxPixel: 500)
-                    .frame(width: 104, height: 156)
+                Group {
+                    if let poster = model.metadata?.posterURL {
+                        PXRemoteImage(url: poster, maxPixel: 500)
+                    } else {
+                        PXCoverImage(drama: model.drama, maxPixel: 500)
+                    }
+                }
+                .frame(width: 104, height: 156)
                     .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
                     .overlay {
                         RoundedRectangle(cornerRadius: 13, style: .continuous)

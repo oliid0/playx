@@ -153,9 +153,15 @@ struct PXGlobalSearchView: View {
 
     private func card(_ result: PXSearchResult) -> some View {
         HStack(spacing: 11) {
-            PXRemoteImage(url: result.imageURL, maxPixel: 300)
-                .frame(width: 58, height: 87)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+            Group {
+                if let entry = result.catalogEntry {
+                    PXCoverImage(drama: entry.drama, maxPixel: 300)
+                } else {
+                    PXRemoteImage(url: result.imageURL, maxPixel: 300)
+                }
+            }
+            .frame(width: 58, height: 87)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
             VStack(alignment: .leading, spacing: 4) {
                 Text(result.title)
                     .font(.system(size: 13, weight: .semibold))
