@@ -8,8 +8,8 @@ struct PXMacTopBar: View {
 
     private var tabs: [PXTab] {
         var values: [PXTab] = [.home]
-        if settings.bangumiEnabled { values.append(.bangumi) }
         if settings.moviePilotEnabled { values.append(.moviePilot) }
+        if settings.bangumiEnabled { values.append(.bangumi) }
         values.append(.settings)
         return values
     }
@@ -53,6 +53,7 @@ struct PXMacTopBar: View {
                 Image(systemName: PXTab.search.symbol)
             }
             .buttonStyle(PXIconButtonStyle(size: 32))
+            .foregroundStyle(app.selectedTab == .search ? PXTheme.accent : PXTheme.textPrimary)
             .accessibilityLabel("搜索全部媒体库")
         }
         .padding(.horizontal, 22)

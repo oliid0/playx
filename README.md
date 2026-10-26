@@ -10,13 +10,31 @@ TMDB 元数据、Bangumi 追番、弹弹play 弹幕与 MoviePilot 找片/下载/
 | --- | --- | --- |
 | `PlayerX` | iPhone / iPad (iOS 17+) | Pillarbox（默认）、Erika、原生 AVPlayer |
 | `PlayerX-macOS` | macOS 14+ | Erika、原生 AVPlayer |
-| `PlayerX-tvOS` | Apple TV (tvOS 17+) | Pillarbox 系统播放器 + 直链播放 |
+| `PlayerX-tvOS` | Apple TV (tvOS 17+) | Pillarbox + 外部媒体源 / 直链播放 |
+
+## 界面结构（对齐 OcPlayer）
+
+- iPhone / iPad 底部 Tab：**首页 / Bangumi / MoviePilot / 设置 / 搜索**。
+- macOS 顶部胶囊：**首页 / MoviePilot / Bangumi / 设置**，不再使用侧栏。
+- 首页栏目固定为：**继续观看 / 接下来看 / 最近添加 / 媒体库**。
+  每个站源或外部媒体源就是一张媒体库卡片，进入后再按该库的分类浏览。
+- 详情页是 OcPlayer 式的长页：背景氛围、海报、评分、简介、剧集、演员、媒体信息、
+  相关推荐，不再拆成额外 Tab 入口。
+- macOS 点击播放使用**同一窗口根覆盖层**，不再用 sheet 新开播放窗口。
 
 ## 功能
 
-- **首页 / 片库**：Hero、继续观看、站源推荐、类型分类、筛选（站源、题材、年份、排序）。
+- **首页 / 媒体库**：继续观看、接下来看、最近添加、媒体库卡片、库内分类、筛选。
 - **详情页**：背景氛围图、海报、年份、类型、TMDB 评分、简介、季/集、演员表、
   媒体信息、外部链接、相关推荐、手动 TMDB 匹配。
+- **统一媒体源平台**：
+  - 内置 Go 站源；
+  - Emby / Jellyfin（登录、媒体库、Items、Episodes、HLS 转码）；
+  - WebDAV / NAS / Alist·OpenList（PROPFIND 目录、视频识别、Basic Auth）；
+  - MacCMS（`provide/vod` JSON API、播放组解析）；
+  - 配置保存在本机，设置 → 媒体源中增删改和测试。
+  - 所有源统一实现 `ContentProvider`；站源配置、外部源配置、首页、搜索、详情、
+    播放器只依赖这一层，后续新协议只需新增 `PXSourceKind` 与 provider。
 - **播放器**：Pillarbox 默认；Erika（FFmpeg + libass，iOS/macOS）；原生 AVPlayer。
   竖屏 Stories 进度条、左右切换上一集/下一集、横屏章节导航、倍速、音轨/字幕、
   自动连播、锁定、弹幕覆盖层。
@@ -24,8 +42,8 @@ TMDB 元数据、Bangumi 追番、弹弹play 弹幕与 MoviePilot 找片/下载/
 - **Bangumi**：每日放送、搜索、条目详情、想看/在看/看过、章节进度。
 - **MoviePilot**：媒体搜索、SSE 站点资源搜索、添加下载、订阅、下载进度轮询。
 - **TMDB**：内置只读 Token；自动匹配 + 手动匹配；中文/英文回退。
-- **tvOS**：侧边栏 Shell、焦点卡片、首页/分类/搜索/详情、Bangumi、MoviePilot、
-  原生系统播放器与直链输入。
+- **tvOS**：OcPlayer 同级五入口侧边栏、焦点卡片、首页/详情/Bangumi/MoviePilot/
+  设置/搜索；媒体库栏直接读取外部媒体源，详情与播放共用同一套 provider。
 
 ## 构建
 

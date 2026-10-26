@@ -14,8 +14,8 @@ enum PXTab: String, CaseIterable, Identifiable, Hashable {
     var title: String {
         switch self {
         case .home: "首页"
-        case .bangumi: "追番"
-        case .moviePilot: "找片"
+        case .bangumi: "Bangumi"
+        case .moviePilot: "MoviePilot"
         case .settings: "设置"
         case .search: "搜索"
         }
