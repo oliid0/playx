@@ -12,7 +12,7 @@ struct PXContinueCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             ZStack(alignment: .bottomLeading) {
-                PXRemoteImage(url: URL(string: entry.drama.cover ?? ""), maxPixel: width * 2.4)
+                PXCoverImage(drama: entry.drama, maxPixel: width * 2.4)
                     .aspectRatio(16 / 9, contentMode: .fill)
                     .frame(width: width, height: width * 9 / 16)
                     .clipped()

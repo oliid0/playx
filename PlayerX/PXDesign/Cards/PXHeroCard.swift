@@ -6,7 +6,7 @@ struct PXHeroCard: View {
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
-            PXRemoteImage(url: item.backdropURL ?? URL(string: item.entry.drama.cover ?? ""), maxPixel: 2000)
+            PXCoverImage(drama: item.entry.drama, maxPixel: 2000)
                 .frame(maxWidth: .infinity)
                 .frame(height: height)
                 .clipped()

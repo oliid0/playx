@@ -31,7 +31,7 @@ enum PXCatalogSection: String, CaseIterable, Identifiable, Hashable {
         case .bangumi: "追番"
         case .moviepilot: "找片"
         case .downloads: "下载"
-        case .profile: "我的"
+        case .profile: "设置"
         }
     }
 
@@ -48,7 +48,7 @@ enum PXCatalogSection: String, CaseIterable, Identifiable, Hashable {
         case .bangumi: "calendar"
         case .moviepilot: "paperplane.fill"
         case .downloads: "arrow.down.circle.fill"
-        case .profile: "person.crop.circle.fill"
+        case .profile: "gearshape.fill"
         }
     }
 

@@ -1,268 +1,217 @@
 import SwiftUI
 
+/// 首页严格按 OcPlayer 的栏目顺序组织：继续观看 / 接下来看 / 最近添加 / 媒体库。
+/// 不再放 Hero 轮播、类型 Chips、站源卡片和“片库”一级 Tab——这些入口在
+/// OcPlayer 里都不存在，也是上一版界面的杂乱来源。
 struct PXHomeView: View {
     @EnvironmentObject private var app: PXAppState
     @StateObject private var model = PXHomeViewModel()
     @ObservedObject private var history = HistoryStore.shared
     @ObservedObject private var follow = FollowStore.shared
-    @State private var heroIndex = 0
-    @State private var showSourcePicker = false
+
+    private var continueItems: [HistoryEntry] {
+        Array(history.entries.sorted { $0.updatedAt > $1.updatedAt }.prefix(12))
+    }
+
+    private var nextUp: [PXCatalogEntry] {
+        follow.entries
+            .filter { $0.status == .watching || $0.status == .planned }
+            .compactMap { entry in
+                guard let descriptor = SourceRegistry.descriptor(for: entry.drama.source) else { return nil }
+                return PXCatalogEntry(drama: entry.drama, section: .library, providerID: descriptor.id)
+            }
+            .prefix(12)
+            .map { $0 }
+    }
 
     var body: some View {
         GeometryReader { proxy in
             ScrollView(showsIndicators: false) {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    PXHomeHeader(onSearch: { app.searchPresented = true })
-                        .padding(.horizontal, PXTheme.padding(for: proxy.size.width))
-                        .padding(.top, PXPlatform.isMac ? 18 : 8)
-                    categoryStrip
-                        .padding(.top, 18)
-                    heroSection(width: proxy.size.width)
-                        .padding(.top, 16)
-                    continueSection(width: proxy.size.width)
-                    railsSection(width: proxy.size.width)
-                    sourceRail(width: proxy.size.width)
-                    footer
-                }
-                .padding(.bottom, 36)
-            }
-            .refreshable { await model.reload() }
-            .background {
-                PXBackdropAmbience(url: heroBackdrop, intensity: 0.9)
-            }
-        }
-        .background(PXPageBackground())
-        .navigationTitle("首页")
-        .pxHiddenNavigationBar()
-        .task { await model.loadIfNeeded() }
-        .onChange(of: model.heroItems.count) { count in
-            if heroIndex >= count { heroIndex = 0 }
-        }
-        .sheet(isPresented: $showSourcePicker) {
-            PXSourcePickerView()
-                .presentationDetents([.medium, .large])
-        }
-    }
-
-    private var heroBackdrop: URL? {
-        if model.heroItems.indices.contains(heroIndex) {
-            return model.heroItems[heroIndex].backdropURL
-        }
-        return model.heroItems.first?.backdropURL
-    }
-
-    private var categoryStrip: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                NavigationLink {
-                    PXBrowseView(section: .library)
-                } label: {
-                    PXChip(title: "全部", selected: true, symbol: "square.grid.2x2")
-                }
-                .buttonStyle(.plain)
-                ForEach(PXCatalogSection.contentSections.filter { $0 != .home }) { section in
-                    NavigationLink {
-                        PXBrowseView(section: section)
-                    } label: {
-                        PXChip(title: section.title, symbol: section.symbol)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(.horizontal, PXTheme.contentPadding)
-        }
-    }
-
-    @ViewBuilder
-    private func heroSection(width: CGFloat) -> some View {
-        if model.heroItems.isEmpty {
-            if model.isLoading {
-                RoundedRectangle(cornerRadius: 26)
-                    .fill(PXTheme.surfaceMuted)
-                    .frame(height: PXTheme.heroHeight)
-                    .overlay(PXShimmer())
-                    .padding(.horizontal, PXTheme.contentPadding)
-            } else {
-                PXEmptyState(
-                    title: "今天还没有推荐",
-                    message: model.errorMessage ?? "下拉刷新，或到片库直接浏览站源。",
-                    symbol: "sparkles.tv",
-                    actionTitle: "打开片库",
-                    action: { app.selectedSection = .library }
-                )
-            }
-        } else {
-            VStack(spacing: 12) {
-                #if os(iOS)
-                TabView(selection: $heroIndex) {
-                    ForEach(Array(model.heroItems.enumerated()), id: \.element.id) { index, item in
-                        NavigationLink {
-                            PXDetailView(entry: item.entry)
-                        } label: {
-                            PXHeroCard(item: item, height: PXTheme.heroHeight)
+                    if !continueItems.isEmpty {
+                        rail(title: "继续观看", subtitle: "从上次看到的位置接着看") {
+                            ForEach(continueItems) { entry in
+                                if let descriptor = SourceRegistry.descriptor(for: entry.drama.source) {
+                                    NavigationLink {
+                                        PXDetailView(
+                                            entry: PXCatalogEntry(drama: entry.drama, section: .library, providerID: descriptor.id),
+                                            resume: entry
+                                        )
+                                    } label: {
+                                        PXContinueCard(entry: entry, width: proxy.size.width > 900 ? 300 : 260)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
                         }
-                        .buttonStyle(PXPressStyle(scale: 0.995))
-                        .padding(.horizontal, PXTheme.padding(for: width))
-                        .tag(index)
                     }
-                }
-                .tabViewStyle(.page(indexDisplayMode: .never))
-                .frame(height: PXTheme.heroHeight)
-                #else
-                HStack(spacing: 8) {
-                    heroStep(-1)
-                    NavigationLink {
-                        PXDetailView(entry: model.heroItems[min(heroIndex, model.heroItems.count - 1)].entry)
-                    } label: {
-                        PXHeroCard(item: model.heroItems[min(heroIndex, model.heroItems.count - 1)], height: PXTheme.heroHeight)
-                    }
-                    .buttonStyle(PXPressStyle(scale: 0.995))
-                    heroStep(1)
-                }
-                .padding(.horizontal, PXTheme.widePadding)
-                #endif
 
-                HStack(spacing: 6) {
-                    ForEach(model.heroItems.indices, id: \.self) { index in
-                        Button {
-                            withAnimation(PXTheme.heroMotion) { heroIndex = index }
-                        } label: {
-                            Capsule()
-                                .fill(index == heroIndex ? PXTheme.accent : Color.white.opacity(0.22))
-                                .frame(width: index == heroIndex ? 22 : 6, height: 4)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-        }
-    }
-
-    #if os(macOS)
-    private func heroStep(_ delta: Int) -> some View {
-        Button {
-            guard !model.heroItems.isEmpty else { return }
-            let count = model.heroItems.count
-            withAnimation(PXTheme.heroMotion) {
-                heroIndex = (heroIndex + delta + count) % count
-            }
-        } label: {
-            Image(systemName: delta > 0 ? "chevron.right" : "chevron.left")
-        }
-        .buttonStyle(PXIconButtonStyle(size: 38))
-    }
-    #endif
-
-    @ViewBuilder
-    private func continueSection(width: CGFloat) -> some View {
-        let entries = history.entries.sorted { $0.updatedAt > $1.updatedAt }.prefix(10)
-        if !entries.isEmpty {
-            VStack(alignment: .leading, spacing: 12) {
-                PXSectionHeader(
-                    title: "继续观看",
-                    subtitle: "从上次看到的位置接着看",
-                    symbol: "clock.arrow.circlepath"
-                )
-                .padding(.horizontal, PXTheme.padding(for: width))
-                ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(spacing: 12) {
-                        ForEach(Array(entries)) { entry in
-                            if let descriptor = SourceRegistry.descriptor(for: entry.drama.source) {
+                    if !nextUp.isEmpty {
+                        rail(title: "接下来看", subtitle: "你在看和想看的下一部") {
+                            ForEach(nextUp) { entry in
                                 NavigationLink {
-                                    PXDetailView(entry: PXCatalogEntry(
-                                        drama: entry.drama,
-                                        section: .library,
-                                        providerID: descriptor.id
-                                    ), resume: entry)
+                                    PXDetailView(entry: entry)
                                 } label: {
-                                    PXContinueCard(entry: entry, width: width > 800 ? 300 : 260)
+                                    PXLandscapeCard(entry: entry, width: proxy.size.width > 900 ? 300 : 258)
                                 }
                                 .buttonStyle(.plain)
                             }
                         }
                     }
-                    .padding(.horizontal, PXTheme.padding(for: width))
-                }
-            }
-            .padding(.top, 26)
-        }
-    }
 
-    @ViewBuilder
-    private func railsSection(width: CGFloat) -> some View {
-        ForEach(model.rails) { rail in
-            VStack(alignment: .leading, spacing: 11) {
-                PXSectionHeader(
-                    title: rail.title,
-                    subtitle: rail.subtitle,
-                    symbol: rail.symbol,
-                    actionTitle: rail.seeAllSection == nil ? nil : "查看全部",
-                    action: rail.seeAllSection.map { section in
-                        { app.select(section) }
-                    }
-                )
-                .padding(.horizontal, PXTheme.padding(for: width))
-
-                ScrollView(.horizontal, showsIndicators: false) {
-                    LazyHStack(alignment: .top, spacing: 13) {
-                        ForEach(rail.entries) { entry in
-                            NavigationLink {
-                                PXDetailView(entry: entry)
-                            } label: {
-                                if rail.style == .poster {
-                                    PXPosterCard(entry: entry, width: width > 800 ? 158 : 132)
-                                } else {
-                                    PXLandscapeCard(entry: entry, width: width > 800 ? 300 : 246)
+                    if model.isLoading && model.latest.isEmpty {
+                        skeletonRail(width: proxy.size.width)
+                    } else if !model.latest.isEmpty {
+                        rail(title: "最近添加", subtitle: "来自全部媒体库的最新内容") {
+                            ForEach(model.latest) { entry in
+                                NavigationLink {
+                                    PXDetailView(entry: entry)
+                                } label: {
+                                    PXLandscapeCard(entry: entry, width: proxy.size.width > 900 ? 300 : 258)
                                 }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+
+                    rail(title: "媒体库", subtitle: librariesSubtitle) {
+                        ForEach(model.libraries) { descriptor in
+                            NavigationLink {
+                                PXSourceBrowseView(descriptor: descriptor)
+                            } label: {
+                                PXLibraryCard(
+                                    descriptor: descriptor,
+                                    covers: model.libraryCovers[descriptor.id] ?? [],
+                                    width: proxy.size.width > 900 ? 300 : 258
+                                )
                             }
                             .buttonStyle(.plain)
                         }
-                    }
-                    .padding(.horizontal, PXTheme.padding(for: width))
-                    .padding(.vertical, 4)
-                }
-            }
-            .padding(.top, 28)
-        }
-    }
-
-    private func sourceRail(width: CGFloat) -> some View {
-        VStack(alignment: .leading, spacing: 11) {
-            PXSectionHeader(
-                title: "站源",
-                subtitle: "\(model.sources.count) 个可用内容库",
-                symbol: "server.rack",
-                actionTitle: "管理",
-                action: { showSourcePicker = true }
-            )
-            .padding(.horizontal, PXTheme.padding(for: width))
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 12) {
-                    ForEach(model.sources) { source in
-                        NavigationLink {
-                            PXSourceBrowseView(descriptor: source)
+                        Button {
+                            app.select(.profile)
                         } label: {
-                            PXSourceCard(descriptor: source, width: width > 800 ? 170 : 146)
+                            addLibraryCard
                         }
                         .buttonStyle(.plain)
                     }
+
+                    if !model.isLoading, continueItems.isEmpty, nextUp.isEmpty, model.latest.isEmpty, model.libraries.isEmpty {
+                        PXEmptyState(
+                            title: "还没有媒体库",
+                            message: model.errorMessage ?? "到设置中添加站源、Jellyfin、Emby、WebDAV 或 MacCMS。",
+                            symbol: "rectangle.stack.badge.plus",
+                            actionTitle: "去设置",
+                            action: { app.select(.profile) }
+                        )
+                        .padding(.horizontal, PXTheme.contentPadding)
+                    }
+
+                    if let error = model.errorMessage, !model.isLoading, model.latest.isEmpty {
+                        PXErrorBanner(message: error) {
+                            Task { await model.reload() }
+                        }
+                        .padding(.horizontal, PXTheme.contentPadding)
+                        .padding(.top, 12)
+                    }
                 }
-                .padding(.horizontal, PXTheme.padding(for: width))
+                .padding(.top, 4)
+                .padding(.bottom, 36)
+            }
+            .refreshable { await model.reload() }
+        }
+        .background(PXPageBackground())
+        .navigationTitle("")
+        .pxInlineNavigationTitle()
+        .pxTransparentNavigation()
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                if model.isLoading {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button { Task { await model.reload() } } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .accessibilityLabel("刷新首页")
+                }
             }
         }
-        .padding(.top, 28)
+        .task { await model.loadIfNeeded() }
     }
 
-    private var footer: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("PlayerX · 多内核原生播放器")
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(PXTheme.textTertiary)
-            Text("内容来自公开站源，元数据由 TMDB 提供；弹幕由弹弹play 提供。")
-                .font(.system(size: 9))
-                .foregroundStyle(PXTheme.textTertiary.opacity(0.7))
+    private var librariesSubtitle: String {
+        let count = model.libraries.count
+        let external = model.libraries.filter(\.isExternal).count
+        if count == 0 { return "添加站源或外部媒体源" }
+        if external == 0 { return "\(count) 个内置站源" }
+        return "\(count) 个媒体库 · \(external) 个外部源"
+    }
+
+    private func rail<Content: View>(
+        title: String,
+        subtitle: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 11) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundStyle(PXTheme.textPrimary)
+                Text(subtitle)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(PXTheme.textTertiary)
+            }
+            .padding(.horizontal, PXTheme.contentPadding)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(alignment: .top, spacing: 12) {
+                    content()
+                }
+                .padding(.horizontal, PXTheme.contentPadding)
+                .padding(.vertical, 3)
+            }
         }
-        .padding(.horizontal, PXTheme.contentPadding)
-        .padding(.top, 32)
+        .padding(.top, 24)
+    }
+
+    private func skeletonRail(width: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: 11) {
+            RoundedRectangle(cornerRadius: 4).fill(PXTheme.surface).frame(width: 110, height: 20)
+                .padding(.horizontal, PXTheme.contentPadding)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 12) {
+                    ForEach(0..<4, id: \.self) { _ in
+                        RoundedRectangle(cornerRadius: 12)
+                            .fill(PXTheme.surfaceMuted)
+                            .frame(width: 260, height: 146)
+                            .overlay(PXShimmer())
+                    }
+                }
+                .padding(.horizontal, PXTheme.contentPadding)
+            }
+        }
+        .padding(.top, 24)
+    }
+
+    private var addLibraryCard: some View {
+        VStack(spacing: 9) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 14)
+                    .fill(PXTheme.surfaceMuted)
+                VStack(spacing: 7) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundStyle(PXTheme.accent)
+                    Text("添加媒体库")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(PXTheme.textSecondary)
+                }
+            }
+            .frame(width: 258, height: 145)
+            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(PXTheme.stroke, lineWidth: 0.7))
+            Text("站源 / Jellyfin / WebDAV / MacCMS")
+                .font(.system(size: 9))
+                .foregroundStyle(PXTheme.textTertiary)
+                .frame(width: 258, alignment: .leading)
+        }
+        .frame(width: 258, alignment: .leading)
     }
 }

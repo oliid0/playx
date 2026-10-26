@@ -2,12 +2,43 @@ import Foundation
 import SwiftUI
 import Combine
 
+enum PXTab: String, CaseIterable, Identifiable, Hashable {
+    case home
+    case bangumi
+    case moviePilot
+    case settings
+    case search
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .home: "首页"
+        case .bangumi: "追番"
+        case .moviePilot: "找片"
+        case .settings: "设置"
+        case .search: "搜索"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .home: "house.fill"
+        case .bangumi: "calendar"
+        case .moviePilot: "paperplane.fill"
+        case .settings: "gearshape.fill"
+        case .search: "magnifyingglass"
+        }
+    }
+}
+
 /// 全 App 的单例状态。导航保持轻量：一级分区 + 每个分区的路径由 SwiftUI
 /// `NavigationStack` 自己管理；播放器则作为根覆盖层，避免被 navigation bar
 /// 或 sheet 裁剪。
 @MainActor
 final class PXAppState: ObservableObject {
     @Published var selectedSection: PXCatalogSection = .home
+    @Published var selectedTab: PXTab = .home
     @Published var searchPresented = false
     @Published var presentedPlayer: PXPlaybackRequest?
     @Published var isShowingSourcePicker = false
@@ -54,12 +85,37 @@ final class PXAppState: ObservableObject {
             selectedLibrarySection = section
             libraryDestination = section
             selectedSection = .library
+            selectedTab = .home
             return
         }
         if section == .library {
             libraryDestination = nil
+            selectedSection = .library
+            selectedTab = .home
+            return
         }
         selectedSection = section
+        switch section {
+        case .home, .movies, .series, .anime, .shorts, .variety, .documentary, .library:
+            selectedTab = .home
+        case .bangumi:
+            selectedTab = .bangumi
+        case .moviepilot:
+            selectedTab = .moviePilot
+        case .downloads, .profile:
+            selectedTab = .settings
+        }
+    }
+
+    func selectTab(_ tab: PXTab) {
+        selectedTab = tab
+        switch tab {
+        case .home: selectedSection = .home
+        case .bangumi: selectedSection = .bangumi
+        case .moviePilot: selectedSection = .moviepilot
+        case .settings: selectedSection = .profile
+        case .search: break
+        }
     }
 
     func handleDeepLink(_ url: URL) {

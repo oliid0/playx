@@ -9,7 +9,7 @@ struct PXPosterCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             ZStack(alignment: .bottomLeading) {
-                PXRemoteImage(url: URL(string: entry.drama.cover ?? ""), maxPixel: width * 3)
+                PXCoverImage(drama: entry.drama, maxPixel: width * 3)
                     .aspectRatio(2 / 3, contentMode: .fit)
                     .frame(width: width)
                     .clipShape(RoundedRectangle(cornerRadius: PXTheme.posterRadius, style: .continuous))

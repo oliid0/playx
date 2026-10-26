@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct PXGlobalSearchView: View {
+    var embedded: Bool = false
     @EnvironmentObject private var app: PXAppState
     @Environment(\.dismiss) private var dismiss
     @StateObject private var model = PXSearchViewModel()
@@ -8,38 +9,46 @@ struct PXGlobalSearchView: View {
     @FocusState private var focused: Bool
     @AppStorage("playerx.search.recent.v1") private var recentRaw = ""
 
+    init(embedded: Bool = false) {
+        self.embedded = embedded
+    }
+
+    @ViewBuilder
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                PXSearchField(text: $model.query, prompt: "搜索电影、剧集、动漫、演员") {
-                    saveRecent(model.query)
-                    model.submit()
-                }
-                .focused($focused)
-                .padding(.horizontal, PXTheme.contentPadding)
-                .padding(.top, 8)
-                scopeBar
-                content
+        if embedded {
+            searchContent
+        } else {
+            NavigationStack { searchContent }
+                .preferredColorScheme(.dark)
+        }
+    }
+
+    private var searchContent: some View {
+        VStack(spacing: 0) {
+            PXSearchField(text: $model.query, prompt: "搜索电影、剧集、动漫、演员") {
+                saveRecent(model.query)
+                model.submit()
             }
-            .background(PXPageBackground())
-            .navigationTitle("搜索")
-            .pxInlineNavigationTitle()
-            .toolbar {
+            .focused($focused)
+            .padding(.horizontal, PXTheme.contentPadding)
+            .padding(.top, 8)
+            scopeBar
+            content
+        }
+        .background(PXPageBackground())
+        .navigationTitle("搜索")
+        .pxInlineNavigationTitle()
+        .toolbar {
+            if !embedded {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("关闭") { dismiss() }
                 }
             }
-            .task {
-                focused = true
-                if !recentRaw.isEmpty, model.query.isEmpty {
-                    // 不自动重搜：只把最近一次放进占位提示，避免打开就发请求。
-                }
-            }
-            .sheet(item: $preview) { item in
-                PXMediaPreviewSheet(recommendation: item)
-            }
         }
-        .preferredColorScheme(.dark)
+        .task { focused = true }
+        .sheet(item: $preview) { item in
+            PXMediaPreviewSheet(recommendation: item)
+        }
     }
 
     private var scopeBar: some View {
