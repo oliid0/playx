@@ -4,7 +4,6 @@ struct PXBrowseView: View {
     @EnvironmentObject private var app: PXAppState
     @StateObject private var model: PXBrowseViewModel
     @State private var showFilter = false
-    @State private var showSourcePicker = false
 
     init(section: PXCatalogSection, initialSource: String? = nil) {
         _model = StateObject(wrappedValue: PXBrowseViewModel(section: section, initialSource: initialSource))
@@ -46,12 +45,6 @@ struct PXBrowseView: View {
                     Image(systemName: model.filter.isActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
                 }
                 .accessibilityLabel("筛选")
-                if model.initialSourceID != nil {
-                    Button { showSourcePicker = true } label: {
-                        Image(systemName: "server.rack")
-                    }
-                    .accessibilityLabel("切换站源")
-                }
             }
         }
         .task { await model.load() }
@@ -60,10 +53,6 @@ struct PXBrowseView: View {
                 Task { await model.apply(filter) }
             }
             .presentationDetents([.medium, .large])
-        }
-        .sheet(isPresented: $showSourcePicker) {
-            PXSourcePickerView()
-                .presentationDetents([.medium, .large])
         }
     }
 
@@ -79,10 +68,6 @@ struct PXBrowseView: View {
                         .foregroundStyle(PXTheme.textTertiary)
                 }
                 Spacer()
-                Button { app.searchPresented = true } label: {
-                    Image(systemName: "magnifyingglass")
-                }
-                .buttonStyle(PXIconButtonStyle(size: 38))
             }
             if model.filter.isActive {
                 HStack(spacing: 7) {

@@ -58,13 +58,7 @@ struct PXDetailView: View {
         .navigationTitle(model.title)
         .pxInlineNavigationTitle()
         .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button {
-                    model.showMatchSheet = true
-                } label: {
-                    Image(systemName: "sparkles.tv")
-                }
-                .accessibilityLabel("匹配元数据")
+            ToolbarItem(placement: .primaryAction) {
                 ShareLink(item: model.drama.pxShareURL ?? URL(string: "https://github.com/oliid0/playx")!) {
                     Image(systemName: "square.and.arrow.up")
                 }
