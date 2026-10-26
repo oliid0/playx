@@ -173,6 +173,7 @@ targets:
       - path: PlayerX/PXDesign/Components
         excludes:
           - "PXCoverImage.swift"
+          - "PXAmbientCover.swift"
     dependencies:
       - package: Pillarbox
         product: PillarboxPlayer

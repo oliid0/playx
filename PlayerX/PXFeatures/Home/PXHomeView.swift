@@ -120,7 +120,13 @@ struct PXHomeView: View {
             }
             .refreshable { await model.reload() }
         }
-        .background(PXPageBackground())
+        .background {
+            if let seed = model.latest.first?.drama ?? continueItems.first?.drama {
+                PXAmbientCover(drama: seed)
+            } else {
+                PXPageBackground()
+            }
+        }
         .navigationTitle("")
         .pxInlineNavigationTitle()
         .pxTransparentNavigation()
