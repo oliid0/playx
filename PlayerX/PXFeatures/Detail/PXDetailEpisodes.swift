@@ -25,14 +25,16 @@ struct PXDetailEpisodes: View {
                         .font(.system(size: 10, weight: .medium))
                         .foregroundStyle(PXTheme.textTertiary)
                     Spacer()
-                    Button {
-                        Task { await model.downloadAll() }
-                    } label: {
-                        Label("缓存全集", systemImage: "arrow.down.circle")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(PXTheme.accent)
+                    if model.provider.sourceKind == .station {
+                        Button {
+                            Task { await model.downloadAll() }
+                        } label: {
+                            Label("缓存全集", systemImage: "arrow.down.circle")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(PXTheme.accent)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
                 LazyVGrid(columns: columns, spacing: 8) {
                     ForEach(Array(model.chapters.enumerated()), id: \.element.id) { index, chapter in

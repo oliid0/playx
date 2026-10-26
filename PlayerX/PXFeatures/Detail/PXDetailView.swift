@@ -33,11 +33,23 @@ struct PXDetailView: View {
                         onShare: { share() },
                         height: proxy.size.width > 820 ? 460 : 370
                     )
-                    PXDetailTabs(selection: $model.tab)
-                        .padding(.top, 4)
-                    content
-                        .padding(.top, 20)
-                        .padding(.bottom, 40)
+                    VStack(alignment: .leading, spacing: 24) {
+                        PXDetailOverview(model: model, descriptionExpanded: $model.descriptionExpanded)
+                        if model.drama.pxKind.isEpisodic || model.chapters.count > 1 {
+                            PXDetailEpisodes(model: model) { index in
+                                Task { await model.play(index: index) }
+                            }
+                        }
+                        if !model.cast.isEmpty || !model.crew.isEmpty {
+                            PXDetailCast(model: model)
+                        }
+                        PXDetailInfo(model: model)
+                        if !model.recommendations.isEmpty {
+                            PXDetailRecommendations(model: model) { selectedRecommendation = $0 }
+                        }
+                    }
+                    .padding(.top, 20)
+                    .padding(.bottom, 40)
                 }
             }
             .refreshable { await model.load() }
@@ -98,26 +110,6 @@ struct PXDetailView: View {
         }
     }
 
-    @ViewBuilder
-    private var content: some View {
-        switch model.tab {
-        case .overview:
-            PXDetailOverview(
-                model: model,
-                descriptionExpanded: $model.descriptionExpanded,
-                onSelectRecommendation: { selectedRecommendation = $0 },
-                onPlayEpisode: { index in Task { await model.play(index: index) } }
-            )
-        case .episodes:
-            PXDetailEpisodes(model: model) { index in
-                Task { await model.play(index: index) }
-            }
-        case .cast:
-            PXDetailCast(model: model)
-        case .info:
-            PXDetailInfo(model: model)
-        }
-    }
 
     private func share() {
         #if os(iOS)

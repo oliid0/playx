@@ -38,6 +38,10 @@ enum PXTVTab: String, CaseIterable, Identifiable, Hashable {
         }
     }
 
+    /// tvOS 侧边栏只保留 OcPlayer 同级的五个入口；电影/剧集/动漫由首页 MediaRail 进入，
+    /// 不再单独占一级导航。
+    static var sidebarTabs: [PXTVTab] { [.home, .bangumi, .moviePilot, .search, .settings] }
+
     var kind: PXMediaKind? {
         switch self {
         case .movies: .movie

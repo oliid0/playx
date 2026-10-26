@@ -54,7 +54,7 @@ struct PXTVShellView: View {
                 }
             }
             .padding(.bottom, 16)
-            ForEach(PXTVTab.allCases) { tab in
+            ForEach(PXTVTab.sidebarTabs) { tab in
                 Button {
                     app.select(tab)
                 } label: {

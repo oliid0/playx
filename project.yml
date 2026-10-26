@@ -161,6 +161,8 @@ targets:
       - path: PlayerX/PXCore/Networking/Danmaku
       - path: PlayerX/PXDesign/Tokens
       - path: PlayerX/PXDesign/Components
+        excludes:
+          - "PXCoverImage.swift"
     dependencies:
       - package: Pillarbox
         product: PillarboxPlayer

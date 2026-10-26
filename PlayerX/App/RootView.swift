@@ -50,6 +50,9 @@ struct PXRootView: View {
             app.selectedTab = .search
         }
         .onOpenURL { app.handleDeepLink($0) }
+        #if os(macOS)
+        .toolbar(app.presentedPlayer == nil ? .visible : .hidden, for: .windowToolbar)
+        #endif
     }
 
     @ViewBuilder
