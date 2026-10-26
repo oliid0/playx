@@ -11,6 +11,16 @@ struct PXSettingsHomeView: View {
         GeometryReader { proxy in
             ScrollView(showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("设置")
+                            .font(PXFont.display(32))
+                            .foregroundStyle(PXTheme.textPrimary)
+                        Text("播放、元数据、媒体源与外部服务")
+                            .font(PXFont.caption(11))
+                            .foregroundStyle(PXTheme.textTertiary)
+                    }
+                    .padding(.bottom, 2)
+
                     PXSettingsSection(title: "播放") {
                         NavigationLink {
                             PXPlaybackSettingsView()

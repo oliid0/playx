@@ -8,6 +8,7 @@ struct PXHomeView: View {
     @StateObject private var model = PXHomeViewModel()
     @ObservedObject private var history = HistoryStore.shared
     @ObservedObject private var follow = FollowStore.shared
+    @ObservedObject private var sourceStore = PXSourceConfigurationStore.shared
 
     private var continueItems: [HistoryEntry] {
         Array(history.entries.sorted { $0.updatedAt > $1.updatedAt }.prefix(12))
@@ -136,6 +137,9 @@ struct PXHomeView: View {
             }
         }
         .task { await model.loadIfNeeded() }
+        .onChange(of: sourceStore.configurations.count) { _ in
+            Task { await model.reload() }
+        }
     }
 
     private var librariesSubtitle: String {

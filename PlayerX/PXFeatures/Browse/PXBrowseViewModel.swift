@@ -78,7 +78,7 @@ final class PXBrowseViewModel: ObservableObject {
         hasMore = result.hasMore && result.items.count > 0
         warnings = result.warnings
         errorMessage = result.warnings.first
-        if reset, filter.sourceID == nil {
+        if reset {
             await loadCategoriesIfNeeded()
         }
     }
