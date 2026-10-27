@@ -10,6 +10,7 @@ extension PlaybackPlan {
         qualities: [Int]? = nil
     ) {
         self.url = streamURL
+        self.directURL = streamURL
         self.headers = headers
         self.decryptionKey = nil
         self.quality = quality

@@ -110,6 +110,7 @@ struct DetailResult: Codable {
 /// 见 Documentation/Architecture.md「已知限制」。
 struct PlaybackPlan: Codable {
     var url: String
+    var directURL: String?
     var headers: [String: String]?
     var decryptionKey: String?
     var quality: Int?

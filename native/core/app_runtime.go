@@ -138,6 +138,7 @@ type nativePlan struct {
 	DanmakuID       string            `json:"danmakuId,omitempty"`
 	Local           bool              `json:"local"`
 	URL             string            `json:"url"`
+	DirectURL       string            `json:"directUrl,omitempty"`
 	Headers         map[string]string `json:"headers"`
 	Key             string            `json:"decryptionKey,omitempty"`
 	Quality         int               `json:"quality"`

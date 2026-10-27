@@ -78,7 +78,7 @@ final class PXPlayerModel: ObservableObject {
         activateAudio()
         PXPlaybackWakeLock.begin()
         engine?.load(
-            url: URL(string: plan.url) ?? URL(string: "about:blank")!,
+            url: playbackURL(for: engineKind),
             headers: plan.headers ?? [:],
             startAt: request.startPosition,
             autoplay: true
@@ -322,6 +322,15 @@ final class PXPlayerModel: ObservableObject {
         notice = "当前内核播放失败，已切换原生 AVPlayer：\(reason)"
     }
 
+    private func playbackURL(for kind: PXPlayerEngineKind) -> URL {
+        // Erika 直接打开 CDN 原始地址；本机回环代理是给 AVPlayer/Pillarbox
+        // 做 HLS 密钥重写用的，FFmpeg 自己就能取 key，无需多一跳。
+        if kind == .erika, let direct = plan.directURL, let url = URL(string: direct) {
+            return url
+        }
+        return URL(string: plan.url) ?? URL(string: "about:blank")!
+    }
+
     private func installEngine(kind: PXPlayerEngineKind, startAt: Double, autoplay: Bool, loadNow: Bool = true) {
         guard let engine = PXPlaybackEngineFactory.resolve(kind) else { return }
         self.engine = engine
@@ -352,7 +361,7 @@ final class PXPlayerModel: ObservableObject {
         engine.setVolume(snapshot.volume)
         if loadNow {
             engine.load(
-                url: URL(string: plan.url) ?? URL(string: "about:blank")!,
+                url: playbackURL(for: kind),
                 headers: plan.headers ?? [:],
                 startAt: startAt,
                 autoplay: autoplay
