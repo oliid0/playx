@@ -53,6 +53,10 @@ jobs:
           go-version-file: native/go.mod
           cache-dependency-path: native/go.sum
 
+      - name: Test Go core
+        working-directory: native
+        run: go test ./core -count=1
+
       - name: Cache Swift Package Manager
         uses: actions/cache@v4
         with:
@@ -172,6 +176,10 @@ jobs:
           go-version-file: native/go.mod
           cache-dependency-path: native/go.sum
 
+      - name: Test Go core
+        working-directory: native
+        run: go test ./core -count=1
+
       - name: Cache Swift Package Manager
         uses: actions/cache@v4
         with:
@@ -285,6 +293,10 @@ jobs:
 
       - name: Show Xcode version
         run: xcodebuild -version
+
+      - name: Test Go core
+        working-directory: native
+        run: go test ./core -count=1
 
       - name: Cache Swift Package Manager
         uses: actions/cache@v4
