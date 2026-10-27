@@ -8,7 +8,7 @@ import MediaPlayer
 
 /// 系统 AVPlayer 内核。所有平台可用，也是 macOS 的默认内核。
 @MainActor
-final class PXAVPlayerEngine: PXBasePlaybackEngine {
+class PXAVPlayerEngine: PXBasePlaybackEngine {
     override class var kind: PXPlayerEngineKind { .native }
 
     private let player = AVPlayer()

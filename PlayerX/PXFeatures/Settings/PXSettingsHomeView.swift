@@ -1,144 +1,84 @@
 import SwiftUI
 
+/// 设置 hub：严格沿用 OcPlayer 的 `SettingsGlassPage` 卡片流和分组。
+/// 行只负责导航与当前值预览，具体控件在子页。
 struct PXSettingsHomeView: View {
     @EnvironmentObject private var app: PXAppState
     @ObservedObject private var player = PXPlayerPreferences.shared
     @ObservedObject private var settings = PXAppSettings.shared
     @ObservedObject private var bangumi = PXBangumiCoordinator.shared
     @ObservedObject private var moviePilot = PXMoviePilotCoordinator.shared
+    @ObservedObject private var sources = PXSourceConfigurationStore.shared
+    @ObservedObject private var downloads = DownloadStore.shared
 
     var body: some View {
-        GeometryReader { proxy in
-            ScrollView(showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 18) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("设置")
-                            .font(PXFont.display(32))
-                            .foregroundStyle(PXTheme.textPrimary)
-                        Text("播放、元数据、媒体源与外部服务")
-                            .font(PXFont.caption(11))
-                            .foregroundStyle(PXTheme.textTertiary)
-                    }
-                    .padding(.bottom, 2)
-
-                    PXSettingsSection(title: "播放") {
-                        NavigationLink {
-                            PXPlaybackSettingsView()
-                        } label: {
-                            PXSettingsRow(
-                                symbol: "play.circle",
-                                title: "播放内核与设置",
-                                subtitle: "竖屏 Stories / 横屏章节 / 自动连播",
-                                value: player.engine.title
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        Divider().overlay(PXTheme.stroke)
-                        NavigationLink {
-                            PXDanmakuSettingsView()
-                        } label: {
-                            PXSettingsRow(
-                                symbol: "text.bubble",
-                                title: "弹幕",
-                                subtitle: "弹弹play 匹配、字号、速度与轨道",
-                                value: player.danmakuEnabled ? "开启" : "关闭"
-                            )
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    PXSettingsSection(title: "元数据") {
-                        NavigationLink {
-                            PXTMDbSettingsView()
-                        } label: {
-                            PXSettingsRow(
-                                symbol: "sparkles.tv",
-                                title: "TMDB",
-                                subtitle: "评分、简介、演员表、季集资料",
-                                value: settings.tmdbEnabled ? "已开启" : "关闭"
-                            )
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    PXSettingsSection(title: "服务") {
-                        NavigationLink {
-                            PXBangumiSettingsView()
-                        } label: {
-                            PXSettingsRow(
-                                symbol: "calendar",
-                                title: "Bangumi",
-                                subtitle: "每日放送与追番进度",
-                                value: bangumi.isLoggedIn ? "已登录" : "未登录",
-                                tint: PXTheme.rose
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        Divider().overlay(PXTheme.stroke)
-                        NavigationLink {
-                            PXMoviePilotSettingsView()
-                        } label: {
-                            PXSettingsRow(
-                                symbol: "paperplane",
-                                title: "MoviePilot",
-                                subtitle: "找片、下载、订阅",
-                                value: moviePilot.isLoggedIn ? "已登录" : "未连接",
-                                tint: PXTheme.sky
-                            )
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    PXSettingsSection(title: "内容") {
-                        NavigationLink {
-                            PXSourceSettingsView()
-                        } label: {
-                            PXSettingsRow(
-                                symbol: "server.rack",
-                                title: "站源与片库",
-                                subtitle: "启用站源、密码锁、内容偏好",
-                                value: "\(app.availableSources.count) 个"
-                            )
-                        }
-                        .buttonStyle(.plain)
-                        Divider().overlay(PXTheme.stroke)
-                        NavigationLink {
-                            PXDownloadsView()
-                        } label: {
-                            PXSettingsRow(
-                                symbol: "arrow.down.circle",
-                                title: "下载与缓存",
-                                subtitle: "管理离线剧集与磁盘占用"
-                            )
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    PXSettingsSection(title: "其他") {
-                        NavigationLink {
-                            PXAboutView()
-                        } label: {
-                            PXSettingsRow(
-                                symbol: "info.circle",
-                                title: "关于 PlayerX",
-                                subtitle: "版本、开源许可与项目主页"
-                            )
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    Text("PlayerX · \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0")")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(PXTheme.textTertiary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 8)
+        SettingsGlassPage {
+            SettingsGlassSection("服务") {
+                SettingsNavLink(title: "媒体服务器与站源", systemImage: "server.rack", value: sourceValue) {
+                    PXSourceSettingsView()
+                        .environmentObject(app)
                 }
-                .padding(.horizontal, PXTheme.padding(for: proxy.size.width))
-                .padding(.bottom, 36)
+                SettingsGlassDivider()
+                SettingsNavLink(title: "Bangumi", systemImage: "calendar", value: bangumiValue) {
+                    PXBangumiSettingsView()
+                }
+                SettingsGlassDivider()
+                SettingsNavLink(title: "MoviePilot", systemImage: "paperplane", value: moviePilotValue) {
+                    PXMoviePilotSettingsView()
+                }
+                SettingsGlassDivider()
+                SettingsNavLink(title: "TMDB 元数据补全", systemImage: "sparkles.tv", value: settings.tmdbEnabled ? "已启用" : "未启用") {
+                    PXTMDbSettingsView()
+                }
             }
+
+            SettingsGlassSection("播放与界面") {
+                SettingsNavLink(title: "播放", systemImage: "play.circle", value: player.engine.title) {
+                    PXPlaybackSettingsView()
+                }
+                SettingsGlassDivider()
+                SettingsNavLink(title: "弹幕", systemImage: "text.bubble", value: player.danmakuEnabled ? "自动加载" : "已关闭") {
+                    PXDanmakuSettingsView()
+                }
+            }
+
+            SettingsGlassSection("应用") {
+                SettingsNavLink(title: "下载", systemImage: "arrow.down.circle", value: downloads.jobs.isEmpty ? "无任务" : "\(downloads.jobs.count) 个任务") {
+                    PXDownloadsView()
+                }
+                SettingsGlassDivider()
+                SettingsNavLink(title: "关于", systemImage: "info.circle", value: PXBundleInfo.version) {
+                    PXAboutView()
+                }
+            }
+
+            Text("This product uses the TMDB API but is not endorsed or certified by TMDB.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
         }
         .background(PXPageBackground())
         .navigationTitle("设置")
-        .pxHiddenNavigationBar()
+        .pxInlineNavigationTitle()
+        .task { await downloads.refresh() }
+    }
+
+    private var sourceValue: String {
+        let external = sources.enabledConfigurations.count
+        let stations = PXCatalogService.shared.visibleSources.filter { !$0.isExternal }.count
+        if external == 0 { return "\(stations) 个站源" }
+        return "\(stations) 站源 · \(external) 外部"
+    }
+
+    private var bangumiValue: String {
+        guard settings.bangumiEnabled else { return "已关闭" }
+        return bangumi.isLoggedIn ? (bangumi.profile?.displayName ?? "已登录") : "未登录"
+    }
+
+    private var moviePilotValue: String {
+        guard settings.moviePilotEnabled else { return "已关闭" }
+        return moviePilot.isLoggedIn ? "已登录" : "未配置"
     }
 }

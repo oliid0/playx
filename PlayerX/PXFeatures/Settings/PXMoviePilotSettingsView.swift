@@ -6,45 +6,45 @@ struct PXMoviePilotSettingsView: View {
     @State private var showLogin = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                PXSettingsSection(title: "服务器") {
-                    if coordinator.isLoggedIn {
-                        PXSettingsRow(
-                            symbol: "checkmark.seal.fill",
-                            title: coordinator.user?.name ?? "已连接",
-                            subtitle: settings.moviePilotURL,
-                            value: "在线",
-                            tint: PXTheme.mint
-                        )
-                        Divider().overlay(PXTheme.stroke)
+        SettingsGlassPage {
+            SettingsGlassSection("服务器") {
+                if coordinator.isLoggedIn {
+                    HStack(spacing: 10) {
+                        Image(systemName: "checkmark.seal.fill").foregroundStyle(PXTheme.mint)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(coordinator.user?.name ?? "已连接").font(.body.weight(.semibold))
+                            Text(settings.moviePilotURL).font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
                     }
-                    Button {
-                        showLogin = true
-                    } label: {
-                        PXSettingsRow(
-                            symbol: "person.badge.key",
-                            title: coordinator.isLoggedIn ? "切换账号" : "连接 MoviePilot",
-                            subtitle: "地址 / 用户名 / 密码",
-                            value: coordinator.isLoggedIn ? "已登录" : "未登录"
-                        )
+                    .settingsRow()
+                    SettingsGlassDivider()
+                    SettingsActionRow("切换账号", systemImage: "person.badge.key") { showLogin = true }
+                    SettingsGlassDivider()
+                    SettingsActionRow("退出登录", systemImage: "rectangle.portrait.and.arrow.right", role: .destructive) {
+                        coordinator.logout()
                     }
-                    .buttonStyle(.plain)
+                } else {
+                    SettingsActionRow("连接 MoviePilot", systemImage: "person.badge.key") { showLogin = true }
+                    SettingsNote("填写自建 MoviePilot 地址、用户名和密码；凭证只保存在本机。")
                 }
-                PXSettingsSection(title: "功能") {
-                    ToggleRow(title: "启用 MoviePilot", subtitle: "在标签栏显示找片分区", isOn: $settings.moviePilotEnabled)
-                    Divider().overlay(PXTheme.stroke)
-                    ToggleRow(title: "后台轮询下载", subtitle: "找片页打开时每 5 秒刷新进度", isOn: .constant(true))
-                }
-                if let error = coordinator.errorMessage {
-                    PXErrorBanner(message: error)
-                }
-                Text("MoviePilot 是自建服务；地址与凭证只保存在本机。资源搜索走服务端站点聚合。")
-                    .font(.system(size: 10)).foregroundStyle(PXTheme.textTertiary)
             }
-            .padding(20)
+
+            SettingsGlassSection("功能") {
+                Toggle("启用 MoviePilot 分区", isOn: $settings.moviePilotEnabled)
+                SettingsGlassDivider()
+                Toggle("下载进度后台轮询", isOn: .constant(true))
+                SettingsNote("找片页打开时每 5 秒刷新下载任务。")
+            }
+
+            if let error = coordinator.errorMessage {
+                SettingsInlineError(error)
+            }
+
+            SettingsGlassSection("关于") {
+                SettingsNote("资源搜索由 MoviePilot 服务端聚合站点完成；PlayerX 只负责展示与提交下载/订阅。")
+            }
         }
-        .background(PXPageBackground())
         .navigationTitle("MoviePilot")
         .pxInlineNavigationTitle()
         .sheet(isPresented: $showLogin) { PXMoviePilotLoginView() }

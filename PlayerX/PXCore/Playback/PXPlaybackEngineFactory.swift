@@ -7,6 +7,8 @@ enum PXPlaybackEngineFactory {
         case .pillarbox:
             #if canImport(PillarboxPlayer)
             return PXPillarboxEngine()
+            #elseif os(macOS)
+            return PXMacPillarboxEngine()
             #else
             return PXAVPlayerEngine()
             #endif

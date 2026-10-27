@@ -36,7 +36,7 @@ enum PXPlayerEngineKind: String, CaseIterable, Codable, Identifiable, Hashable {
     var isAvailable: Bool {
         switch self {
         case .pillarbox:
-            #if os(iOS) || os(tvOS)
+            #if os(iOS) || os(tvOS) || os(macOS)
             true
             #else
             false
@@ -75,7 +75,7 @@ enum PXPlayerEngineKind: String, CaseIterable, Codable, Identifiable, Hashable {
 
     static var defaultKind: PXPlayerEngineKind {
         #if os(macOS)
-        .native
+        .erika
         #else
         .pillarbox
         #endif

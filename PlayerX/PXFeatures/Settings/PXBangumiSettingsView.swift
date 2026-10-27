@@ -6,57 +6,57 @@ struct PXBangumiSettingsView: View {
     @State private var showLogin = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                PXSettingsSection(title: "账号") {
-                    if let profile = coordinator.profile {
-                        HStack(spacing: 11) {
-                            PXRemoteImage(url: profile.avatar?.best, maxPixel: 160)
-                                .frame(width: 46, height: 46).clipShape(Circle())
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(profile.displayName).font(.system(size: 13, weight: .semibold)).foregroundStyle(PXTheme.textPrimary)
-                                Text("@\(profile.username)").font(.system(size: 10)).foregroundStyle(PXTheme.textTertiary)
-                            }
-                            Spacer()
-                            Button("切换") { showLogin = true }
-                                .font(.system(size: 11, weight: .semibold))
-                                .foregroundStyle(PXTheme.accent)
+        SettingsGlassPage {
+            SettingsGlassSection("账号") {
+                if let profile = coordinator.profile {
+                    HStack(spacing: 12) {
+                        PXRemoteImage(url: profile.avatar?.best, maxPixel: 160)
+                            .frame(width: 44, height: 44)
+                            .clipShape(Circle())
+                            .overlay(Circle().strokeBorder(PXTheme.stroke))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(profile.displayName).font(.body.weight(.semibold))
+                            Text("@\(profile.username)").font(.caption).foregroundStyle(.secondary)
                         }
-                        .padding(.vertical, 9)
-                    } else {
-                        Button {
-                            showLogin = true
-                        } label: {
-                            PXSettingsRow(symbol: "person.badge.key", title: "登录 Bangumi", subtitle: "使用 access_token 同步收藏与进度")
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                PXSettingsSection(title: "偏好") {
-                    ToggleRow(title: "启用 Bangumi", subtitle: "在标签栏显示追番分区", isOn: $settings.bangumiEnabled)
-                    Divider().overlay(PXTheme.stroke)
-                    ToggleRow(title: "优先中文名", subtitle: "显示条目时优先 name_cn", isOn: $settings.bangumiPreferChinese)
-                    Divider().overlay(PXTheme.stroke)
-                    HStack {
-                        Text("用户名").font(.system(size: 13)).foregroundStyle(PXTheme.textPrimary)
                         Spacer()
-                        Text(settings.bangumiUsername.isEmpty ? "未设置" : settings.bangumiUsername)
-                            .font(.system(size: 11)).foregroundStyle(PXTheme.textTertiary)
+                        Button("切换") { showLogin = true }
+                            .buttonStyle(.bordered)
                     }
-                    .padding(.vertical, 8)
+                    .settingsRow()
+                    SettingsGlassDivider()
+                    SettingsActionRow("退出 Bangumi", systemImage: "rectangle.portrait.and.arrow.right", role: .destructive) {
+                        coordinator.logout()
+                    }
+                } else {
+                    SettingsActionRow("登录 Bangumi", systemImage: "person.badge.key") {
+                        showLogin = true
+                    }
+                    SettingsNote("使用 Bangumi 个人 access_token。登录后可同步想看/在看/看过与单集进度。")
                 }
-                if let error = coordinator.errorMessage {
-                    PXErrorBanner(message: error)
-                }
-                Button("打开 Bangumi 分区") {
-                    // 由根导航处理；设置页只负责关闭当前层。
-                }
-                .buttonStyle(PXSecondaryButtonStyle())
-                .frame(maxWidth: .infinity)
             }
-            .padding(20)
+
+            SettingsGlassSection("显示") {
+                Toggle("启用 Bangumi 分区", isOn: $settings.bangumiEnabled)
+                SettingsGlassDivider()
+                Toggle("优先中文名", isOn: $settings.bangumiPreferChinese)
+                SettingsGlassDivider()
+                HStack {
+                    Text("用户名")
+                    Spacer()
+                    Text(settings.bangumiUsername.isEmpty ? "未设置" : settings.bangumiUsername)
+                        .foregroundStyle(.secondary)
+                }
+                .settingsRow()
+            }
+
+            if let error = coordinator.errorMessage {
+                SettingsInlineError(error)
+            }
+
+            SettingsGlassSection("关于") {
+                SettingsNote("Bangumi 数据来自 api.bgm.tv。剧集收藏与进度通过官方 v0 API 读写。")
+            }
         }
-        .background(PXPageBackground())
         .navigationTitle("Bangumi")
         .pxInlineNavigationTitle()
         .sheet(isPresented: $showLogin) { PXBangumiLoginView() }

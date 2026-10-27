@@ -9,29 +9,17 @@ struct PXSourceSettingsView: View {
     @State private var showLock = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                externalSection
-                stationSection
-                accessSection
-                ToggleRow(title: "显示成人内容", subtitle: "部分站源可能返回 R18 条目", isOn: $settings.showAdultContent)
-            }
-            .padding(20)
-        }
-        .background(PXPageBackground())
-        .navigationTitle("媒体源")
-        .pxInlineNavigationTitle()
-        .sheet(item: $editing) { configuration in
-            PXSourceEditorView(configuration: configuration)
-        }
-        .sheet(isPresented: $showLock) { SourceLockView() }
-    }
-
-    private var externalSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("外部媒体源").font(PXFont.section(16)).foregroundStyle(PXTheme.textPrimary)
-                Spacer()
+        SettingsGlassPage {
+            SettingsGlassSection("外部媒体源") {
+                if store.configurations.isEmpty {
+                    SettingsNote("还没有外部源。可添加 Jellyfin / Emby、WebDAV、NAS、Alist 或 MacCMS。")
+                } else {
+                    ForEach(Array(store.configurations.enumerated()), id: \.element.id) { index, configuration in
+                        if index > 0 { SettingsGlassDivider() }
+                        externalRow(configuration)
+                    }
+                }
+                SettingsGlassDivider()
                 Menu {
                     ForEach([PXSourceKind.jellyfin, .emby, .webdav, .nas, .alist, .maccms]) { kind in
                         Button {
@@ -41,73 +29,31 @@ struct PXSourceSettingsView: View {
                         }
                     }
                 } label: {
-                    Label("添加", systemImage: "plus")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(PXTheme.accent)
+                    HStack(spacing: SettingsMetrics.iconLabelSpacing) {
+                        Image(systemName: "plus.circle")
+                            .font(.system(size: SettingsMetrics.iconGlyphSize))
+                            .frame(width: SettingsMetrics.iconColumnWidth)
+                        Text("添加媒体源")
+                        Spacer()
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                    .contentShape(.rect)
                 }
+                .buttonStyle(.plain)
             }
-            if store.configurations.isEmpty {
-                Text("还没有外部源。可添加 Jellyfin / Emby、WebDAV、NAS、Alist 或 MacCMS。")
-                    .font(.system(size: 10)).foregroundStyle(PXTheme.textTertiary)
-                    .pxFlatCard()
-            } else {
-                ForEach(store.configurations) { configuration in
-                    externalRow(configuration)
-                }
-            }
-        }
-    }
 
-    private func externalRow(_ configuration: PXSourceConfiguration) -> some View {
-        HStack(spacing: 11) {
-            Image(systemName: configuration.kind.symbol)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(configuration.enabled ? PXTheme.accent : PXTheme.textTertiary)
-                .frame(width: 28)
-            Button {
-                editing = configuration
-            } label: {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(configuration.displayName)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(PXTheme.textPrimary)
-                    Text(configuration.kind.title + ((configuration.normalizedBaseURL?.host).map { " · \($0)" } ?? ""))
-                        .font(.system(size: 9))
-                        .foregroundStyle(PXTheme.textTertiary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .buttonStyle(.plain)
-            Toggle("", isOn: Binding(
-                get: { configuration.enabled },
-                set: { store.setEnabled($0, id: configuration.id) }
-            ))
-            .labelsHidden()
-            .tint(PXTheme.accent)
-            Menu {
-                Button("编辑") { editing = configuration }
-                Button("删除", role: .destructive) { store.delete(id: configuration.id) }
-            } label: {
-                Image(systemName: "ellipsis").foregroundStyle(PXTheme.textTertiary)
-            }
-        }
-        .padding(10)
-        .background(PXTheme.surfaceMuted, in: RoundedRectangle(cornerRadius: 11))
-    }
-
-    private var stationSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("内置站源").font(PXFont.section(16)).foregroundStyle(PXTheme.textPrimary)
-            PXSettingsSection(title: nil) {
-                ForEach(SourceRegistry.stationSources) { descriptor in
-                    HStack(spacing: 11) {
-                        Image(systemName: "play.rectangle.fill")
-                            .foregroundStyle(isStationEnabled(descriptor) ? PXTheme.accent : PXTheme.textTertiary)
-                            .frame(width: 24)
+            SettingsGlassSection("内置站源") {
+                ForEach(Array(SourceRegistry.stationSources.enumerated()), id: \.element.id) { index, descriptor in
+                    if index > 0 { SettingsGlassDivider() }
+                    HStack(spacing: SettingsMetrics.iconLabelSpacing) {
+                        Image(systemName: "antenna.radiowaves.left.and.right")
+                            .font(.system(size: SettingsMetrics.iconGlyphSize))
+                            .frame(width: SettingsMetrics.iconColumnWidth)
+                            .foregroundStyle(.primary)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(descriptor.displayName).font(.system(size: 13)).foregroundStyle(PXTheme.textPrimary)
+                            Text(descriptor.displayName)
                             Text(PXCatalogService.sourceTagline(descriptor.id))
-                                .font(.system(size: 9)).foregroundStyle(PXTheme.textTertiary)
+                                .font(.caption).foregroundStyle(.secondary)
                         }
                         Spacer()
                         Toggle("", isOn: Binding(
@@ -115,31 +61,54 @@ struct PXSourceSettingsView: View {
                             set: { toggleStation(descriptor.id, enabled: $0) }
                         ))
                         .labelsHidden()
-                        .tint(PXTheme.accent)
                         .disabled(!descriptor.defaultVisible && !lock.isUnlockedThisLaunch)
                     }
-                    .padding(.vertical, 8)
-                    if descriptor.id != SourceRegistry.stationSources.last?.id {
-                        Divider().overlay(PXTheme.stroke)
-                    }
+                    .settingsRow()
                 }
             }
+
+            SettingsGlassSection("访问控制") {
+                SettingsActionRow(lock.hasPassword ? "站源密码锁（已设置）" : "设置站源密码锁", systemImage: "lock.shield") {
+                    showLock = true
+                }
+                SettingsGlassDivider()
+                Toggle("显示成人内容", isOn: $settings.showAdultContent)
+            }
         }
+        .navigationTitle("媒体服务器与站源")
+        .pxInlineNavigationTitle()
+        .sheet(item: $editing) { configuration in
+            PXSourceEditorView(configuration: configuration)
+        }
+        .sheet(isPresented: $showLock) { SourceLockView() }
     }
 
-    private var accessSection: some View {
-        PXSettingsSection(title: "访问控制") {
-            Button { showLock = true } label: {
-                PXSettingsRow(
-                    symbol: lock.hasPassword ? "lock.shield.fill" : "lock.shield",
-                    title: "站源密码锁",
-                    subtitle: lock.hasPassword ? "隐藏站源需解锁" : "保护隐藏站源",
-                    value: lock.isUnlockedThisLaunch ? "已解锁" : nil,
-                    tint: PXTheme.warning
-                )
+    private func externalRow(_ configuration: PXSourceConfiguration) -> some View {
+        HStack(spacing: SettingsMetrics.iconLabelSpacing) {
+            Image(systemName: configuration.kind.symbol)
+                .font(.system(size: SettingsMetrics.iconGlyphSize))
+                .frame(width: SettingsMetrics.iconColumnWidth)
+                .foregroundStyle(configuration.enabled ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiary))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(configuration.displayName)
+                Text(configuration.kind.title + ((configuration.normalizedBaseURL?.host).map { " · \($0)" } ?? ""))
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            .buttonStyle(.plain)
+            Spacer()
+            Toggle("", isOn: Binding(
+                get: { configuration.enabled },
+                set: { store.setEnabled($0, id: configuration.id) }
+            ))
+            .labelsHidden()
+            Menu {
+                Button("编辑") { editing = configuration }
+                Button("删除", role: .destructive) { store.delete(id: configuration.id) }
+            } label: {
+                Image(systemName: "ellipsis").foregroundStyle(.secondary)
+            }
+            .fixedSize()
         }
+        .settingsRow()
     }
 
     private func isStationEnabled(_ descriptor: SourceDescriptor) -> Bool {
@@ -149,14 +118,9 @@ struct PXSourceSettingsView: View {
     }
 
     private func toggleStation(_ id: String, enabled: Bool) {
-        var ids = SourceRegistry.stationSources
-            .filter { isStationEnabled($0) }
-            .map(\.id)
-        if enabled {
-            if !ids.contains(id) { ids.append(id) }
-        } else {
-            ids.removeAll { $0 == id }
-        }
+        var ids = SourceRegistry.stationSources.filter { isStationEnabled($0) }.map(\.id)
+        if enabled { if !ids.contains(id) { ids.append(id) } }
+        else { ids.removeAll { $0 == id } }
         settings.preferredSourceIDs = ids
     }
 }
