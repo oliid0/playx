@@ -19,7 +19,12 @@ enum PXPlayerEngineKind: String, CaseIterable, Codable, Identifiable, Hashable {
 
     var summary: String {
         switch self {
-        case .pillarbox: "SRG SSR · 系统播放队列 · 画中画 / AirPlay"
+        case .pillarbox:
+            #if os(macOS)
+            "Pillarbox 兼容 · AVFoundation 承载 · 画中画 / AirPlay"
+            #else
+            "SRG SSR · 系统播放队列 · 画中画 / AirPlay"
+            #endif
         case .erika: "Rust · FFmpeg · libass · Metal"
         case .native: "Apple AVFoundation · 零额外依赖"
         }

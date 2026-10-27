@@ -74,7 +74,7 @@ final class PXPlayerPreferences: ObservableObject {
     private let defaults = UserDefaults.standard
 
     private enum Keys {
-        static let engine = "playerx.player.engine.v2"
+        static let engine = "playerx.player.engine.v3"
         static let portraitStories = "playerx.player.portraitStories.v1"
         static let autoNext = "playerx.player.autoNext.v2"
         static let autoNextSeconds = "playerx.player.autoNextSeconds.v1"
