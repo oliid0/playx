@@ -29,7 +29,7 @@ struct PXMacTopBar: View {
                         app.selectTab(tab)
                     } label: {
                         HStack(spacing: 6) {
-                            Image(systemName: tab.symbol).font(.system(size: 11, weight: .semibold))
+                            tabIcon(tab)
                             Text(tab.title).font(.system(size: 12, weight: .semibold))
                         }
                         .foregroundStyle(app.selectedTab == tab ? PXTheme.textPrimary : PXTheme.textSecondary)
@@ -62,6 +62,18 @@ struct PXMacTopBar: View {
         .frame(maxWidth: 1_100)
         .frame(maxWidth: .infinity)
         .background(PXTheme.background.opacity(0.72))
+    }
+
+    @ViewBuilder
+    private func tabIcon(_ tab: PXTab) -> some View {
+        switch tab {
+        case .bangumi:
+            Image("bangumi-logo").renderingMode(.template).resizable().scaledToFit().frame(width: 13, height: 13)
+        case .moviePilot:
+            Image("moviepilot-logo").renderingMode(.template).resizable().scaledToFit().frame(width: 14, height: 12)
+        default:
+            Image(systemName: tab.symbol).font(.system(size: 11, weight: .semibold))
+        }
     }
 }
 #endif

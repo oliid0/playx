@@ -19,15 +19,15 @@ struct PXSettingsHomeView: View {
                         .environmentObject(app)
                 }
                 SettingsGlassDivider()
-                SettingsNavLink(title: "Bangumi", systemImage: "calendar", value: bangumiValue) {
+                SettingsNavLink(title: "Bangumi", icon: .brand(name: "bangumi-logo", aspect: 0.94), value: bangumiValue) {
                     PXBangumiSettingsView()
                 }
                 SettingsGlassDivider()
-                SettingsNavLink(title: "MoviePilot", systemImage: "paperplane", value: moviePilotValue) {
+                SettingsNavLink(title: "MoviePilot", icon: .brand(name: "moviepilot-logo", aspect: 0.86), value: moviePilotValue) {
                     PXMoviePilotSettingsView()
                 }
                 SettingsGlassDivider()
-                SettingsNavLink(title: "TMDB 元数据补全", systemImage: "sparkles.tv", value: settings.tmdbEnabled ? "已启用" : "未启用") {
+                SettingsNavLink(title: "TMDB 元数据补全", icon: .brand(name: "tmdb-logo", aspect: 2.33), value: settings.tmdbEnabled ? "已启用" : "未启用") {
                     PXTMDbSettingsView()
                 }
                 SettingsGlassDivider()

@@ -86,13 +86,25 @@ struct PXRootView: View {
 
             if settings.bangumiEnabled {
                 NavigationStack { PXBangumiHomeView() }
-                    .tabItem { Label(PXTab.bangumi.title, systemImage: PXTab.bangumi.symbol) }
+                    .tabItem {
+                        Label {
+                            Text(PXTab.bangumi.title)
+                        } icon: {
+                            Image("bangumi-logo").renderingMode(.template)
+                        }
+                    }
                     .tag(PXTab.bangumi)
             }
 
             if settings.moviePilotEnabled {
                 NavigationStack { PXMoviePilotHomeView() }
-                    .tabItem { Label(PXTab.moviePilot.title, systemImage: PXTab.moviePilot.symbol) }
+                    .tabItem {
+                        Label {
+                            Text(PXTab.moviePilot.title)
+                        } icon: {
+                            Image("moviepilot-logo").renderingMode(.template)
+                        }
+                    }
                     .tag(PXTab.moviePilot)
             }
 
