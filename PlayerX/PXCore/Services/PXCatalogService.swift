@@ -265,7 +265,16 @@ final class PXCatalogService {
             }
             var warning = response.warning
             if response.items.isEmpty == false && entries.isEmpty {
-                warning = "\(descriptor.displayName) 返回了 \(response.items.count) 条，但均与关键词无关"
+                // 站源搜索经常按演员、别名或站内标签命中，标题本身未必含关键词。
+                // 少量结果保留源排序，避免把有效结果误杀；大批量未命中才视为噪声。
+                if response.items.count <= 30 {
+                    entries = response.items.map {
+                        PXCatalogEntry(drama: $0, section: section, providerID: descriptor.id)
+                    }
+                    warning = "\(descriptor.displayName) 按站内关键词命中，标题未直接包含关键词"
+                } else {
+                    warning = "\(descriptor.displayName) 返回了 \(response.items.count) 条，但均与关键词无关"
+                }
             }
             return SearchOneOutcome(entries: entries, warning: warning, topScore: topScore)
         }
