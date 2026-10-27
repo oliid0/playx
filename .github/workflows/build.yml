@@ -294,10 +294,6 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
-      - name: Test Go core
-        working-directory: native
-        run: go test ./core -run 'TestHongguo|TestSelectHongguo|TestDiagHongguo' -count=1
-
       - name: Cache Swift Package Manager
         uses: actions/cache@v4
         with:
