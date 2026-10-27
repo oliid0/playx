@@ -5,6 +5,7 @@ struct PXDanmakuSettingsView: View {
     @ObservedObject private var settings = PXAppSettings.shared
     @State private var testResult: String?
     @State private var isTesting = false
+    @StateObject private var danmaku = PXDanmakuCoordinator()
 
     var body: some View {
         SettingsGlassPage {
@@ -45,7 +46,7 @@ struct PXDanmakuSettingsView: View {
             SettingsGlassSection("弹幕引擎") {
                 SettingsNote("内置弹弹play 网关；弹幕由播放器覆盖层绘制，三个内核共用同一套轨道与样式。")
                 SettingsActionRow("清除当前弹幕缓存", systemImage: "trash") {
-                    PXDanmakuCoordinator.shared.clear()
+                    danmaku.clear()
                 }
             }
         }

@@ -38,7 +38,7 @@ struct PXMoviePilotSettingsView: View {
             }
 
             if let error = coordinator.errorMessage {
-                SettingsInlineError(error)
+                SettingsInlineError(message: error)
             }
 
             SettingsGlassSection("关于") {

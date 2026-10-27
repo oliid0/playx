@@ -37,7 +37,7 @@ struct PXTMDbSettingsView: View {
             }
 
             if let error = metadata.lastError {
-                SettingsInlineError(error)
+                SettingsInlineError(message: error)
             }
 
             SettingsGlassSection("说明") {
