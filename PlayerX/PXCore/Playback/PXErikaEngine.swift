@@ -50,7 +50,11 @@ final class PXErikaEngine: PXBasePlaybackEngine {
         pendingStart = startAt
         autoPlay = autoplay
         publish { $0 = .init(); $0.state = .opening }
-        let source = PlaybackSource(uri: url.absoluteString, headers: headers)
+        // Go 核心的播放地址是本机回环代理，认证头由代理内部附加；把 CDN
+        // Referer/UA 再塞给 FFmpeg 会污染对 127.0.0.1 的请求。
+        let host = url.host?.lowercased() ?? ""
+        let effectiveHeaders = (host == "127.0.0.1" || host == "localhost" || host == "::1") ? [:] : headers
+        let source = PlaybackSource(uri: url.absoluteString, headers: effectiveHeaders)
         let volume = snapshot.volume
         openTask?.cancel()
         openTask = Task { @MainActor [weak self] in

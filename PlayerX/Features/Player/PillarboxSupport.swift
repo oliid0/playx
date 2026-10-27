@@ -67,8 +67,16 @@ private final class HeaderResourceLoader: NSObject, AVAssetResourceLoaderDelegat
 
                 if let information = loadingRequest.contentInformationRequest {
                     information.contentType = http.mimeType
-                    information.contentLength = Int64(data.count)
-                    information.isByteRangeAccessSupported = true
+                    if let range = http.value(forHTTPHeaderField: "Content-Range"),
+                       let total = range.split(separator: "/").last.flatMap({ Int64($0) }) {
+                        information.contentLength = total
+                    } else if let length = http.value(forHTTPHeaderField: "Content-Length").flatMap({ Int64($0) }) {
+                        information.contentLength = (dataRequest?.requestedOffset ?? 0) + length
+                    } else {
+                        information.contentLength = -1
+                    }
+                    information.isByteRangeAccessSupported = http.statusCode == 206
+                        || (http.value(forHTTPHeaderField: "Accept-Ranges")?.lowercased() == "bytes")
                 }
                 dataRequest?.respond(with: data)
                 loadingRequest.finishLoading()
@@ -109,6 +117,11 @@ enum PlayerXAssetProvider: URLAssetLoaderProvider {
     }
 }
 
+private func isLoopback(_ url: URL) -> Bool {
+    guard let host = url.host?.lowercased() else { return false }
+    return host == "127.0.0.1" || host == "localhost" || host == "::1"
+}
+
 @MainActor
 enum PillarboxPlayback {
     /// 外部媒体源（Emby / Jellyfin / WebDAV / MacCMS）的直链通常要带
@@ -120,7 +133,10 @@ enum PillarboxPlayback {
         identifier: String,
         title: String
     ) -> PillarboxPlayer.PlayerItem {
-        guard !headers.isEmpty,
+        // Go 核心返回的是 127.0.0.1 回环代理；请求头已经由代理内部附加，
+        // AVPlayer 对回环地址不需要也不应该再走自定义 scheme/loader。
+        let effectiveHeaders = isLoopback(url) ? [:] : headers
+        guard !effectiveHeaders.isEmpty,
               var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
             return .simple(url: url)
         }
@@ -133,18 +149,19 @@ enum PillarboxPlayback {
         let metadata = AssetMetadata<PlayerXStreamData>(
             identifier: identifier,
             title: title,
-            customData: PlayerXStreamData(headers: headers)
+            customData: PlayerXStreamData(headers: effectiveHeaders)
         )
         return .custom(assetProviderType: PlayerXAssetProvider.self, url: customURL, metadata: metadata)
     }
 
     static func makeItem(drama: Drama, chapter: Chapter?, plan: PlaybackPlan) -> PillarboxPlayer.PlayerItem? {
         guard let url = URL(string: plan.url) else { return nil }
+        let headers = isLoopback(url) ? [:] : (plan.headers ?? [:])
         let metadata = AssetMetadata<PlayerXStreamData>(
             identifier: drama.id,
             title: drama.title,
             subtitle: chapter?.title,
-            customData: PlayerXStreamData(headers: plan.headers ?? [:])
+            customData: PlayerXStreamData(headers: headers)
         )
         return PillarboxPlayer.PlayerItem.custom(
             assetProviderType: PlayerXAssetProvider.self,

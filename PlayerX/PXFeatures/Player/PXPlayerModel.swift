@@ -31,6 +31,7 @@ final class PXPlayerModel: ObservableObject {
     private var lastSavedAt = Date.distantPast
     private var lastNowPlayingUpdate = Date.distantPast
     private var currentRate: Double
+    private var didFallbackEngine = false
 
     init(request: PXPlaybackRequest) {
         self.request = request
@@ -72,6 +73,7 @@ final class PXPlayerModel: ObservableObject {
     func start() {
         guard !hasStarted else { return }
         hasStarted = true
+        didFallbackEngine = false
         activateAudio()
         PXPlaybackWakeLock.begin()
         engine?.load(
@@ -207,6 +209,7 @@ final class PXPlayerModel: ObservableObject {
             engine?.stop()
             plan = resolved
             currentIndex = index
+            didFallbackEngine = false
             installEngine(kind: engineKind, startAt: 0, autoplay: true)
             loadDanmaku()
         } catch {
@@ -243,6 +246,7 @@ final class PXPlayerModel: ObservableObject {
         engine?.stop()
         engineKind = kind
         preferences.engine = kind
+        didFallbackEngine = false
         installEngine(kind: kind, startAt: position, autoplay: wasPlaying)
     }
 
@@ -298,6 +302,14 @@ final class PXPlayerModel: ObservableObject {
         #endif
     }
 
+    private func fallbackToNative(reason: String) {
+        let position = snapshot.currentTime
+        engine?.stop()
+        engineKind = .native
+        installEngine(kind: .native, startAt: position, autoplay: true)
+        notice = "当前内核播放失败，已切换原生 AVPlayer：\(reason)"
+    }
+
     private func installEngine(kind: PXPlayerEngineKind, startAt: Double, autoplay: Bool, loadNow: Bool = true) {
         guard let engine = PXPlaybackEngineFactory.resolve(kind) else { return }
         self.engine = engine
@@ -308,6 +320,12 @@ final class PXPlayerModel: ObservableObject {
             self.snapshot = snapshot
             if snapshot.state == .ended, previousState != .ended {
                 self.handleEnded()
+            }
+            if case .failed(let message) = snapshot.state,
+               !self.didFallbackEngine,
+               self.engineKind != .native {
+                self.didFallbackEngine = true
+                self.fallbackToNative(reason: message)
             }
             if snapshot.state.isPlaying, !previousState.isPlaying {
                 self.activateAudio()

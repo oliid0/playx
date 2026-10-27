@@ -15,15 +15,22 @@ struct PXMacTopBar: View {
     }
 
     var body: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 12) {
             HStack(spacing: 9) {
                 PXLogoMark(size: 30)
-                Text("PlayerX")
-                    .font(.system(size: 15, weight: .heavy, design: .rounded))
-                    .foregroundStyle(PXTheme.textPrimary)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("PLAYERX")
+                        .font(.system(size: 13, weight: .heavy, design: .rounded))
+                        .kerning(0.8)
+                        .foregroundStyle(PXTheme.textPrimary)
+                    Text(app.selectedTab.title)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(PXTheme.textTertiary)
+                }
             }
-            Spacer(minLength: 18)
-            HStack(spacing: 4) {
+            .frame(minWidth: 128, alignment: .leading)
+
+            HStack(spacing: 3) {
                 ForEach(tabs) { tab in
                     Button {
                         app.selectTab(tab)
@@ -34,7 +41,7 @@ struct PXMacTopBar: View {
                         }
                         .foregroundStyle(app.selectedTab == tab ? PXTheme.textPrimary : PXTheme.textSecondary)
                         .padding(.horizontal, 12)
-                        .frame(height: 32)
+                        .frame(height: 31)
                         .background(
                             app.selectedTab == tab ? PXTheme.surfaceStrong : .clear,
                             in: Capsule()
@@ -43,25 +50,32 @@ struct PXMacTopBar: View {
                     .buttonStyle(.plain)
                 }
             }
-            .padding(4)
+            .padding(3)
             .background(.ultraThinMaterial, in: Capsule())
             .overlay(Capsule().strokeBorder(PXTheme.stroke, lineWidth: 0.7))
-            Spacer(minLength: 18)
-            Button {
-                app.selectTab(.search)
-            } label: {
-                Image(systemName: PXTab.search.symbol)
+            .fixedSize()
+
+            Spacer(minLength: 16)
+
+            HStack(spacing: 8) {
+                Button {
+                    app.selectTab(.search)
+                } label: {
+                    Image(systemName: PXTab.search.symbol)
+                }
+                .buttonStyle(PXIconButtonStyle(size: 32))
+                .foregroundStyle(app.selectedTab == .search ? PXTheme.accent : PXTheme.textPrimary)
+                .accessibilityLabel("搜索全部媒体库")
             }
-            .buttonStyle(PXIconButtonStyle(size: 32))
-            .foregroundStyle(app.selectedTab == .search ? PXTheme.accent : PXTheme.textPrimary)
-            .accessibilityLabel("搜索全部媒体库")
         }
-        .padding(.horizontal, 22)
-        .padding(.top, 12)
-        .padding(.bottom, 8)
-        .frame(maxWidth: 1_100)
-        .frame(maxWidth: .infinity)
-        .background(PXTheme.background.opacity(0.72))
+        .padding(.horizontal, 18)
+        .padding(.top, 9)
+        .padding(.bottom, 7)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(PXTheme.stroke).frame(height: 1)
+        }
     }
 
     @ViewBuilder
