@@ -72,7 +72,7 @@ struct PXSettingsHomeView: View {
                 .padding(.vertical, 12)
         }
         .background(PXPageBackground())
-        .navigationTitle("设置")
+        .navigationTitle("")
         .pxInlineNavigationTitle()
         .task { await downloads.refresh() }
     }

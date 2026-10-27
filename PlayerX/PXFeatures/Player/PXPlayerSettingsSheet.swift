@@ -2,9 +2,15 @@ import SwiftUI
 
 struct PXPlayerSettingsSheet: View {
     @ObservedObject var model: PXPlayerModel
+    @ObservedObject private var sleepTimer: PXPlaybackSleepTimer
     @ObservedObject private var preferences = PXPlayerPreferences.shared
     @ObservedObject private var appSettings = PXAppSettings.shared
     @Environment(\.dismiss) private var dismiss
+
+    init(model: PXPlayerModel) {
+        self.model = model
+        self.sleepTimer = model.sleepTimer
+    }
 
     var body: some View {
         NavigationStack {

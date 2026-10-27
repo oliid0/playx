@@ -21,6 +21,7 @@ final class PXPlayerModel: ObservableObject {
     @Published var notice: String?
 
     let danmaku = PXDanmakuCoordinator()
+    let sleepTimer = PXPlaybackSleepTimer()
     private(set) var engine: (any PXPlaybackEngine)?
     private let history = HistoryStore.shared
     private let preferences = PXPlayerPreferences.shared
@@ -42,6 +43,10 @@ final class PXPlayerModel: ObservableObject {
         let preferred = request.preferredEngine ?? PXPlayerPreferences.shared.engine
         self.engineKind = preferred.isAvailable ? preferred : .native
         installEngine(kind: engineKind, startAt: request.startPosition, autoplay: false, loadNow: false)
+        sleepTimer.onFire = { [weak self] in
+            self?.pause()
+            self?.notice = "睡眠定时已暂停播放"
+        }
     }
 
     var currentChapter: Chapter? {
@@ -83,6 +88,7 @@ final class PXPlayerModel: ObservableObject {
     func stop() {
         nextTask?.cancel()
         hideTask?.cancel()
+        sleepTimer.cancel()
         saveProgress(force: true)
         engine?.stop()
         engine?.onChange = nil
