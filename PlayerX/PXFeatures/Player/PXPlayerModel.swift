@@ -28,6 +28,7 @@ final class PXPlayerModel: ObservableObject {
     private var hideTask: Task<Void, Never>?
     private var hasStarted = false
     private var lastSavedAt = Date.distantPast
+    private var lastNowPlayingUpdate = Date.distantPast
     private var currentRate: Double
 
     init(request: PXPlaybackRequest) {
@@ -67,6 +68,7 @@ final class PXPlayerModel: ObservableObject {
         guard !hasStarted else { return }
         hasStarted = true
         activateAudio()
+        PXPlaybackWakeLock.begin()
         engine?.load(
             url: URL(string: plan.url) ?? URL(string: "about:blank")!,
             headers: plan.headers ?? [:],
@@ -87,6 +89,8 @@ final class PXPlayerModel: ObservableObject {
         engine = nil
         danmaku.clear()
         deactivateAudio()
+        PXPlaybackWakeLock.end()
+        PXPlaybackNowPlayingCenter.clear()
     }
 
     func togglePlayPause() {
@@ -304,6 +308,10 @@ final class PXPlayerModel: ObservableObject {
                 self.scheduleHide()
             }
             self.saveProgress(force: false)
+            if Date().timeIntervalSince(self.lastNowPlayingUpdate) > 2 {
+                self.lastNowPlayingUpdate = Date()
+                self.updateNowPlaying()
+            }
         }
         engine.setVolume(snapshot.volume)
         if loadNow {
@@ -362,14 +370,22 @@ final class PXPlayerModel: ObservableObject {
     }
 
     private func activateAudio() {
-        #if os(iOS) || os(tvOS)
-        try? AVAudioSession.sharedInstance().setActive(true)
-        #endif
+        PXPlaybackAudioSession.activate()
+        updateNowPlaying()
     }
 
     private func deactivateAudio() {
-        #if os(iOS) || os(tvOS)
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-        #endif
+        PXPlaybackAudioSession.deactivate()
+    }
+
+    private func updateNowPlaying() {
+        PXPlaybackNowPlayingCenter.update(
+            drama: request.drama,
+            chapter: currentChapter,
+            duration: snapshot.duration,
+            elapsed: snapshot.currentTime,
+            rate: snapshot.rate,
+            isPlaying: snapshot.state.isPlaying
+        )
     }
 }

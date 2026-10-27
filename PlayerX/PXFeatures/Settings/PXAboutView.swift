@@ -2,60 +2,64 @@ import SwiftUI
 
 struct PXAboutView: View {
     @State private var showLicenses = false
-    private var version: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
-    }
-    private var build: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
-    }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 22) {
-                VStack(spacing: 10) {
-                    PXLogoMark(size: 74)
-                    Text("PlayerX").font(PXFont.display(30)).foregroundStyle(PXTheme.textPrimary)
-                    Text("Version \(version) (\(build))")
-                        .font(PXFont.mono(10))
-                        .foregroundStyle(PXTheme.textTertiary)
-                    Text("多站源 · 多内核 · 原生 Apple 播放器")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(PXTheme.textSecondary)
+        SettingsGlassPage {
+            SettingsGlassSection("PlayerX") {
+                HStack(spacing: 14) {
+                    PXLogoMark(size: 52)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("PlayerX").font(.title3.weight(.bold))
+                        Text("多站源 · 多内核 · 原生 Apple 播放器")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
                 }
-                .padding(.top, 12)
-                PXSettingsSection(title: "开源与致谢") {
-                    Link(destination: URL(string: "https://github.com/oliid0/playx")!) {
-                        PXSettingsRow(symbol: "chevron.left.forwardslash.chevron.right", title: "PlayerX 项目主页")
-                    }
-                    Divider().overlay(PXTheme.stroke)
-                    Link(destination: URL(string: "https://github.com/SRGSSR/pillarbox-apple")!) {
-                        PXSettingsRow(symbol: "circle.grid.cross", title: "Pillarbox", subtitle: "默认播放内核")
-                    }
-                    Divider().overlay(PXTheme.stroke)
-                    Link(destination: URL(string: "https://github.com/AimesSoft/Erika")!) {
-                        PXSettingsRow(symbol: "bolt", title: "Erika", subtitle: "FFmpeg + libass 内核")
-                    }
-                    Divider().overlay(PXTheme.stroke)
-                    Button { showLicenses = true } label: {
-                        PXSettingsRow(symbol: "doc.text", title: "开源许可")
-                    }
-                    .buttonStyle(.plain)
+                .settingsRow()
+                SettingsGlassDivider()
+                HStack {
+                    Text("版本")
+                    Spacer()
+                    Text("\(PXBundleInfo.version) (\(PXBundleInfo.build))")
+                        .foregroundStyle(.secondary)
                 }
-                Text("内容来自公开站源，App 不托管任何视频文件。TMDB、Bangumi、弹弹play、MoviePilot 为第三方服务。")
-                    .font(.system(size: 10))
-                    .foregroundStyle(PXTheme.textTertiary)
-                    .multilineTextAlignment(.center)
-                    .lineSpacing(3)
-                    .padding(.horizontal, 30)
+                .settingsRow()
+                SettingsGlassDivider()
+                HStack {
+                    Text("设备")
+                    Spacer()
+                    Text("\(PXDeviceInfo.name) · \(PXDeviceInfo.system)")
+                        .foregroundStyle(.secondary)
+                }
+                .settingsRow()
             }
-            .padding(20)
+
+            SettingsGlassSection("链接") {
+                Link(destination: URL(string: "https://github.com/oliid0/playx")!) {
+                    SettingsNavRowContent(title: "PlayerX 项目主页", icon: .symbol("chevron.left.forwardslash.chevron.right"))
+                }
+                SettingsGlassDivider()
+                Link(destination: URL(string: "https://github.com/SRGSSR/pillarbox-apple")!) {
+                    SettingsNavRowContent(title: "Pillarbox", icon: .symbol("circle.grid.cross"))
+                }
+                SettingsGlassDivider()
+                Link(destination: URL(string: "https://github.com/AimesSoft/Erika")!) {
+                    SettingsNavRowContent(title: "Erika", icon: .symbol("bolt"))
+                }
+            }
+
+            SettingsGlassSection("许可") {
+                SettingsActionRow("开源许可", systemImage: "doc.text") { showLicenses = true }
+            }
+
+            SettingsGlassSection("说明") {
+                SettingsNote("内容来自公开站源与用户添加的媒体源，App 不托管任何视频文件。TMDB、Bangumi、弹弹play、MoviePilot 为第三方服务。")
+                SettingsNote("This product uses the TMDB API but is not endorsed or certified by TMDB.")
+            }
         }
-        .background(PXPageBackground())
         .navigationTitle("关于")
         .pxInlineNavigationTitle()
-        .sheet(isPresented: $showLicenses) {
-            PXLicenseView()
-        }
+        .sheet(isPresented: $showLicenses) { PXLicenseView() }
     }
 }
 
@@ -72,14 +76,21 @@ struct PXLicenseView: View {
 
     var body: some View {
         NavigationStack {
-            List(Array(licenses.enumerated()), id: \.offset) { item in
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(item.element.0).font(.system(size: 13, weight: .semibold))
-                    Text(item.element.1).font(.system(size: 10)).foregroundStyle(.secondary)
+            SettingsGlassPage {
+                SettingsGlassSection("第三方组件") {
+                    ForEach(Array(licenses.enumerated()), id: \.offset) { index, item in
+                        if index > 0 { SettingsGlassDivider() }
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(item.0)
+                                Text(item.1).font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                        }
+                        .settingsRow()
+                    }
                 }
-                .listRowBackground(PXTheme.surfaceMuted)
             }
-            .scrollContentBackground(.hidden)
             .background(PXPageBackground())
             .navigationTitle("开源许可")
             .pxInlineNavigationTitle()

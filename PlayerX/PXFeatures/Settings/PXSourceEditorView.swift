@@ -17,25 +17,85 @@ struct PXSourceEditorView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    kindSection
-                    connectionSection
-                    if draft.kind.isWebDAV {
-                        pathSection
+            SettingsGlassPage {
+                SettingsGlassSection("类型") {
+                    HStack(spacing: SettingsMetrics.iconLabelSpacing) {
+                        Image(systemName: draft.kind.symbol)
+                            .font(.system(size: SettingsMetrics.iconGlyphSize))
+                            .frame(width: SettingsMetrics.iconColumnWidth)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(draft.kind.title)
+                            Text(draft.kind.hint).font(.caption).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if isNew {
+                            Picker("类型", selection: $draft.kind) {
+                                ForEach([PXSourceKind.jellyfin, .emby, .webdav, .nas, .alist, .maccms]) { kind in
+                                    Text(kind.title).tag(kind)
+                                }
+                            }
+                            .labelsHidden()
+                            .fixedSize()
+                        }
                     }
-                    if draft.kind == .maccms {
-                        maccmsSection
-                    }
-                    if draft.kind.isMediaServer {
-                        credentialsSection
-                    }
-                    testSection
-                    if let errorMessage {
-                        PXErrorBanner(message: errorMessage)
+                    .settingsRow()
+                }
+
+                SettingsGlassSection("连接") {
+                    SettingsTextRow("显示名称", text: $draft.name, prompt: draft.kind.title)
+                    SettingsGlassDivider()
+                    SettingsTextRow("服务器地址", text: $draft.baseURL, prompt: "https://host:port")
+                    if let url = draft.normalizedBaseURL {
+                        SettingsNote("最终地址：\(url.absoluteString)")
                     }
                 }
-                .padding(20)
+
+                if draft.kind.isMediaServer {
+                    SettingsGlassSection("账号") {
+                        SettingsTextRow("用户名", text: $draft.username, prompt: "媒体服务器用户名")
+                        SettingsGlassDivider()
+                        SettingsTextRow("密码", text: $draft.password, prompt: "媒体服务器密码", isSecure: true)
+                        if !draft.token.isEmpty {
+                            SettingsNote("已登录 · \(draft.userID)")
+                            SettingsGlassDivider()
+                            SettingsActionRow("清除登录状态", systemImage: "xmark.circle", role: .destructive) {
+                                draft.token = ""
+                                draft.userID = ""
+                            }
+                        }
+                    }
+                }
+
+                if draft.kind.isWebDAV {
+                    SettingsGlassSection("WebDAV") {
+                        SettingsTextRow("用户名", text: $draft.username, prompt: "WebDAV 用户名")
+                        SettingsGlassDivider()
+                        SettingsTextRow("密码", text: $draft.password, prompt: "WebDAV 密码", isSecure: true)
+                        SettingsGlassDivider()
+                        SettingsTextRow("根目录", text: $draft.rootPath, prompt: "/")
+                    }
+                }
+
+                if draft.kind == .maccms {
+                    SettingsGlassSection("MacCMS API") {
+                        SettingsTextRow("API 路径", text: $draft.apiPath, prompt: "api.php/provide/vod/")
+                        SettingsNote("常见为 /api.php/provide/vod/；不同 CMS 可能不同。")
+                    }
+                }
+
+                SettingsGlassSection("验证") {
+                    SettingsActionRow(isTesting ? "正在测试…" : "测试连接", systemImage: "bolt.horizontal") {
+                        Task { await test() }
+                    }
+                    .disabled(isTesting || draft.normalizedBaseURL == nil)
+                    if let testResult {
+                        SettingsNote("\(testResult.title) · \(testResult.detail)")
+                    }
+                }
+
+                if let errorMessage {
+                    SettingsInlineError(message: errorMessage)
+                }
             }
             .background(PXPageBackground())
             .navigationTitle(isNew ? "添加媒体源" : "编辑媒体源")
@@ -62,136 +122,6 @@ struct PXSourceEditorView: View {
         if draft.kind.isMediaServer { return !draft.token.isEmpty && !draft.userID.isEmpty }
         if draft.kind.isWebDAV { return !draft.username.isEmpty }
         return true
-    }
-
-    private var kindSection: some View {
-        PXSettingsSection(title: "类型") {
-            HStack(spacing: 11) {
-                Image(systemName: draft.kind.symbol)
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(PXTheme.accent)
-                    .frame(width: 30)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(draft.kind.title).font(.system(size: 13, weight: .semibold)).foregroundStyle(PXTheme.textPrimary)
-                    Text(draft.kind.hint).font(.system(size: 9)).foregroundStyle(PXTheme.textTertiary)
-                }
-                Spacer()
-                if isNew {
-                    Picker("", selection: $draft.kind) {
-                        ForEach([PXSourceKind.jellyfin, .emby, .webdav, .nas, .alist, .maccms]) { kind in
-                            Text(kind.title).tag(kind)
-                        }
-                    }
-                    .labelsHidden()
-                }
-            }
-            .padding(.vertical, 8)
-        }
-    }
-
-    private var connectionSection: some View {
-        PXSettingsSection(title: "连接") {
-            field("显示名称", text: $draft.name, prompt: draft.kind.title)
-            divider
-            field("服务器地址", text: $draft.baseURL, prompt: "https://host:port")
-            if let url = draft.normalizedBaseURL {
-                Text("最终地址：\(url.absoluteString)")
-                    .font(.system(size: 9)).foregroundStyle(PXTheme.textTertiary)
-                    .padding(.bottom, 8)
-            }
-        }
-    }
-
-    private var credentialsSection: some View {
-        PXSettingsSection(title: "账号") {
-            field("用户名", text: $draft.username, prompt: "媒体服务器用户名")
-            divider
-            secureField("密码", text: $draft.password, prompt: "媒体服务器密码")
-            if !draft.token.isEmpty {
-                Text("已登录 · \(draft.userID)")
-                    .font(.system(size: 9)).foregroundStyle(PXTheme.mint)
-                    .padding(.vertical, 6)
-                Button("清除登录状态") {
-                    draft.token = ""
-                    draft.userID = ""
-                }
-                .font(.system(size: 10, weight: .semibold))
-                .foregroundStyle(PXTheme.warning)
-                .buttonStyle(.plain)
-            }
-        }
-    }
-
-    private var pathSection: some View {
-        PXSettingsSection(title: "WebDAV") {
-            field("用户名", text: $draft.username, prompt: "WebDAV 用户名")
-            divider
-            secureField("密码", text: $draft.password, prompt: "WebDAV 密码")
-            divider
-            field("根目录", text: $draft.rootPath, prompt: "/")
-        }
-    }
-
-    private var maccmsSection: some View {
-        PXSettingsSection(title: "MacCMS API") {
-            field("API 路径", text: $draft.apiPath, prompt: "api.php/provide/vod/")
-            Text("通常是 /api.php/provide/vod/，不同 CMS 可能不同。")
-                .font(.system(size: 9)).foregroundStyle(PXTheme.textTertiary)
-                .padding(.bottom, 8)
-        }
-    }
-
-    private var testSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Button {
-                Task { await test() }
-            } label: {
-                HStack {
-                    if isTesting { ProgressView().controlSize(.small) }
-                    Image(systemName: "bolt.horizontal")
-                    Text(isTesting ? "正在测试" : "测试连接")
-                }
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(PXSecondaryButtonStyle())
-            .disabled(isTesting || draft.normalizedBaseURL == nil)
-
-            if let testResult {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(testResult.title).font(.system(size: 12, weight: .semibold)).foregroundStyle(PXTheme.mint)
-                    Text(testResult.detail).font(.system(size: 10)).foregroundStyle(PXTheme.textSecondary)
-                }
-                .pxFlatCard()
-            }
-        }
-    }
-
-    private var divider: some View { Divider().overlay(PXTheme.stroke) }
-
-    private func field(_ title: String, text: Binding<String>, prompt: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title).font(.system(size: 9, weight: .medium)).foregroundStyle(PXTheme.textTertiary)
-            TextField(prompt, text: text)
-                .textFieldStyle(.plain)
-                .font(.system(size: 12))
-                .foregroundStyle(PXTheme.textPrimary)
-                .padding(.vertical, 8)
-                #if os(iOS)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                #endif
-        }
-    }
-
-    private func secureField(_ title: String, text: Binding<String>, prompt: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title).font(.system(size: 9, weight: .medium)).foregroundStyle(PXTheme.textTertiary)
-            SecureField(prompt, text: text)
-                .textFieldStyle(.plain)
-                .font(.system(size: 12))
-                .foregroundStyle(PXTheme.textPrimary)
-                .padding(.vertical, 8)
-        }
     }
 
     private func test() async {

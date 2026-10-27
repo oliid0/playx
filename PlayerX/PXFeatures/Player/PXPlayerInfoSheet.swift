@@ -35,6 +35,11 @@ struct PXPlayerInfoSheet: View {
                         PXInfoRow(title: "弹幕", value: "\(model.danmakuCount) 条")
                     }
                     .pxFlatCard()
+                    PXPlaybackStatsView(stats: PXPlaybackStats(
+                        engine: model.engineKind,
+                        snapshot: model.snapshot,
+                        danmakuCount: model.danmakuCount
+                    ))
                     if let overview = model.metadata?.overview ?? model.request.drama.description {
                         Text(overview)
                             .font(.system(size: 12))
