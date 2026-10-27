@@ -34,6 +34,7 @@ final class PXPlayerModel: ObservableObject {
     private var didFallbackEngine = false
     private var watchdogTask: Task<Void, Never>?
     private var preferDirectPlayback = false
+    private var didRetryDirectPlayback = false
 
     init(request: PXPlaybackRequest) {
         self.request = request
@@ -77,6 +78,7 @@ final class PXPlayerModel: ObservableObject {
         hasStarted = true
         didFallbackEngine = false
         preferDirectPlayback = false
+        didRetryDirectPlayback = false
         activateAudio()
         PXPlaybackWakeLock.begin()
         engine?.load(
@@ -225,6 +227,7 @@ final class PXPlayerModel: ObservableObject {
             currentIndex = index
             didFallbackEngine = false
             preferDirectPlayback = false
+            didRetryDirectPlayback = false
             installEngine(kind: engineKind, startAt: 0, autoplay: true)
             loadDanmaku()
         } catch {
@@ -263,6 +266,7 @@ final class PXPlayerModel: ObservableObject {
         preferences.engine = kind
         didFallbackEngine = false
         preferDirectPlayback = false
+        didRetryDirectPlayback = false
         installEngine(kind: kind, startAt: position, autoplay: wasPlaying)
     }
 
@@ -322,12 +326,7 @@ final class PXPlayerModel: ObservableObject {
         let position = snapshot.currentTime
         engine?.stop()
         engineKind = .native
-        #if os(iOS) || os(tvOS)
-        // Pillarbox 失败多半是回环代理/自定义 loader；原生改用原始 CDN 地址再试一次。
-        preferDirectPlayback = true
-        #else
         preferDirectPlayback = false
-        #endif
         installEngine(kind: .native, startAt: position, autoplay: true)
         notice = "当前内核播放失败，已切换原生 AVPlayer：\(reason)"
     }
@@ -352,11 +351,17 @@ final class PXPlayerModel: ObservableObject {
             if snapshot.state == .ended, previousState != .ended {
                 self.handleEnded()
             }
-            if case .failed(let message) = snapshot.state,
-               !self.didFallbackEngine,
-               self.engineKind != .native {
-                self.didFallbackEngine = true
-                self.fallbackToNative(reason: message)
+            if case .failed(let message) = snapshot.state {
+                if !self.didFallbackEngine, self.engineKind != .native {
+                    self.didFallbackEngine = true
+                    self.fallbackToNative(reason: message)
+                } else if self.engineKind == .native, !self.didRetryDirectPlayback,
+                          self.plan.directURL != nil {
+                    self.didRetryDirectPlayback = true
+                    self.preferDirectPlayback = true
+                    self.installEngine(kind: .native, startAt: self.snapshot.currentTime, autoplay: true)
+                    self.notice = "回环代理播放失败，已改用原始播放地址"
+                }
             }
             if snapshot.state.isPlaying, !previousState.isPlaying {
                 self.activateAudio()
