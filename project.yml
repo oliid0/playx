@@ -159,6 +159,8 @@ targets:
           - "PXSearchResult.swift"
           - "PXSearchScope.swift"
       - path: PlayerX/PXCore/Utilities
+        excludes:
+          - "Ported"
       - path: PlayerX/PXCore/Networking/PXTMDbClient.swift
       - path: PlayerX/PXCore/Networking/PXTMDbError.swift
       - path: PlayerX/PXCore/Networking/PXTMDbMapper.swift

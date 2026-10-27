@@ -12,6 +12,9 @@ enum PXUEngineCapabilityLabel {
         case .subtitleStyle: "字幕样式"
         case .hdr: "HDR"
         case .hardwareDecode: "硬解"
+        case .chapterNavigation: "章节导航"
+        case .nowPlaying: "系统正在播放"
+        case .screenshot: "截图"
         }
     }
 }
