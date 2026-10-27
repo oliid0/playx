@@ -18,21 +18,52 @@ const hongguoBaseURL = "https://hongguoduanju.com"
 
 func (d *Downloader) fetchHongguoDramas(ctx context.Context) ([]Drama, error) {
 	initialized := hongguoCatalogInitialized(d.hongguoCatalogSnapshot())
-	dramas, appErr := d.fetchHongguoAppCatalog(ctx)
-	if len(dramas) > 0 || appErr == nil && initialized {
-		return dramas, appErr
+	appDramas, appErr := d.fetchHongguoAppCatalog(ctx)
+	if appErr == nil && initialized {
+		return appDramas, nil
 	}
 	if ctx.Err() != nil {
-		return dramas, ctx.Err()
+		return appDramas, ctx.Err()
 	}
+	// 单个 App 分类偶发 200 空响应（服务端 TLB 直接返回空体）时，不能把已经拿到的
+	// 其它分类一起丢掉；用网页分类补齐，再按 ID 去重合并。
 	webDramas, webErr := d.fetchHongguoWebDramas(ctx)
-	if len(webDramas) > 0 && webErr == nil {
-		return webDramas, nil
+	merged := mergeHongguoDramas(appDramas, webDramas)
+	if len(merged) > 0 {
+		if len(webDramas) == 0 && appErr != nil {
+			return merged, appErr
+		}
+		return merged, nil
 	}
-	return webDramas, errors.Join(appErr, webErr)
+	return nil, errors.Join(appErr, webErr)
+}
+
+func mergeHongguoDramas(groups ...[]Drama) []Drama {
+	seen := map[string]bool{}
+	var out []Drama
+	for _, group := range groups {
+		for _, drama := range group {
+			if drama.ID == "" || seen[drama.ID] {
+				continue
+			}
+			seen[drama.ID] = true
+			out = append(out, drama)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].DisplayTitle() < out[j].DisplayTitle() })
+	return out
 }
 
 func (d *Downloader) fetchHongguoWebDramas(ctx context.Context) ([]Drama, error) {
+	// App 接口失效时的网页兜底：只扫有限页，避免 4 个分类沿 totalPages 一路翻到
+	// 几百页把首屏拖死。完整库仍由 App 分类接口负责。
+	maxPages := d.cfg.MaxPagesPerSort
+	if maxPages < 1 {
+		maxPages = 1
+	}
+	if maxPages > 4 {
+		maxPages = 4
+	}
 	routes := []struct {
 		path string
 		name string
@@ -50,7 +81,7 @@ func (d *Downloader) fetchHongguoWebDramas(ctx context.Context) ([]Drama, error)
 	for _, route := range routes {
 		route := route
 		go func() {
-			dramas, err := d.fetchHongguoRoute(ctx, route.path, route.name)
+			dramas, err := d.fetchHongguoRoute(ctx, route.path, route.name, maxPages)
 			results <- routeResult{dramas: dramas, err: err}
 		}()
 	}
@@ -73,8 +104,8 @@ func (d *Downloader) fetchHongguoWebDramas(ctx context.Context) ([]Drama, error)
 	return out, errors.Join(failures...)
 }
 
-func (d *Downloader) fetchHongguoRoute(ctx context.Context, route, category string) ([]Drama, error) {
-	pages := d.cfg.MaxPagesPerSort
+func (d *Downloader) fetchHongguoRoute(ctx context.Context, route, category string, maxPages int) ([]Drama, error) {
+	pages := maxPages
 	if pages < 1 {
 		pages = 1
 	}
@@ -85,11 +116,8 @@ func (d *Downloader) fetchHongguoRoute(ctx context.Context, route, category stri
 		if err != nil {
 			return dramas, fmt.Errorf("%s: %w", category, err)
 		}
-		if totalPages > pages {
+		if totalPages > 0 && totalPages < pages {
 			pages = totalPages
-			if pages > 500 {
-				pages = 500
-			}
 		}
 		reportLibraryProgress(ctx, sourceHongguo, items, nil, false)
 		added := 0
