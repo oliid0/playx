@@ -65,24 +65,33 @@ func (downloader *Downloader) fetchHongguoAppCatalogCategory(ctx context.Context
 	if pageLimit > 200 {
 		pageLimit = 200
 	}
-	headLimit := min(pageLimit, 3)
+	if more {
+		// 用户翻页只取一页；MaxPagesPerSort 是后台全量同步的上限，不是单次翻页量。
+		pageLimit = 1
+	}
+	headLimit := 1
 	roundLimit := pageLimit
 	if update {
 		roundLimit += headLimit
 	}
 	type feedScan struct {
-		cursor hongguoCatalogCursor
-		tail   hongguoCatalogCursor
-		head   bool
-		done   bool
-		pages  int
+		cursor  hongguoCatalogCursor
+		tail    hongguoCatalogCursor
+		head    bool
+		initial bool
+		done    bool
+		pages   int
 	}
 	scans := make([]feedScan, len(genres))
 	for index, genre := range genres {
 		cursor := state.Feeds[feedKey(genre.key)]
-		if !more && cursor.Initialized {
+		scans[index].initial = !cursor.Initialized
+		if !cursor.Initialized || (!more && cursor.Initialized) {
+			// 首次抓取也只扫 head 页：50 页全量同步会把首屏拖到分钟级，后续页由
+			// 用户翻页/刷新继续。断点续爬仍保留 cursor。
 			scans[index].head = true
 			scans[index].tail = cursor
+			scans[index].cursor = cursor
 		} else {
 			scans[index].cursor = cursor
 			scans[index].done = cursor.Exhausted
@@ -166,6 +175,10 @@ func (downloader *Downloader) fetchHongguoAppCatalogCategory(ctx context.Context
 			scan.cursor = cursor
 			scan.done = cursor.Exhausted
 			checkpoint := cursor
+			if scan.head && scan.tail.Initialized && scan.tail.Offset >= cursor.Offset {
+				// 首页刷新只更新头部，不能把已经翻到的续页 offset 回退。
+				checkpoint = scan.tail
+			}
 			if scan.head && newItems == 0 && !cursor.Exhausted {
 				scan.done = true
 				if scan.tail.Exhausted || scan.tail.Offset >= cursor.Offset {
@@ -174,7 +187,7 @@ func (downloader *Downloader) fetchHongguoAppCatalogCategory(ctx context.Context
 			}
 			if scan.head && (scan.done || scan.pages >= headLimit) {
 				scan.done = true
-				if update && !checkpoint.Exhausted {
+				if update && !scan.initial && !checkpoint.Exhausted {
 
 					scan.cursor = checkpoint
 					scan.head, scan.done, scan.pages = false, false, 0
