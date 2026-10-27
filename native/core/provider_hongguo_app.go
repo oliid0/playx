@@ -39,6 +39,7 @@ type hongguoCatalogState struct {
 type hongguoAppClient struct {
 	mu             sync.Mutex
 	catalogMu      sync.Mutex
+	deviceMu       sync.Mutex
 	baseURL        string
 	state          hongguoCatalogState
 	details        map[string]hongguoDetailEntry
@@ -49,6 +50,7 @@ type hongguoAppClient struct {
 	suggestPending map[string]*hongguoSuggestionCall
 	danmaku        map[string]hongguoDanmakuCacheEntry
 	danmakuPending map[string]*hongguoDanmakuCall
+	device         *hongguoRegisteredDevice
 }
 
 func (downloader *Downloader) hongguoClient() *hongguoAppClient {

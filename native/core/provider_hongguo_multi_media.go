@@ -160,8 +160,12 @@ func (downloader *Downloader) hongguoPlayerPost(ctx context.Context, videoID str
 	if err != nil {
 		return nil, err
 	}
+	device, err := downloader.hongguoDevice(ctx)
+	if err != nil {
+		return nil, err
+	}
 	khronos := time.Now().Unix()
-	iid, deviceID := hongguoPlayerLocalID(), hongguoPlayerLocalID()
+	iid, deviceID := device.InstallID, device.DeviceID
 
 	// _rticket 抖动避 branch==1（服务端不认该分支的签名）。
 	var query string
@@ -182,14 +186,14 @@ func (downloader *Downloader) hongguoPlayerPost(ctx context.Context, videoID str
 	request.Header.Set("Accept", "application/json; charset=utf-8,application/x-protobuf")
 	request.Header.Set("Content-Type", "application/json; charset=UTF-8")
 	request.Header.Set("x-xs-from-web", "0")
-	request.Header.Set("x-ss-req-ticket", strconv.FormatInt(ticketBase+0, 10))
+	request.Header.Set("x-ss-req-ticket", strconv.FormatInt(ticketBase, 10))
 	request.Header.Set("x-tt-request-tag", "t=0;n=0")
 	request.Header.Set("sdk-version", "2")
 	request.Header.Set("passport-sdk-version", "50561")
 	request.Header.Set("x-vc-bdturing-sdk-version", "3.7.2.cn")
 	request.Header.Set("x-ss-stub", hgMd5HexUpper(body))
 	request.Header.Set("x-tt-dt", "")
-	for key, value := range hongguoPureSign(fullURL, body, uint32(khronos)) {
+	for key, value := range hgPlayerHeaders(query, body, khronos, device.DeviceID, "") {
 		request.Header.Set(key, value)
 	}
 
@@ -520,7 +524,7 @@ func selectHongguoFallbackMedia(info map[string]any) (providerMedia, error) {
 
 // resolveHongguoAppMedia 新链路：multi_video_model/v1 签名 POST -> fallback_api
 // 二次 GET -> key_seed 解密 -> 选流。
-func (downloader *Downloader) resolveHongguoAppMedia(ctx context.Context, videoID string) (providerMedia, error) {
+func (downloader *Downloader) resolveHongguoPhoenixMedia(ctx context.Context, videoID string) (providerMedia, error) {
 	if !hongguoNumericID.MatchString(videoID) {
 		return providerMedia{}, errors.New("红果视频 ID 无效")
 	}
