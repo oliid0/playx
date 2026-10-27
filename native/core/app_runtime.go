@@ -529,6 +529,16 @@ func (engine *nativeEngine) nativeCatalog(ctx context.Context, input nativeInput
 		}
 		return result, nil
 	}
+	if query != "" && source == sourceHuangguoAI {
+		items, err := d.searchHuangguoAI(ctx, query)
+		if err != nil {
+			return result, err
+		}
+		for _, drama := range items {
+			result.Items = append(result.Items, nativeNormalize(drama))
+		}
+		return result, nil
+	}
 	if query != "" && source == sourceHuangju {
 		items, more, err := d.fetchHuangjuCatalogPage(ctx, page, "", query)
 		if err != nil {
@@ -593,18 +603,19 @@ func (engine *nativeEngine) nativeCatalog(ctx context.Context, input nativeInput
 	}
 	if query != "" {
 		engine.mu.Lock()
-		items := append([]nativeDrama{}, engine.catalogs[source]...)
+		cached := append([]nativeDrama{}, engine.catalogs[source]...)
 		engine.mu.Unlock()
-		for _, item := range items {
-			text := hongguoSearchText(item.Title + " " + item.Description + " " + strings.Join(item.Tags, " "))
-			matches := true
-			for _, word := range strings.Fields(query) {
-				matches = matches && strings.Contains(text, hongguoSearchText(word))
-			}
-			if matches {
-				result.Items = append(result.Items, item)
+		items := filterSearchNativeDramas(cached, query)
+		if len(items) == 0 {
+			// 有些站源没有独立的搜索接口（或只缓存了首页）。搜索时补抓一页目录，
+			// 保证“搜索全部站源”不会因为该源没被首页预热而静默缺失。
+			if fallback, err := d.searchCatalogFallback(ctx, source, query); err == nil {
+				for _, drama := range fallback {
+					items = append(items, nativeNormalize(drama))
+				}
 			}
 		}
+		result.Items = append(result.Items, items...)
 		result.LocalSearch = true
 		return result, nil
 	}

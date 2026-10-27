@@ -14,6 +14,7 @@ struct PXSearchResult: Identifiable, Hashable {
     var overview: String?
     var imageURL: URL?
     var badge: String?
+    var sourceID: String?
     var catalogEntry: PXCatalogEntry?
     var tmdbResult: PXTMDbSearchResult?
     var bangumiResult: PXBangumiSubject?

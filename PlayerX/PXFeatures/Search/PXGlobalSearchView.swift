@@ -33,6 +33,7 @@ struct PXGlobalSearchView: View {
             .padding(.horizontal, PXTheme.contentPadding)
             .padding(.top, 8)
             scopeBar
+            if !model.results.isEmpty { resultToolbar }
             content
         }
         .background(PXPageBackground())
@@ -46,6 +47,13 @@ struct PXGlobalSearchView: View {
             }
         }
         .task { focused = true }
+        .task(id: model.query) {
+            let text = model.query.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard text.count >= 2, text != model.submittedQuery else { return }
+            try? await Task.sleep(nanoseconds: 650_000_000)
+            guard !Task.isCancelled else { return }
+            model.submit()
+        }
         .sheet(item: $preview) { item in
             PXMediaPreviewSheet(recommendation: item)
         }
@@ -71,13 +79,30 @@ struct PXGlobalSearchView: View {
     @ViewBuilder
     private var content: some View {
         if model.isSearching {
-            PXLoadingCard()
+            VStack(spacing: 12) {
+                PXLoadingCard()
+                Text("正在搜索 \(model.totalSourceCount > 0 ? "\(model.totalSourceCount) 个源" : "全部站源")…")
+                    .font(.system(size: 10)).foregroundStyle(PXTheme.textTertiary)
+            }
+            Spacer()
+        } else if !model.submittedQuery.isEmpty && model.results.isEmpty {
+            VStack(spacing: 10) {
+                Image(systemName: "magnifyingglass").font(.system(size: 28, weight: .light)).foregroundStyle(PXTheme.textTertiary)
+                Text("没有找到「\(model.submittedQuery)」").font(PXFont.section(17))
+                Text("已搜索全部 \(model.totalSourceCount) 个站源与外部媒体源；\(model.warnings.first ?? "换个关键词试试")")
+                    .font(.system(size: 11)).foregroundStyle(PXTheme.textTertiary).multilineTextAlignment(.center)
+                if !model.warnings.isEmpty {
+                    PXUIWarningBanner(text: model.warnings.joined(separator: "\n"))
+                        .padding(.top, 6)
+                }
+            }
+            .padding(20)
             Spacer()
         } else if model.results.isEmpty {
             VStack(alignment: .leading, spacing: 14) {
                 PXSectionHeader(title: "最近搜索", subtitle: nil, symbol: "clock")
                 if recentTags.isEmpty {
-                    Text("输入关键词，站源、TMDB、Bangumi 会同时搜索。")
+                    Text("输入关键词，全部站源、TMDB、Bangumi 会同时搜索。")
                         .font(.system(size: 11))
                         .foregroundStyle(PXTheme.textTertiary)
                 } else {
@@ -99,7 +124,11 @@ struct PXGlobalSearchView: View {
         } else {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 10) {
-                    ForEach(model.results) { result in
+                    if !model.warnings.isEmpty {
+                        PXUIWarningBanner(text: model.warnings.joined(separator: "\n"))
+                            .padding(.bottom, 4)
+                    }
+                    ForEach(model.displayedResults) { result in
                         resultRow(result)
                     }
                 }
@@ -107,6 +136,46 @@ struct PXGlobalSearchView: View {
                 .padding(.bottom, 24)
             }
         }
+    }
+
+    private var resultToolbar: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Text("全部站源").font(PXFont.caption(10)).foregroundStyle(PXTheme.textTertiary)
+                Text("\(model.results.count) 条 · \(model.totalSourceCount) 个源")
+                    .font(PXFont.caption(10)).foregroundStyle(PXTheme.textSecondary)
+                Spacer()
+                if model.isSearching { ProgressView().controlSize(.mini) }
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    PXUIOptionChip(title: "全部 \(model.results.count)", isSelected: model.selectedSourceID == nil) {
+                        model.selectedSourceID = nil
+                    }
+                    ForEach(model.sourceOptions, id: \.id) { option in
+                        PXUIOptionChip(title: "\(option.name) \(option.count)", isSelected: model.selectedSourceID == option.id) {
+                            model.selectedSourceID = option.id
+                        }
+                    }
+                    ForEach(bangumiSources, id: \.id) { option in
+                        PXUIOptionChip(title: "\(option.name) \(option.count)", isSelected: model.selectedSourceID == option.id) {
+                            model.selectedSourceID = option.id
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, PXTheme.contentPadding)
+        .padding(.bottom, 10)
+    }
+
+    private var bangumiSources: [PXSearchSourceOption] {
+        var values: [PXSearchSourceOption] = []
+        let tmdb = model.results.filter { $0.source == .tmdb }.count
+        let bgm = model.results.filter { $0.source == .bangumi }.count
+        if tmdb > 0 { values.append(PXSearchSourceOption(id: "tmdb", name: "TMDB", count: tmdb)) }
+        if bgm > 0 { values.append(PXSearchSourceOption(id: "bangumi", name: "Bangumi", count: bgm)) }
+        return values
     }
 
     @ViewBuilder
