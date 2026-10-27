@@ -166,43 +166,38 @@ struct PXMoviePilotLoginView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 15) {
-                    field("服务器地址", text: $baseURL, prompt: "https://moviepilot.example.com", secure: false)
-                    field("用户名", text: $username, prompt: "MoviePilot 用户名", secure: false)
-                    field("密码", text: $password, prompt: "MoviePilot 密码", secure: true)
-                    if let error = coordinator.errorMessage {
-                        PXErrorBanner(message: error)
-                    }
-                    Button {
+            SettingsGlassPage {
+                SettingsGlassSection("服务器") {
+                    SettingsTextRow("地址", text: $baseURL, prompt: "https://moviepilot.example.com")
+                    SettingsGlassDivider()
+                    SettingsTextRow("用户名", text: $username, prompt: "MoviePilot 用户名")
+                    SettingsGlassDivider()
+                    SettingsTextRow("密码", text: $password, prompt: "MoviePilot 密码", isSecure: true)
+                    SettingsNote("凭证只保存在本机 UserDefaults；JWT 由服务器签发。")
+                }
+
+                if let error = coordinator.errorMessage {
+                    SettingsInlineError(message: error)
+                }
+
+                SettingsGlassSection {
+                    SettingsActionRow(working ? "正在登录…" : "登录", systemImage: "person.badge.key") {
                         Task {
                             working = true
                             await coordinator.login(username: username, password: password, baseURL: baseURL)
                             working = false
                             if coordinator.isLoggedIn { dismiss() }
                         }
-                    } label: {
-                        HStack {
-                            if working { ProgressView().controlSize(.small) }
-                            Text("登录")
-                        }
-                        .frame(maxWidth: .infinity)
                     }
-                    .buttonStyle(PXPrimaryButtonStyle())
                     .disabled(baseURL.isEmpty || username.isEmpty || password.isEmpty || working)
                     if coordinator.isLoggedIn {
-                        Button("退出登录", role: .destructive) {
+                        SettingsGlassDivider()
+                        SettingsActionRow("退出登录", systemImage: "rectangle.portrait.and.arrow.right", role: .destructive) {
                             coordinator.logout()
                             dismiss()
                         }
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(PXTheme.danger)
                     }
-                    Text("凭证只保存在本机 UserDefaults。MoviePilot 的 JWT 由服务器签发。")
-                        .font(.system(size: 9))
-                        .foregroundStyle(PXTheme.textTertiary)
                 }
-                .padding(20)
             }
             .background(PXPageBackground())
             .navigationTitle("MoviePilot 账号")
@@ -217,23 +212,5 @@ struct PXMoviePilotLoginView: View {
             }
         }
         .preferredColorScheme(.dark)
-    }
-
-    private func field(_ title: String, text: Binding<String>, prompt: String, secure: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(title).font(.system(size: 12, weight: .semibold)).foregroundStyle(PXTheme.textSecondary)
-            Group {
-                if secure { SecureField(prompt, text: text) }
-                else { TextField(prompt, text: text) }
-            }
-            .textFieldStyle(.plain)
-            .padding(12)
-            .background(PXTheme.surfaceMuted, in: RoundedRectangle(cornerRadius: 10))
-            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(PXTheme.stroke))
-            #if os(iOS)
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled()
-            #endif
-        }
     }
 }
