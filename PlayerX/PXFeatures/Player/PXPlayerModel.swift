@@ -33,6 +33,7 @@ final class PXPlayerModel: ObservableObject {
     private var currentRate: Double
     private var didFallbackEngine = false
     private var watchdogTask: Task<Void, Never>?
+    private var preferDirectPlayback = false
 
     init(request: PXPlaybackRequest) {
         self.request = request
@@ -75,6 +76,7 @@ final class PXPlayerModel: ObservableObject {
         guard !hasStarted else { return }
         hasStarted = true
         didFallbackEngine = false
+        preferDirectPlayback = false
         activateAudio()
         PXPlaybackWakeLock.begin()
         engine?.load(
@@ -222,6 +224,7 @@ final class PXPlayerModel: ObservableObject {
             plan = resolved
             currentIndex = index
             didFallbackEngine = false
+            preferDirectPlayback = false
             installEngine(kind: engineKind, startAt: 0, autoplay: true)
             loadDanmaku()
         } catch {
@@ -259,6 +262,7 @@ final class PXPlayerModel: ObservableObject {
         engineKind = kind
         preferences.engine = kind
         didFallbackEngine = false
+        preferDirectPlayback = false
         installEngine(kind: kind, startAt: position, autoplay: wasPlaying)
     }
 
@@ -318,6 +322,12 @@ final class PXPlayerModel: ObservableObject {
         let position = snapshot.currentTime
         engine?.stop()
         engineKind = .native
+        #if os(iOS) || os(tvOS)
+        // Pillarbox 失败多半是回环代理/自定义 loader；原生改用原始 CDN 地址再试一次。
+        preferDirectPlayback = true
+        #else
+        preferDirectPlayback = false
+        #endif
         installEngine(kind: .native, startAt: position, autoplay: true)
         notice = "当前内核播放失败，已切换原生 AVPlayer：\(reason)"
     }
@@ -325,7 +335,7 @@ final class PXPlayerModel: ObservableObject {
     private func playbackURL(for kind: PXPlayerEngineKind) -> URL {
         // Erika 直接打开 CDN 原始地址；本机回环代理是给 AVPlayer/Pillarbox
         // 做 HLS 密钥重写用的，FFmpeg 自己就能取 key，无需多一跳。
-        if kind == .erika, let direct = plan.directURL, let url = URL(string: direct) {
+        if (kind == .erika || preferDirectPlayback), let direct = plan.directURL, let url = URL(string: direct) {
             return url
         }
         return URL(string: plan.url) ?? URL(string: "about:blank")!
