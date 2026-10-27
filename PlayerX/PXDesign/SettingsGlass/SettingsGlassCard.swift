@@ -178,6 +178,7 @@ struct SettingsGlassPage<Content: View>: View {
     }
 }
 
+#if os(macOS)
 struct SettingsSwitchToggleStyle: ToggleStyle {
     func makeBody(configuration: Configuration) -> some View {
         HStack(spacing: 12) {
@@ -189,6 +190,7 @@ struct SettingsSwitchToggleStyle: ToggleStyle {
         }
     }
 }
+#endif
 
 struct SettingsRow<Label: View, Trailing: View>: View {
     private let label: Label
