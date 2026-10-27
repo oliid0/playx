@@ -32,6 +32,7 @@ final class PXPlayerModel: ObservableObject {
     private var lastNowPlayingUpdate = Date.distantPast
     private var currentRate: Double
     private var didFallbackEngine = false
+    private var watchdogTask: Task<Void, Never>?
 
     init(request: PXPlaybackRequest) {
         self.request = request
@@ -85,9 +86,20 @@ final class PXPlayerModel: ObservableObject {
         engine?.setRate(currentRate)
         loadDanmaku()
         scheduleHide()
+        watchdogTask?.cancel()
+        watchdogTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 12_000_000_000)
+            guard let self, !Task.isCancelled, !self.didFallbackEngine else { return }
+            if case .failed = self.snapshot.state { return }
+            if self.snapshot.state == .opening || self.snapshot.state == .buffering {
+                self.didFallbackEngine = true
+                self.fallbackToNative(reason: "内核长时间未就绪")
+            }
+        }
     }
 
     func stop() {
+        watchdogTask?.cancel()
         nextTask?.cancel()
         hideTask?.cancel()
         sleepTimer.cancel()
