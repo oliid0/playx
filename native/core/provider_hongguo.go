@@ -54,6 +54,21 @@ func mergeHongguoDramas(groups ...[]Drama) []Drama {
 	return out
 }
 
+func hongguoWebRoute(category string) (route, label string) {
+	switch category {
+	case "short_play", "":
+		return "real-drama", "真人剧"
+	case "comic_series":
+		return "comic-drama", "漫剧"
+	case "ai_series":
+		return "ai-drama", "AI剧"
+	case "comic":
+		return "comic", "动漫"
+	default:
+		return "real-drama", category
+	}
+}
+
 func (d *Downloader) fetchHongguoWebDramas(ctx context.Context) ([]Drama, error) {
 	// App 接口失效时的网页兜底：只扫有限页，避免 4 个分类沿 totalPages 一路翻到
 	// 几百页把首屏拖死。完整库仍由 App 分类接口负责。

@@ -637,9 +637,10 @@ func (engine *nativeEngine) nativeCatalog(ctx context.Context, input nativeInput
 		if category != "" && state != nil {
 			result.HasMore = !state.Feeds["category:"+category].Exhausted
 		}
-		if len(items) == 0 && err != nil && ctx.Err() == nil && (category == "" || category == "short_play") {
+		if len(items) == 0 && err != nil && ctx.Err() == nil {
+			route, label := hongguoWebRoute(category)
 			var totalPages int
-			items, totalPages, err = d.fetchHongguoCategoryPage(ctx, "real-drama?page="+strconv.Itoa(page), "真人剧")
+			items, totalPages, err = d.fetchHongguoCategoryPage(ctx, route+"?page="+strconv.Itoa(page), label)
 			result.HasMore = page < totalPages
 		}
 	case sourceHuangdou:
