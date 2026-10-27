@@ -38,7 +38,7 @@ final class PXMacCMSClient {
     var headers: [String: String] {
         [
             "Accept": "application/json,text/plain,*/*",
-            "User-Agent": "PlayerX/1.0",
+            "User-Agent": PXProviderSupport.userAgent,
             "Referer": configuration.normalizedBaseURL?.absoluteString ?? "",
         ]
     }

@@ -30,6 +30,10 @@ struct PXSettingsHomeView: View {
                 SettingsNavLink(title: "TMDB 元数据补全", systemImage: "sparkles.tv", value: settings.tmdbEnabled ? "已启用" : "未启用") {
                     PXTMDbSettingsView()
                 }
+                SettingsGlassDivider()
+                SettingsNavLink(title: "网络", systemImage: "globe", value: settings.customUserAgent.isEmpty ? "默认 UA" : "自定义 UA") {
+                    PXNetworkSettingsView()
+                }
             }
 
             SettingsGlassSection("播放与界面") {
@@ -40,11 +44,19 @@ struct PXSettingsHomeView: View {
                 SettingsNavLink(title: "弹幕", systemImage: "text.bubble", value: player.danmakuEnabled ? "自动加载" : "已关闭") {
                     PXDanmakuSettingsView()
                 }
+                SettingsGlassDivider()
+                SettingsNavLink(title: "首页栏目", systemImage: "square.grid.2x2", value: homeSectionsValue) {
+                    PXHomeSectionsSettingsView()
+                }
             }
 
             SettingsGlassSection("应用") {
                 SettingsNavLink(title: "下载", systemImage: "arrow.down.circle", value: downloads.jobs.isEmpty ? "无任务" : "\(downloads.jobs.count) 个任务") {
                     PXDownloadsView()
+                }
+                SettingsGlassDivider()
+                SettingsNavLink(title: "维护", systemImage: "wrench.and.screwdriver", value: nil) {
+                    PXMaintenanceSettingsView()
                 }
                 SettingsGlassDivider()
                 SettingsNavLink(title: "关于", systemImage: "info.circle", value: PXBundleInfo.version) {
@@ -80,5 +92,10 @@ struct PXSettingsHomeView: View {
     private var moviePilotValue: String {
         guard settings.moviePilotEnabled else { return "已关闭" }
         return moviePilot.isLoggedIn ? "已登录" : "未配置"
+    }
+
+    private var homeSectionsValue: String {
+        let hidden = PXHomeSectionPreference.hidden(from: UserDefaults.standard.string(forKey: PXHomeSectionPreference.storageKey) ?? "")
+        return hidden.isEmpty ? "显示 4 栏" : "显示 \(4 - hidden.count)/4 栏"
     }
 }

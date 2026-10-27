@@ -60,6 +60,13 @@ actor PXMetadataCache {
         links.mapValues { ($0.tmdbID, $0.kind) }
     }
 
+    func clearAll() {
+        metadataMemory.removeAll()
+        seasonMemory.removeAll()
+        links.removeAll()
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent("links.json"))
+    }
+
     private func key(tmdbID: Int, kind: PXMediaKind, language: String) -> String {
         "\(kind.rawValue):\(tmdbID):\(language)"
     }

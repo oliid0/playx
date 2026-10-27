@@ -43,7 +43,7 @@ final class PXWebDAVClient {
                 password: configuration.password
             ),
             "Accept": "application/xml,text/xml,*/*",
-            "User-Agent": "PlayerX/1.0",
+            "User-Agent": PXProviderSupport.userAgent,
         ]
     }
 

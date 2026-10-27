@@ -9,6 +9,15 @@ struct PXHomeView: View {
     @ObservedObject private var history = HistoryStore.shared
     @ObservedObject private var follow = FollowStore.shared
     @ObservedObject private var sourceStore = PXSourceConfigurationStore.shared
+    @AppStorage(PXHomeSectionPreference.storageKey) private var hiddenSectionsRaw = ""
+
+    private var hiddenSections: Set<PXHomeSection> {
+        PXHomeSectionPreference.hidden(from: hiddenSectionsRaw)
+    }
+
+    private func shows(_ section: PXHomeSection) -> Bool {
+        !hiddenSections.contains(section)
+    }
 
     private var continueItems: [HistoryEntry] {
         Array(history.entries.sorted { $0.updatedAt > $1.updatedAt }.prefix(12))
@@ -29,7 +38,7 @@ struct PXHomeView: View {
         GeometryReader { proxy in
             ScrollView(showsIndicators: false) {
                 LazyVStack(alignment: .leading, spacing: 0) {
-                    if !continueItems.isEmpty {
+                    if shows(.continueWatching), !continueItems.isEmpty {
                         rail(title: "继续观看", subtitle: "从上次看到的位置接着看") {
                             ForEach(continueItems) { entry in
                                 if let descriptor = SourceRegistry.descriptor(for: entry.drama.source) {
@@ -47,7 +56,7 @@ struct PXHomeView: View {
                         }
                     }
 
-                    if !nextUp.isEmpty {
+                    if shows(.nextUp), !nextUp.isEmpty {
                         rail(title: "接下来看", subtitle: "你在看和想看的下一部") {
                             ForEach(nextUp) { entry in
                                 NavigationLink {
@@ -62,7 +71,7 @@ struct PXHomeView: View {
 
                     if model.isLoading && model.latest.isEmpty {
                         skeletonRail(width: proxy.size.width)
-                    } else if !model.latest.isEmpty {
+                    } else if shows(.latest), !model.latest.isEmpty {
                         rail(title: "最近添加", subtitle: "来自全部媒体库的最新内容") {
                             ForEach(model.latest) { entry in
                                 NavigationLink {
@@ -75,7 +84,30 @@ struct PXHomeView: View {
                         }
                     }
 
-                    rail(title: "媒体库", subtitle: librariesSubtitle) {
+                    if shows(.libraries) {
+                        rail(title: "媒体库", subtitle: librariesSubtitle) {
+                            ForEach(model.libraries) { descriptor in
+                                NavigationLink {
+                                    PXSourceBrowseView(descriptor: descriptor)
+                                } label: {
+                                    PXLibraryCard(
+                                        descriptor: descriptor,
+                                        covers: model.libraryCovers[descriptor.id] ?? [],
+                                        width: proxy.size.width > 900 ? 300 : 258
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            Button {
+                                app.select(.profile)
+                            } label: {
+                                addLibraryCard
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+
+                    if !model.isLoading, continueItems.isEmpty, nextUp.isEmpty, model.latest.isEmpty, model.libraries.isEmpty {
                         ForEach(model.libraries) { descriptor in
                             NavigationLink {
                                 PXSourceBrowseView(descriptor: descriptor)

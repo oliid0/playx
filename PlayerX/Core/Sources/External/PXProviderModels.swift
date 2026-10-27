@@ -90,6 +90,12 @@ enum PXProviderSupport {
         return value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    static var userAgent: String {
+        let custom = UserDefaults.standard.string(forKey: "playerx.settings.network.userAgent.v1")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return custom.isEmpty ? "PlayerX/1.0" : custom
+    }
+
     static func basicAuth(username: String, password: String) -> String {
         "Basic " + Data("\(username):\(password)".utf8).base64EncodedString()
     }

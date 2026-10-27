@@ -16,6 +16,10 @@ final class PXImageMemoryCache {
         let cost = Int(image.size.width * image.size.height * 4)
         cache.setObject(image, forKey: url as NSURL, cost: cost)
     }
+
+    func clear() {
+        cache.removeAllObjects()
+    }
 }
 
 struct PXRemoteImage: View {

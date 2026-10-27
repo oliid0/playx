@@ -27,6 +27,7 @@ final class PXAppSettings: ObservableObject {
     @Published var moviePilotPassword: String { didSet { defaults.set(moviePilotPassword, forKey: Keys.mpPassword) } }
     @Published var moviePilotToken: String { didSet { defaults.set(moviePilotToken, forKey: Keys.mpToken) } }
 
+    @Published var customUserAgent: String { didSet { defaults.set(customUserAgent, forKey: Keys.userAgent) } }
     @Published var showAdultContent: Bool { didSet { defaults.set(showAdultContent, forKey: Keys.adult) } }
     @Published var preferredSourceIDs: [String] { didSet { defaults.set(preferredSourceIDs, forKey: Keys.sources) } }
 
@@ -54,6 +55,7 @@ final class PXAppSettings: ObservableObject {
         static let mpUser = "playerx.settings.moviepilot.user.v1"
         static let mpPassword = "playerx.settings.moviepilot.password.v1"
         static let mpToken = "playerx.settings.moviepilot.token.v1"
+        static let userAgent = "playerx.settings.network.userAgent.v1"
         static let adult = "playerx.settings.content.adult.v1"
         static let sources = "playerx.settings.sources.v1"
     }
@@ -75,6 +77,7 @@ final class PXAppSettings: ObservableObject {
         moviePilotUsername = defaults.string(forKey: Keys.mpUser) ?? ""
         moviePilotPassword = defaults.string(forKey: Keys.mpPassword) ?? ""
         moviePilotToken = defaults.string(forKey: Keys.mpToken) ?? ""
+        customUserAgent = defaults.string(forKey: Keys.userAgent) ?? ""
         showAdultContent = defaults.object(forKey: Keys.adult) as? Bool ?? false
         preferredSourceIDs = defaults.stringArray(forKey: Keys.sources) ?? []
     }
