@@ -92,7 +92,7 @@ final class PXPlayerModel: ObservableObject {
         scheduleHide()
         watchdogTask?.cancel()
         watchdogTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 12_000_000_000)
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
             guard let self, !Task.isCancelled, !self.didFallbackEngine else { return }
             if case .failed = self.snapshot.state { return }
             if self.snapshot.state == .opening || self.snapshot.state == .buffering {

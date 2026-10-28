@@ -40,7 +40,7 @@ final class PXSearchViewModel: ObservableObject {
         .sorted { $0.count == $1.count ? $0.name < $1.name : $0.count > $1.count }
     }
 
-    var totalSourceCount: Int { sourceCounts.count }
+    var totalSourceCount: Int { Set(results.compactMap(\.sourceID)).count }
 
     func submit() {
         let text = query.trimmingCharacters(in: .whitespacesAndNewlines)
