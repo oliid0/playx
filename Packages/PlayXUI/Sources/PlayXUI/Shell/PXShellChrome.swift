@@ -90,6 +90,7 @@ public struct PXShellChrome: View {
 
             Spacer(minLength: 12)
 
+            #if !os(tvOS)
             if let shareURL {
                 ShareLink(item: shareURL) {
                     Image(systemName: "square.and.arrow.up")
@@ -97,6 +98,7 @@ public struct PXShellChrome: View {
                 .buttonStyle(iconStyle)
                 .accessibilityLabel("分享")
             }
+            #endif
 
             Button(action: onSearch) {
                 Image(systemName: "magnifyingglass")
