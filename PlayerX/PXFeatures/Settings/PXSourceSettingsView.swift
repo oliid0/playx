@@ -1,4 +1,5 @@
 import SwiftUI
+import PlayXUI
 
 struct PXSourceSettingsView: View {
     @EnvironmentObject private var app: PXAppState

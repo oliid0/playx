@@ -1,4 +1,5 @@
 import SwiftUI
+import PlayXUI
 
 struct PXPlaybackSettingsView: View {
     @ObservedObject private var preferences = PXPlayerPreferences.shared

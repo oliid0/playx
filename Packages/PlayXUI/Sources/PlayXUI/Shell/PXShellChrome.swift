@@ -145,7 +145,9 @@ public struct PXShellChrome: View {
                     .background(section.id == selectedID ? PlayXTheme.surfaceStrong : .clear, in: Capsule())
                 }
                 .buttonStyle(.plain)
+                #if os(macOS)
                 .onHover { hovering = $0 ? section.id : nil }
+                #endif
             }
         }
         .padding(3)

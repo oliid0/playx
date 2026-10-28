@@ -1,4 +1,5 @@
 import SwiftUI
+import PlayXUI
 
 struct SourceLockView: View {
     @ObservedObject private var lock = SourceLockStore.shared

@@ -1,4 +1,5 @@
 import SwiftUI
+import PlayXUI
 
 struct PXBangumiLoginView: View {
     @Environment(\.dismiss) private var dismiss

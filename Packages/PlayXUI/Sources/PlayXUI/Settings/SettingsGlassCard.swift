@@ -17,24 +17,24 @@ enum SettingsCardRole: Equatable {
 }
 
 private struct SettingsCardRoleKey: LayoutValueKey {
-    static let defaultValue = SettingsCardRole.row
+    public static let defaultValue = SettingsCardRole.row
 }
 
-extension View {
-    func settingsCardCompact() -> some View {
+public extension View {
+    public func settingsCardCompact() -> some View {
         layoutValue(key: SettingsCardRoleKey.self, value: SettingsCardRole.note)
     }
 
-    func settingsCardInline() -> some View {
+    public func settingsCardInline() -> some View {
         layoutValue(key: SettingsCardRoleKey.self, value: SettingsCardRole.inline)
     }
 
-    func settingsRow() -> some View {
+    public func settingsRow() -> some View {
         frame(minHeight: SettingsMetrics.cardRowMinHeight)
     }
 
     @ViewBuilder
-    func settingsToggleStyle() -> some View {
+    public func settingsToggleStyle() -> some View {
         #if os(macOS)
         toggleStyle(SettingsSwitchToggleStyle())
         #else
@@ -54,7 +54,7 @@ struct SettingsCardRowLayout: Layout {
         role == .row ? max(size.height, minHeight) : size.height
     }
 
-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+    public func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
         let width = proposal.width ?? subviews.map { $0.sizeThatFits(.unspecified).width }.max() ?? 0
         guard !subviews.isEmpty else { return .zero }
         var height: CGFloat = 0
@@ -66,7 +66,7 @@ struct SettingsCardRowLayout: Layout {
         return CGSize(width: width, height: height)
     }
 
-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+    public func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
         var y = bounds.minY
         for subview in subviews {
             let role = subview[SettingsCardRoleKey.self]
@@ -82,14 +82,14 @@ struct SettingsCardRowLayout: Layout {
     }
 }
 
-struct SettingsGlassCard<Content: View>: View {
+public struct SettingsGlassCard<Content: View>: View {
     private let content: Content
 
-    init(@ViewBuilder content: () -> Content) {
+    public init(@ViewBuilder content: () -> Content) {
         self.content = content()
     }
 
-    var body: some View {
+    public var body: some View {
         SettingsCardRowLayout { content }
             .padding(.horizontal, SettingsMetrics.cardContentInset)
             .padding(.vertical, SettingsMetrics.cardContentVerticalInset)
@@ -98,19 +98,19 @@ struct SettingsGlassCard<Content: View>: View {
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: SettingsMetrics.cardCornerRadius, style: .continuous))
             .background(
                 RoundedRectangle(cornerRadius: SettingsMetrics.cardCornerRadius, style: .continuous)
-                    .fill(PXTheme.panelGradient)
+                    .fill(PlayXTheme.panelGradient)
             )
             .overlay {
                 RoundedRectangle(cornerRadius: SettingsMetrics.cardCornerRadius, style: .continuous)
-                    .strokeBorder(PXTheme.stroke, lineWidth: 0.8)
+                    .strokeBorder(PlayXTheme.stroke, lineWidth: 0.8)
             }
     }
 }
 
-struct SettingsGlassDivider: View {
+public struct SettingsGlassDivider: View {
     @Environment(\.displayScale) private var displayScale
 
-    var body: some View {
+    public var body: some View {
         Rectangle()
             .fill(Color.primary.opacity(0.10))
             .frame(height: 1 / max(displayScale, 1))
@@ -119,18 +119,18 @@ struct SettingsGlassDivider: View {
     }
 }
 
-struct SettingsGlassSection<Content: View, Footer: View>: View {
+public struct SettingsGlassSection<Content: View, Footer: View>: View {
     private let title: String?
     private let content: Content
     private let footer: Footer
 
-    init(_ title: String? = nil, @ViewBuilder content: () -> Content, @ViewBuilder footer: () -> Footer) {
+    public init(_ title: String? = nil, @ViewBuilder content: () -> Content, @ViewBuilder footer: () -> Footer) {
         self.title = title
         self.content = content()
         self.footer = footer()
     }
 
-    var body: some View {
+    public var body: some View {
         VStack(alignment: .leading, spacing: SettingsMetrics.sectionHeaderSpacing) {
             if let title, !title.isEmpty {
                 Text(title)
@@ -148,8 +148,8 @@ struct SettingsGlassSection<Content: View, Footer: View>: View {
     }
 }
 
-extension SettingsGlassSection where Footer == EmptyView {
-    init(_ title: String? = nil, @ViewBuilder content: () -> Content) {
+public extension SettingsGlassSection where Footer == EmptyView {
+    public init(_ title: String? = nil, @ViewBuilder content: () -> Content) {
         self.init(title, content: content) { EmptyView() }
     }
 }
@@ -158,12 +158,12 @@ struct SettingsGlassPage<Content: View>: View {
     private let content: Content
     private let maxContentWidth: CGFloat
 
-    init(maxContentWidth: CGFloat = SettingsMetrics.pageMaxContentWidth, @ViewBuilder content: () -> Content) {
+    public init(maxContentWidth: CGFloat = SettingsMetrics.pageMaxContentWidth, @ViewBuilder content: () -> Content) {
         self.maxContentWidth = maxContentWidth
         self.content = content()
     }
 
-    var body: some View {
+    public var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: SettingsMetrics.sectionSpacing + 8) {
                 content
@@ -179,8 +179,8 @@ struct SettingsGlassPage<Content: View>: View {
 }
 
 #if os(macOS)
-struct SettingsSwitchToggleStyle: ToggleStyle {
-    func makeBody(configuration: Configuration) -> some View {
+public struct SettingsSwitchToggleStyle: ToggleStyle {
+    public func makeBody(configuration: Configuration) -> some View {
         HStack(spacing: 12) {
             configuration.label
             Spacer(minLength: 8)
@@ -192,16 +192,16 @@ struct SettingsSwitchToggleStyle: ToggleStyle {
 }
 #endif
 
-struct SettingsRow<Label: View, Trailing: View>: View {
+public struct SettingsRow<Label: View, Trailing: View>: View {
     private let label: Label
     private let trailing: Trailing
 
-    init(@ViewBuilder label: () -> Label, @ViewBuilder trailing: () -> Trailing) {
+    public init(@ViewBuilder label: () -> Label, @ViewBuilder trailing: () -> Trailing) {
         self.label = label()
         self.trailing = trailing()
     }
 
-    var body: some View {
+    public var body: some View {
         HStack(spacing: 12) {
             label
             Spacer(minLength: 8)
@@ -211,23 +211,23 @@ struct SettingsRow<Label: View, Trailing: View>: View {
 }
 
 extension SettingsRow where Label == Text {
-    init(_ title: String, @ViewBuilder trailing: () -> Trailing) {
+    public init(_ title: String, @ViewBuilder trailing: () -> Trailing) {
         self.init(label: { Text(title) }, trailing: trailing)
     }
 }
 
-struct SettingsPickerRow<Value: Hashable, Content: View>: View {
+public struct SettingsPickerRow<Value: Hashable, Content: View>: View {
     private let title: String
     @Binding private var selection: Value
     private let content: Content
 
-    init(_ title: String, selection: Binding<Value>, @ViewBuilder content: () -> Content) {
+    public init(_ title: String, selection: Binding<Value>, @ViewBuilder content: () -> Content) {
         self.title = title
         self._selection = selection
         self.content = content()
     }
 
-    var body: some View {
+    public var body: some View {
         SettingsRow(title) {
             Picker(title, selection: $selection) { content }
                 .labelsHidden()
@@ -238,20 +238,20 @@ struct SettingsPickerRow<Value: Hashable, Content: View>: View {
     }
 }
 
-struct SettingsTextRow: View {
+public struct SettingsTextRow: View {
     private let title: String
     private let prompt: String
     @Binding private var text: String
     private let isSecure: Bool
 
-    init(_ title: String, text: Binding<String>, prompt: String = "", isSecure: Bool = false) {
+    public init(_ title: String, text: Binding<String>, prompt: String = "", isSecure: Bool = false) {
         self.title = title
         self._text = text
         self.prompt = prompt
         self.isSecure = isSecure
     }
 
-    var body: some View {
+    public var body: some View {
         SettingsRow(title) {
             field
                 .textFieldStyle(.plain)
@@ -267,20 +267,20 @@ struct SettingsTextRow: View {
     }
 }
 
-struct SettingsActionRow: View {
+public struct SettingsActionRow: View {
     private let title: String
     private let icon: String?
     private let role: ButtonRole?
     private let action: () -> Void
 
-    init(_ title: String, systemImage: String? = nil, role: ButtonRole? = nil, action: @escaping () -> Void) {
+    public init(_ title: String, systemImage: String? = nil, role: ButtonRole? = nil, action: @escaping () -> Void) {
         self.title = title
         self.icon = systemImage
         self.role = role
         self.action = action
     }
 
-    var body: some View {
+    public var body: some View {
         Button(action: action) {
             HStack(spacing: SettingsMetrics.iconLabelSpacing) {
                 if let icon {

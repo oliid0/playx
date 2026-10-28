@@ -9,6 +9,12 @@ public enum PlayXTheme {
     public static let stroke = Color.white.opacity(0.10)
     public static let surface = Color.white.opacity(0.055)
     public static let surfaceStrong = Color.white.opacity(0.095)
+    public static let surfaceMuted = Color.white.opacity(0.032)
+    public static let warning = Color(red: 0.984, green: 0.749, blue: 0.286)
+    public static let panelGradient = LinearGradient(
+        colors: [Color.white.opacity(0.09), Color.white.opacity(0.035)],
+        startPoint: .topLeading, endPoint: .bottomTrailing
+    )
     public static let accentGradient = LinearGradient(
         colors: [accent, Color(red: 0.925, green: 0.353, blue: 0.455)],
         startPoint: .leading, endPoint: .trailing

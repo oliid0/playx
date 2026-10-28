@@ -1,4 +1,5 @@
 import SwiftUI
+import PlayXUI
 
 struct PXDownloadsView: View {
     @ObservedObject private var downloads = DownloadStore.shared

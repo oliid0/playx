@@ -1,4 +1,5 @@
 import SwiftUI
+import PlayXUI
 
 struct PXMoviePilotSettingsView: View {
     @ObservedObject private var coordinator = PXMoviePilotCoordinator.shared

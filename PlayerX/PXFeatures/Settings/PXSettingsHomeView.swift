@@ -1,4 +1,5 @@
 import SwiftUI
+import PlayXUI
 
 /// 设置 hub：严格沿用 OcPlayer 的 `SettingsGlassPage` 卡片流和分组。
 /// 行只负责导航与当前值预览，具体控件在子页。

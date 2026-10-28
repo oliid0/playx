@@ -1,4 +1,5 @@
 import SwiftUI
+import PlayXUI
 
 struct PXTMDbSettingsView: View {
     @ObservedObject private var settings = PXAppSettings.shared

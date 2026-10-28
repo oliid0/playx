@@ -1,4 +1,5 @@
 import SwiftUI
+import PlayXUI
 
 struct PXAboutView: View {
     @State private var showLicenses = false

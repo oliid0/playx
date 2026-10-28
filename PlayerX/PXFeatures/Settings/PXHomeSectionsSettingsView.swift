@@ -1,4 +1,5 @@
 import SwiftUI
+import PlayXUI
 
 struct PXHomeSectionsSettingsView: View {
     @AppStorage(PXHomeSectionPreference.storageKey) private var hiddenRaw = ""

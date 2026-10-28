@@ -1,4 +1,5 @@
 import SwiftUI
+import PlayXUI
 
 struct PXBangumiSettingsView: View {
     @ObservedObject private var coordinator = PXBangumiCoordinator.shared

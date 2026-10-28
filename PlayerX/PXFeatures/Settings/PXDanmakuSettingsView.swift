@@ -1,4 +1,5 @@
 import SwiftUI
+import PlayXUI
 
 struct PXDanmakuSettingsView: View {
     @ObservedObject private var preferences = PXPlayerPreferences.shared
