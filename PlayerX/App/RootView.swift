@@ -51,7 +51,7 @@ struct PXRootView: View {
         }
         .onOpenURL { app.handleDeepLink($0) }
         #if os(macOS)
-        .toolbar(app.presentedPlayer == nil ? .visible : .hidden, for: .windowToolbar)
+        .toolbar(.hidden, for: .windowToolbar)
         #endif
     }
 

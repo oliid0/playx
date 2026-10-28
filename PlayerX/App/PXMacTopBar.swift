@@ -70,6 +70,13 @@ struct PXMacTopBar: View {
             Spacer(minLength: 16)
 
             HStack(spacing: 8) {
+                if let shareURL = app.pageShareURL {
+                    ShareLink(item: shareURL) {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                    .buttonStyle(PXIconButtonStyle(size: 32))
+                    .accessibilityLabel("分享")
+                }
                 Button {
                     app.selectTab(.search)
                 } label: {

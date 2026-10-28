@@ -13,6 +13,28 @@ struct PXBrowseView: View {
         GeometryReader { proxy in
             ScrollView(showsIndicators: false) {
                 LazyVStack(alignment: .leading, spacing: 16) {
+                    HStack(spacing: 10) {
+                        PXUICapsuleSearchField(placeholder: "搜索本库", text: $searchText)
+                        Menu {
+                            ForEach(PXCatalogSort.allCases) { sort in
+                                Button {
+                                    var filter = model.filter
+                                    filter.sort = sort
+                                    Task { await model.apply(filter) }
+                                } label: {
+                                    Label(sort.title, systemImage: sort.symbol)
+                                }
+                            }
+                        } label: {
+                            Image(systemName: "arrow.up.arrow.down")
+                                .font(.system(size: 13, weight: .semibold))
+                                .frame(width: 36, height: 36)
+                                .background(PXTheme.surfaceMuted, in: Circle())
+                        }
+                        .fixedSize()
+                    }
+                    .padding(.horizontal, PXTheme.padding(for: proxy.size.width))
+                    .padding(.top, 8)
                     if !model.categories.isEmpty {
                         categoryBar(width: proxy.size.width)
                     }

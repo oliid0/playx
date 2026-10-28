@@ -52,6 +52,7 @@ final class PXAppState: ObservableObject {
     let sourceStore = PXSourceConfigurationStore.shared
     @Published private(set) var navigationDepth = 0
     @Published private(set) var pageTitle: String?
+    @Published var pageShareURL: URL?
     let metadata = PXMetadataCoordinator.shared
     let settings = PXAppSettings.shared
     let playerPreferences = PXPlayerPreferences.shared
@@ -122,14 +123,18 @@ final class PXAppState: ObservableObject {
 
     var canNavigateBack: Bool { navigationDepth > 0 }
 
-    func enterPage(title: String) {
+    func enterPage(title: String, shareURL: URL? = nil) {
         navigationDepth += 1
         pageTitle = title
+        pageShareURL = shareURL
     }
 
     func leavePage() {
         navigationDepth = max(0, navigationDepth - 1)
-        if navigationDepth == 0 { pageTitle = nil }
+        if navigationDepth == 0 {
+            pageTitle = nil
+            pageShareURL = nil
+        }
     }
 
     func handleDeepLink(_ url: URL) {
