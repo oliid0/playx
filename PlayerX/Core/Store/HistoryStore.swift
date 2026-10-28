@@ -12,6 +12,7 @@ struct HistoryEntry: Codable, Identifiable, Hashable {
     var duration: Double
     var updatedAt: Date
     var id: String { drama.id }
+    var progress: Double { duration > 0 ? min(max(position / duration, 0), 1) : 0 }
 }
 
 @MainActor
