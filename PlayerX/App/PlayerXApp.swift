@@ -9,6 +9,7 @@ struct PlayerXApp: App {
             RootView()
                 .frame(minWidth: 980, minHeight: 640)
         }
+        .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1_180, height: 760)
         .windowToolbarStyle(.unified)
         .commands {

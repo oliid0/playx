@@ -3,7 +3,7 @@ import SwiftUI
 struct PXBrowseView: View {
     @EnvironmentObject private var app: PXAppState
     @StateObject private var model: PXBrowseViewModel
-    @State private var showFilter = false
+    @State private var searchText = ""
 
     init(section: PXCatalogSection, initialSource: String? = nil) {
         _model = StateObject(wrappedValue: PXBrowseViewModel(section: section, initialSource: initialSource))
@@ -13,7 +13,6 @@ struct PXBrowseView: View {
         GeometryReader { proxy in
             ScrollView(showsIndicators: false) {
                 LazyVStack(alignment: .leading, spacing: 16) {
-                    header(width: proxy.size.width)
                     if !model.categories.isEmpty {
                         categoryBar(width: proxy.size.width)
                     }
@@ -27,6 +26,8 @@ struct PXBrowseView: View {
                             actionTitle: "重试",
                             action: { Task { await model.reload() } }
                         )
+                    } else if displayedItems.isEmpty {
+                        PXEmptyState(title: "没有匹配内容", message: "换个关键词或分类再试试。", symbol: "magnifyingglass")
                     } else {
                         grid(width: proxy.size.width)
                         footer
@@ -39,57 +40,31 @@ struct PXBrowseView: View {
         .background(PXPageBackground())
         .navigationTitle(model.title)
         .pxInlineNavigationTitle()
+        .searchable(text: $searchText, placement: .toolbar, prompt: "搜索本库")
         .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button { showFilter = true } label: {
-                    Image(systemName: model.filter.isActive ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    ForEach(PXCatalogSort.allCases) { sort in
+                        Button {
+                            var filter = model.filter
+                            filter.sort = sort
+                            Task { await model.apply(filter) }
+                        } label: {
+                            Label(sort.title, systemImage: sort.symbol)
+                        }
+                    }
+                } label: {
+                    Image(systemName: "arrow.up.arrow.down")
                 }
-                .accessibilityLabel("筛选")
+                .accessibilityLabel("排序")
             }
         }
+        .pxBackCommand()
+        .onAppear { app.enterPage(title: model.title) }
+        .onDisappear { app.leavePage() }
         .task { await model.load() }
-        .sheet(isPresented: $showFilter) {
-            PXFilterSheet(filter: model.filter) { filter in
-                Task { await model.apply(filter) }
-            }
-            .presentationDetents([.medium, .large])
-        }
     }
 
-    private func header(width: CGFloat) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .bottom) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(model.title)
-                        .font(PXFont.display(width > 800 ? 36 : 30))
-                        .foregroundStyle(PXTheme.textPrimary)
-                    Text(model.subtitle)
-                        .font(PXFont.caption(12))
-                        .foregroundStyle(PXTheme.textTertiary)
-                }
-                Spacer()
-            }
-            if model.filter.isActive {
-                HStack(spacing: 7) {
-                    if let kind = model.filter.kind { PXTag(text: kind.title, tint: PXTheme.accent) }
-                    if let source = model.filter.sourceID,
-                       let descriptor = SourceRegistry.descriptor(for: source) {
-                        PXTag(text: descriptor.displayName, tint: PXTheme.sky)
-                    }
-                    if let genre = model.filter.genre { PXTag(text: genre, tint: PXTheme.mint) }
-                    if let year = model.filter.year { PXTag(text: String(year), tint: PXTheme.rose) }
-                    Button("清除") {
-                        Task { await model.apply(PXCatalogFilter(kind: model.section.mediaKind)) }
-                    }
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(PXTheme.textTertiary)
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-        .padding(.horizontal, PXTheme.padding(for: width))
-        .padding(.top, 10)
-    }
 
     private func categoryBar(width: CGFloat) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -115,7 +90,7 @@ struct PXBrowseView: View {
 
     private func grid(width: CGFloat) -> some View {
         LazyVGrid(columns: PXAdaptiveColumns.posters(width: width), spacing: 18) {
-            ForEach(model.items) { entry in
+            ForEach(displayedItems) { entry in
                 NavigationLink {
                     PXDetailView(entry: entry)
                 } label: {
@@ -135,6 +110,15 @@ struct PXBrowseView: View {
             }
         }
         .padding(.horizontal, PXTheme.padding(for: width))
+    }
+
+    private var displayedItems: [PXCatalogEntry] {
+        let text = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return model.items }
+        return model.items.filter {
+            $0.drama.title.localizedCaseInsensitiveContains(text)
+                || ($0.drama.description ?? "").localizedCaseInsensitiveContains(text)
+        }
     }
 
     private var footer: some View {

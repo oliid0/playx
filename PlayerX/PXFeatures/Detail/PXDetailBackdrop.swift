@@ -6,6 +6,7 @@ struct PXDetailBackdrop: View {
     var logoURL: URL?
     var title: String
     var height: CGFloat
+    var showsForeground: Bool = true
 
     var body: some View {
         ZStack(alignment: .bottomLeading) {
@@ -36,12 +37,12 @@ struct PXDetailBackdrop: View {
                 startPoint: .leading,
                 endPoint: .trailing
             )
-            if let logoURL {
+            if showsForeground, let logoURL {
                 PXRemoteImage(url: logoURL, contentMode: .fit, maxPixel: 900)
                     .frame(maxWidth: 380, maxHeight: 100, alignment: .leading)
                     .padding(.horizontal, PXTheme.widePadding)
                     .padding(.bottom, 34)
-            } else {
+            } else if showsForeground {
                 Text(title)
                     .font(PXFont.display(38))
                     .foregroundStyle(PXTheme.textPrimary)

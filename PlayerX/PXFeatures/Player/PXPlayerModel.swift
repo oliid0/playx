@@ -334,7 +334,9 @@ final class PXPlayerModel: ObservableObject {
     private func playbackURL(for kind: PXPlayerEngineKind) -> URL {
         // Erika 直接打开 CDN 原始地址；本机回环代理是给 AVPlayer/Pillarbox
         // 做 HLS 密钥重写用的，FFmpeg 自己就能取 key，无需多一跳。
-        if (kind == .erika || preferDirectPlayback), let direct = plan.directURL, let url = URL(string: direct) {
+        let needsProxyForCENC = !(plan.decryptionKey ?? "").isEmpty
+        if !needsProxyForCENC, (kind == .erika || preferDirectPlayback),
+           let direct = plan.directURL, let url = URL(string: direct) {
             return url
         }
         return URL(string: plan.url) ?? URL(string: "about:blank")!

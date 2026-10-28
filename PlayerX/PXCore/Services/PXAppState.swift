@@ -50,6 +50,8 @@ final class PXAppState: ObservableObject {
 
     let catalog = PXCatalogService.shared
     let sourceStore = PXSourceConfigurationStore.shared
+    @Published private(set) var navigationDepth = 0
+    @Published private(set) var pageTitle: String?
     let metadata = PXMetadataCoordinator.shared
     let settings = PXAppSettings.shared
     let playerPreferences = PXPlayerPreferences.shared
@@ -116,6 +118,18 @@ final class PXAppState: ObservableObject {
         case .settings: selectedSection = .profile
         case .search: break
         }
+    }
+
+    var canNavigateBack: Bool { navigationDepth > 0 }
+
+    func enterPage(title: String) {
+        navigationDepth += 1
+        pageTitle = title
+    }
+
+    func leavePage() {
+        navigationDepth = max(0, navigationDepth - 1)
+        if navigationDepth == 0 { pageTitle = nil }
     }
 
     func handleDeepLink(_ url: URL) {

@@ -39,7 +39,7 @@ struct PXHomeView: View {
             ScrollView(showsIndicators: false) {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     if shows(.continueWatching), !continueItems.isEmpty {
-                        rail(title: "继续观看", subtitle: "从上次看到的位置接着看") {
+                        rail(title: "继续观看", subtitle: nil) {
                             ForEach(continueItems) { entry in
                                 if let descriptor = SourceRegistry.descriptor(for: entry.drama.source) {
                                     NavigationLink {
@@ -48,7 +48,7 @@ struct PXHomeView: View {
                                             resume: entry
                                         )
                                     } label: {
-                                        PXContinueCard(entry: entry, width: proxy.size.width > 900 ? 300 : 260)
+                                        PXContinueCard(entry: entry, width: proxy.size.width > 1_200 ? 390 : (proxy.size.width > 900 ? 320 : 260))
                                     }
                                     .buttonStyle(.plain)
                                 }
@@ -57,7 +57,7 @@ struct PXHomeView: View {
                     }
 
                     if shows(.nextUp), !nextUp.isEmpty {
-                        rail(title: "接下来看", subtitle: "你在看和想看的下一部") {
+                        rail(title: "接下来看", subtitle: nil) {
                             ForEach(nextUp) { entry in
                                 NavigationLink {
                                     PXDetailView(entry: entry)
@@ -72,7 +72,7 @@ struct PXHomeView: View {
                     if model.isLoading && model.latest.isEmpty {
                         skeletonRail(width: proxy.size.width)
                     } else if shows(.latest), !model.latest.isEmpty {
-                        rail(title: "最近添加", subtitle: "来自全部媒体库的最新内容") {
+                        rail(title: "最近添加", subtitle: nil) {
                             ForEach(model.latest) { entry in
                                 NavigationLink {
                                     PXDetailView(entry: entry)
@@ -85,7 +85,7 @@ struct PXHomeView: View {
                     }
 
                     if shows(.libraries) {
-                        rail(title: "媒体库", subtitle: librariesSubtitle) {
+                        rail(title: "媒体库", subtitle: nil) {
                             ForEach(model.libraries) { descriptor in
                                 NavigationLink {
                                     PXSourceBrowseView(descriptor: descriptor)

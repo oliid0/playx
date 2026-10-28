@@ -16,14 +16,26 @@ struct PXMacTopBar: View {
 
     var body: some View {
         HStack(spacing: 12) {
+            if app.canNavigateBack {
+                Button {
+                    NotificationCenter.default.post(name: .playerXNavigationBack, object: nil)
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 12, weight: .bold))
+                        .frame(width: 30, height: 30)
+                        .background(.ultraThinMaterial, in: Circle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(PXTheme.textPrimary)
+            }
             HStack(spacing: 9) {
                 PXLogoMark(size: 30)
                 VStack(alignment: .leading, spacing: 0) {
-                    Text("PLAYERX")
+                    Text(app.pageTitle ?? "PLAYERX")
                         .font(.system(size: 13, weight: .heavy, design: .rounded))
                         .kerning(0.8)
                         .foregroundStyle(PXTheme.textPrimary)
-                    Text(app.selectedTab.title)
+                    Text(app.canNavigateBack ? "PLAYERX" : app.selectedTab.title)
                         .font(.system(size: 9, weight: .medium))
                         .foregroundStyle(PXTheme.textTertiary)
                 }
@@ -68,10 +80,12 @@ struct PXMacTopBar: View {
                 .accessibilityLabel("搜索全部媒体库")
             }
         }
-        .padding(.horizontal, 18)
-        .padding(.top, 9)
+        .padding(.leading, 88)
+        .padding(.trailing, 18)
+        .padding(.top, 8)
         .padding(.bottom, 7)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .background(PXWindowDragArea())
         .background(.ultraThinMaterial)
         .overlay(alignment: .bottom) {
             Rectangle().fill(PXTheme.stroke).frame(height: 1)

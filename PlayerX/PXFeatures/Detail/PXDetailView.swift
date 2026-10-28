@@ -64,6 +64,9 @@ struct PXDetailView: View {
                 }
             }
         }
+        .pxBackCommand()
+        .onAppear { app.enterPage(title: model.title) }
+        .onDisappear { app.leavePage() }
         .task {
             await model.loadIfNeeded()
             await downloads.refresh()

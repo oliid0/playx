@@ -104,6 +104,22 @@ func (stream *nativeStreamServer) nativeOpen(media providerMedia) (string, strin
 		entry.data = []byte(media.Playlist)
 		entry.contentType = "application/vnd.apple.mpegurl"
 	}
+	// Red fruit (and some other providers) return a clear-key CENC MP4. AVPlayer
+	// cannot decrypt CENC without FairPlay, so fetch + clear it once and serve the
+	// decrypted bytes from this local proxy.
+	if len(media.CENCKey) == 16 && !isHLS {
+		if clear, err := stream.downloader.cencDecryptedMedia(ctx, media); err == nil {
+			entry.data = clear
+			entry.contentType = "video/mp4"
+			entry.address = media.URL + "#cenc-clear"
+			entry.total = int64(len(clear))
+		} else {
+			entry.data = []byte("CENC 解密失败：" + err.Error())
+			entry.contentType = "text/plain; charset=utf-8"
+			entry.address = media.URL + "#cenc-error"
+			entry.total = int64(len(entry.data))
+		}
+	}
 	return stream.nativeAsset(token, session, entry), token
 }
 
