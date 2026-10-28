@@ -36,9 +36,9 @@ public final class CredentialFileStore: @unchecked Sendable {
     /// 懒加载缓存；nil = 还没读盘。
     private var cache: [String: String]?
 
-    /// - Parameter directory: 默认 `Application Support/OcPlayer`（`OcPlayerStorage.defaultRoot`）；测试传临时目录。
+    /// - Parameter directory: 默认 `Application Support/OcPlayer`（`PlayXStorage.defaultRoot`）；测试传临时目录。
     public init(directory: URL? = nil, fileName: String = "credentials.json") {
-        let base = directory ?? OcPlayerStorage.defaultRoot
+        let base = directory ?? PlayXStorage.defaultRoot
         self.fileURL = base.appending(path: fileName)
     }
 

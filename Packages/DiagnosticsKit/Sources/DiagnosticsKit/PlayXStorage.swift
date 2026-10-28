@@ -2,11 +2,11 @@ import Foundation
 
 /// OcPlayer 自有存储目录的**唯一事实源**。
 ///
-/// 背景：`Application Support/OcPlayer/<子目录>` 这条路径原先在 6 处各自手拼
+/// 背景：`Application Support/PlayerX/<子目录>` 这条路径原先在 6 处各自手拼
 /// （凭据、Bangumi 库、弹幕、外挂字幕 ×2、图片缓存、App 维护脚本），于是：
 /// - 路径写歪了不会编译报错，只会在运行时静默建出第二份目录；
 /// - **存储维护看不见自己不知道的目录** —— `Bangumi.sqlite` 就是这么漏掉的：
-///   它建在 `OcPlayer/` 下，却从没被 `AppStorageMaintenance` 管过（体积不可见、
+///   它建在 `PlayerX/` 下，却从没被 `AppStorageMaintenance` 管过（体积不可见、
 ///   永不清理、也没有上限）。这条不是理论风险，是实际发生过的事。
 ///
 /// 因此：**新增落盘一律经本类型取路径**，再在 `AppStorageDirectories`
@@ -16,9 +16,9 @@ import Foundation
 /// `cachesRoot` / `cacheDirectory(_:in:)`：它们不在 `Application Support` 下，
 /// 由各自的容量上限自管（`URLCache` 512 MB + `ImageBlobStore` 256 MB），
 /// 也不该被「按旧优先淘汰」的维护器当普通文件处理。
-public enum OcPlayerStorage {
+public enum PlayXStorage {
 
-    /// 应用数据根目录（`Application Support/OcPlayer`）。
+    /// 应用数据根目录（`Application Support/PlayerX`）。
     ///
     /// 用 `applicationSupportDirectory` 而不是 `cachesDirectory`：这里的文件是
     /// **用户数据**（凭据、追番进度、弹幕映射），不是系统可以随手清掉的缓存。
@@ -38,14 +38,14 @@ public enum OcPlayerStorage {
     ///
     /// `AppTests` 跑在 **App 宿主进程**里（`TEST_HOST = OcPlayer.app`），宿主照样装配
     /// 真实存储与偏好 —— 于是「跑一次测试」就把开发者本机的**真实数据**读写了一遍。
-    /// 实测过一次（2026-10-16，macOS 全量用例）：跑完 `~/Library/Application Support/OcPlayer/`
+    /// 实测过一次（2026-10-16，macOS 全量用例）：跑完 `~/Library/Application Support/PlayerX/`
     /// 下 `credentials.json`、`Media.sqlite-wal`、`Bangumi.sqlite-wal` 与真实偏好 plist 的
     /// mtime 全落在测试窗口内。凭据内容当时没坏，**但那是运气不是设计** —— 一个会写
     /// 开发机凭据文件的测试套件迟早会把它写坏。
     ///
     /// ## 打开后
     ///
-    /// * 存储根（凭据 / 各 sqlite / 图片缓存 / 弹幕 / 字幕）→ `临时目录/OcPlayerAutomation`；
+    /// * 存储根（凭据 / 各 sqlite / 图片缓存 / 弹幕 / 字幕）→ `临时目录/PlayerXAutomation`；
     /// * App 偏好默认域（`defaultPreferences`）→ 隔离根下的独立 plist。
     ///
     /// 生产（双击 App、真机验收）不设它，行为与从前**完全一致**。
@@ -56,7 +56,7 @@ public enum OcPlayerStorage {
     /// 隔离运行时的数据根。放临时目录：进程退出后由系统回收，多次运行之间也不互相串。
     public static var isolationRoot: URL {
         FileManager.default.temporaryDirectory
-            .appending(path: "OcPlayerAutomation", directoryHint: .isDirectory)
+            .appending(path: "PlayerXAutomation", directoryHint: .isDirectory)
     }
 
     /// App 偏好的默认域（`ServerStore(defaults:)` / `AppModel(preferences:)` 等的默认值）。
@@ -76,12 +76,12 @@ public enum OcPlayerStorage {
         if let isolated = UserDefaults(suiteName: path) { return isolated }
         // 兜底：万一路径式 suite 不被接受，退到进程级 suite —— 仍然碰不到真实域。
         return UserDefaults(
-            suiteName: "dev.jumusu.OcPlayer.automation.\(ProcessInfo.processInfo.processIdentifier)"
+            suiteName: "com.oliid0.playerx.automation.\(ProcessInfo.processInfo.processIdentifier)"
         ) ?? .standard
     }
 
     /// 目录名。**改它等于丢掉所有用户的既有数据**，别动。
-    public static let directoryName = "OcPlayer"
+    public static let directoryName = "PlayerX"
 
     /// 根目录下的一个子目录。`base` 只给测试注入临时目录用。
     public static func directory(_ name: String, in base: URL? = nil) -> URL {
@@ -105,7 +105,7 @@ public enum OcPlayerStorage {
 
     // MARK: - 可再生缓存（`Caches/`）
 
-    /// 可再生缓存的根目录（`Caches/OcPlayer`）。
+    /// 可再生缓存的根目录（`Caches/PlayerX`）。
     ///
     /// **与 `defaultRoot` 的分工**（放错一边就是 bug，不是风格问题）：
     ///
