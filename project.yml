@@ -142,7 +142,7 @@ targets:
       - path: PlayerX/Core/Sources/PXExternalSourceRegistry.swift
       - path: PlayerX/Core/Sources/PXSourceProviderFactory.swift
       - path: PlayerX/Core/Sources/External
-      - path: PlayerX/Features/Player/PillarboxSupport.swift
+      - path: PlayerX/PXCore/Playback/PillarboxSupport.swift
       - path: PlayerX/PXFeatures/Settings/PXSettingsRow.swift
       - path: PlayerX/PXFeatures/Settings/PXSourceEditorView.swift
       - path: PlayerX/PXCore/Models/PXDrama+Taxonomy.swift
