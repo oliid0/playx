@@ -39,7 +39,7 @@ struct PXHomeView: View {
             ScrollView(showsIndicators: false) {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     if shows(.continueWatching), !continueItems.isEmpty {
-                        rail(title: "继续观看", subtitle: nil) {
+                        rail(title: "继续观看", subtitle: "") {
                             ForEach(continueItems) { entry in
                                 if let descriptor = SourceRegistry.descriptor(for: entry.drama.source) {
                                     NavigationLink {
@@ -57,7 +57,7 @@ struct PXHomeView: View {
                     }
 
                     if shows(.nextUp), !nextUp.isEmpty {
-                        rail(title: "接下来看", subtitle: nil) {
+                        rail(title: "接下来看", subtitle: "") {
                             ForEach(nextUp) { entry in
                                 NavigationLink {
                                     PXDetailView(entry: entry)
@@ -72,7 +72,7 @@ struct PXHomeView: View {
                     if model.isLoading && model.latest.isEmpty {
                         skeletonRail(width: proxy.size.width)
                     } else if shows(.latest), !model.latest.isEmpty {
-                        rail(title: "最近添加", subtitle: nil) {
+                        rail(title: "最近添加", subtitle: "") {
                             ForEach(model.latest) { entry in
                                 NavigationLink {
                                     PXDetailView(entry: entry)
@@ -85,7 +85,7 @@ struct PXHomeView: View {
                     }
 
                     if shows(.libraries) {
-                        rail(title: "媒体库", subtitle: nil) {
+                        rail(title: "媒体库", subtitle: "") {
                             ForEach(model.libraries) { descriptor in
                                 NavigationLink {
                                     PXSourceBrowseView(descriptor: descriptor)
