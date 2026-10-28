@@ -8,6 +8,7 @@ final class PXPlayerModel: ObservableObject {
     let request: PXPlaybackRequest
     @Published private(set) var snapshot = PXPlayerSnapshot()
     @Published private(set) var engineKind: PXPlayerEngineKind
+    @Published private(set) var engineGeneration = 0
     @Published private(set) var currentIndex: Int
     @Published private(set) var plan: PlaybackPlan
     @Published private(set) var chapters: [Chapter]
@@ -361,6 +362,7 @@ final class PXPlayerModel: ObservableObject {
         guard let engine = PXPlaybackEngineFactory.resolve(kind) else { return }
         self.engine = engine
         engineKind = engine.kind
+        engineGeneration += 1
         engine.onChange = { [weak self] snapshot in
             guard let self else { return }
             let previousState = self.snapshot.state

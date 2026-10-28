@@ -27,7 +27,7 @@ struct PXPlayerScreen: View {
             Color.black.ignoresSafeArea()
             if let engine = model.engine {
                 engine.makeSurface()
-                    .id(model.engineKind)
+                    .id(model.engineGeneration)
                     .ignoresSafeArea()
             }
             PXDanmakuOverlay(

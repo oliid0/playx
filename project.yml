@@ -41,6 +41,8 @@ packages:
     path: Packages/ErikaKit
   PlaybackKit:
     path: Packages/PlaybackKit
+  OcPlayerUI:
+    path: Packages/OcPlayerUI
 
 targets:
   PlayerX:
@@ -58,6 +60,8 @@ targets:
         product: ErikaKit
       - package: PlaybackKit
         product: PlaybackKit
+      - package: OcPlayerUI
+        product: OcPlayerUI
       - framework: native/build/DuanjuCore.xcframework
         embed: false
       - sdk: Security.framework
@@ -96,6 +100,8 @@ targets:
         product: ErikaKit
       - package: PlaybackKit
         product: PlaybackKit
+      - package: OcPlayerUI
+        product: OcPlayerUI
       - framework: native/build/DuanjuCore.xcframework
         embed: false
       - sdk: Security.framework
