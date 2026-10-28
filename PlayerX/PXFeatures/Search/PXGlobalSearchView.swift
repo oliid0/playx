@@ -81,7 +81,7 @@ struct PXGlobalSearchView: View {
         if model.isSearching {
             VStack(spacing: 12) {
                 PXLoadingCard()
-                Text("正在搜索 \(model.totalSourceCount > 0 ? "\(model.totalSourceCount) 个源" : "全部站源")…")
+                Text("正在搜索 \(model.searchedSourceCount) 个站源与媒体源…")
                     .font(.system(size: 10)).foregroundStyle(PXTheme.textTertiary)
             }
             Spacer()
@@ -89,7 +89,7 @@ struct PXGlobalSearchView: View {
             VStack(spacing: 10) {
                 Image(systemName: "magnifyingglass").font(.system(size: 28, weight: .light)).foregroundStyle(PXTheme.textTertiary)
                 Text("没有找到「\(model.submittedQuery)」").font(PXFont.section(17))
-                Text("已搜索全部 \(model.totalSourceCount) 个站源与外部媒体源；\(model.warnings.first ?? "换个关键词试试")")
+                Text("已搜索全部 \(max(model.searchedSourceCount, model.totalSourceCount)) 个站源与外部媒体源；\(model.warnings.first ?? "换个关键词试试")")
                     .font(.system(size: 11)).foregroundStyle(PXTheme.textTertiary).multilineTextAlignment(.center)
                 if !model.warnings.isEmpty {
                     PXUIWarningBanner(text: model.warnings.joined(separator: "\n"))

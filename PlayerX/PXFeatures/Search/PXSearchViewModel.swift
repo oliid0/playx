@@ -19,6 +19,7 @@ final class PXSearchViewModel: ObservableObject {
     @Published var selectedSourceID: String?
     @Published private(set) var isSearching = false
     @Published private(set) var submittedQuery = ""
+    @Published private(set) var searchedSourceCount = 0
     @Published var errorMessage: String?
 
     private var generation = 0
@@ -56,6 +57,7 @@ final class PXSearchViewModel: ObservableObject {
         let current = generation
         isSearching = true
         submittedQuery = text
+        searchedSourceCount = catalog.searchSources.count
         errorMessage = nil
         results = []
         sourceCounts = [:]
