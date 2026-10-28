@@ -1,6 +1,6 @@
 import SwiftUI
 
-public enum OcPlayerTheme {
+public enum PlayXTheme {
     public static let background = Color(red: 0.035, green: 0.039, blue: 0.050)
     public static let textPrimary = Color.white.opacity(0.94)
     public static let textSecondary = Color.white.opacity(0.64)

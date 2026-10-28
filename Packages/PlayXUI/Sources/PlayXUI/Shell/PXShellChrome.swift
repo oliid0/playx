@@ -4,9 +4,9 @@ import SwiftUI
 import AppKit
 #endif
 
-/// OcPlayer 顶栏的独立 UI 模块版本。App 只传状态与回调，不再在 App 内维护第二套
+/// PlayerX 顶栏的独立 UI 模块版本。App 只传状态与回调，不再在 App 内维护第二套
 /// 顶栏实现。
-public struct OcShellSection: Identifiable, Hashable, Sendable {
+public struct PXShellSection: Identifiable, Hashable, Sendable {
     public enum Icon: Hashable, Sendable {
         case symbol(String)
         case brand(String)
@@ -22,8 +22,8 @@ public struct OcShellSection: Identifiable, Hashable, Sendable {
     }
 }
 
-public struct OcShellChrome: View {
-    public var sections: [OcShellSection]
+public struct PXShellChrome: View {
+    public var sections: [PXShellSection]
     public var selectedID: String
     public var title: String
     public var subtitle: String
@@ -36,7 +36,7 @@ public struct OcShellChrome: View {
     @State private var hovering: String?
 
     public init(
-        sections: [OcShellSection],
+        sections: [PXShellSection],
         selectedID: String,
         title: String,
         subtitle: String,
@@ -67,7 +67,7 @@ public struct OcShellChrome: View {
                         .background(.ultraThinMaterial, in: Circle())
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(OcPlayerTheme.textPrimary)
+                .foregroundStyle(PlayXTheme.textPrimary)
             }
 
             HStack(spacing: 9) {
@@ -76,11 +76,11 @@ public struct OcShellChrome: View {
                     Text(title)
                         .font(.system(size: 13, weight: .heavy, design: .rounded))
                         .kerning(0.6)
-                        .foregroundStyle(OcPlayerTheme.textPrimary)
+                        .foregroundStyle(PlayXTheme.textPrimary)
                         .lineLimit(1)
                     Text(subtitle)
                         .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(OcPlayerTheme.textTertiary)
+                        .foregroundStyle(PlayXTheme.textTertiary)
                         .lineLimit(1)
                 }
             }
@@ -102,7 +102,7 @@ public struct OcShellChrome: View {
                 Image(systemName: "magnifyingglass")
             }
             .buttonStyle(iconStyle)
-            .foregroundStyle(selectedID == "search" ? OcPlayerTheme.accent : OcPlayerTheme.textPrimary)
+            .foregroundStyle(selectedID == "search" ? PlayXTheme.accent : PlayXTheme.textPrimary)
             .accessibilityLabel("搜索全部媒体库")
         }
         .padding(.leading, 88)
@@ -113,18 +113,18 @@ public struct OcShellChrome: View {
         .background(dragBackground)
         .background(.ultraThinMaterial)
         .overlay(alignment: .bottom) {
-            Rectangle().fill(OcPlayerTheme.stroke).frame(height: 1)
+            Rectangle().fill(PlayXTheme.stroke).frame(height: 1)
         }
     }
 
     private var brandMark: some View {
         ZStack {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(OcPlayerTheme.accentGradient)
+                .fill(PlayXTheme.accentGradient)
                 .frame(width: 28, height: 28)
             Image(systemName: "play.fill")
                 .font(.system(size: 11, weight: .bold))
-                .foregroundStyle(OcPlayerTheme.background)
+                .foregroundStyle(PlayXTheme.background)
         }
     }
 
@@ -139,10 +139,10 @@ public struct OcShellChrome: View {
                         icon(section)
                         Text(section.title).font(.system(size: 12, weight: .semibold))
                     }
-                    .foregroundStyle(section.id == selectedID ? OcPlayerTheme.textPrimary : OcPlayerTheme.textSecondary)
+                    .foregroundStyle(section.id == selectedID ? PlayXTheme.textPrimary : PlayXTheme.textSecondary)
                     .padding(.horizontal, 12)
                     .frame(height: 31)
-                    .background(section.id == selectedID ? OcPlayerTheme.surfaceStrong : .clear, in: Capsule())
+                    .background(section.id == selectedID ? PlayXTheme.surfaceStrong : .clear, in: Capsule())
                 }
                 .buttonStyle(.plain)
                 .onHover { hovering = $0 ? section.id : nil }
@@ -150,12 +150,12 @@ public struct OcShellChrome: View {
         }
         .padding(3)
         .background(.ultraThinMaterial, in: Capsule())
-        .overlay(Capsule().strokeBorder(OcPlayerTheme.stroke, lineWidth: 0.7))
+        .overlay(Capsule().strokeBorder(PlayXTheme.stroke, lineWidth: 0.7))
         .fixedSize()
     }
 
     @ViewBuilder
-    private func icon(_ section: OcShellSection) -> some View {
+    private func icon(_ section: PXShellSection) -> some View {
         switch section.icon {
         case .symbol(let name):
             Image(systemName: name).font(.system(size: 11, weight: .semibold))
@@ -169,7 +169,7 @@ public struct OcShellChrome: View {
     @ViewBuilder
     private var dragBackground: some View {
         #if os(macOS)
-        OcWindowDragArea()
+        PXWindowDragArea()
         #else
         Color.clear
         #endif
@@ -181,16 +181,16 @@ private struct PXIconButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(OcPlayerTheme.textPrimary)
+            .foregroundStyle(PlayXTheme.textPrimary)
             .frame(width: size, height: size)
             .background(.ultraThinMaterial, in: Circle())
-            .overlay(Circle().strokeBorder(OcPlayerTheme.stroke, lineWidth: 0.7))
+            .overlay(Circle().strokeBorder(PlayXTheme.stroke, lineWidth: 0.7))
             .opacity(configuration.isPressed ? 0.72 : 1)
     }
 }
 
 #if os(macOS)
-struct OcWindowDragArea: NSViewRepresentable {
+struct PXWindowDragArea: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView { DragView() }
     func updateNSView(_ nsView: NSView, context: Context) {}
     private final class DragView: NSView {

@@ -2,10 +2,10 @@
 import PackageDescription
 
 let package = Package(
-    name: "OcPlayerUI",
+    name: "PlayXUI",
     platforms: [.macOS(.v14), .iOS(.v17)],
-    products: [.library(name: "OcPlayerUI", targets: ["OcPlayerUI"])],
+    products: [.library(name: "PlayXUI", targets: ["PlayXUI"])],
     targets: [
-        .target(name: "OcPlayerUI")
+        .target(name: "PlayXUI")
     ]
 )
