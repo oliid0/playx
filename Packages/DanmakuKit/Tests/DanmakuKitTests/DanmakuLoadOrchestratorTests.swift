@@ -1,0 +1,1379 @@
+import DiagnosticsKit
+import XCTest
+@testable import DanmakuKit
+
+/// 编排层测试：把「匹配 → 缓存 → 装载」全链路跑进一个可注入的假播放器。
+/// 竞态防护（revision 代次）在这里有直接断言。
+///
+/// 并发说明：本类标 @MainActor（编排器与假播放器都主线程隔离）。
+/// mock handler 闭包只捕获 Sendable 局部常量、不捕获 self，直接赋值
+/// `MockURLProtocol.handler` 而非 `withMock` 的 body 闭包，规避 Swift 6
+/// 严格模式对「发送非 Sendable 闭包」的检查。
+@MainActor
+final class DanmakuLoadOrchestratorTests: XCTestCase {
+
+    private var cache: DanmakuCache!
+    private var service: DanmakuService!
+    private var orchestrator: DanmakuLoadOrchestrator!
+    private var playback: FakePlaybackHost!
+
+    override func setUp() {
+        super.setUp()
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DanmakuOrchestratorTests-\(UUID().uuidString)", isDirectory: true)
+        cache = DanmakuCache(directory: directory)
+        service = DanmakuService(cache: cache)
+        orchestrator = DanmakuLoadOrchestrator(
+            service: service,
+            session: TestSupport.mockedSession(),
+            // 零等待重试策略：编排层透传给网关客户端，重试用例不空等退避。
+            retryPolicy: RetryPolicy(attempts: 3, base: 0, jitter: 0.0...0.0)
+        )
+        playback = FakePlaybackHost()
+    }
+
+    override func tearDown() async throws {
+        await cache.purge()
+        playback = nil
+        orchestrator = nil
+        service = nil
+        cache = nil
+    }
+
+    // MARK: 工具
+
+    private func makeContext(
+        cacheKey: String = "jellyfin:abcdef",
+        allowsCachedMatchReuse: Bool = true,
+        fileSize: Int64 = 64
+    ) -> DanmakuMatchContext {
+        DanmakuMatchContext(
+            uuid: UUID(),
+            cacheKey: cacheKey,
+            allowsCachedMatchReuse: allowsCachedMatchReuse,
+            fileName: "葬送的芙莉莲 01",
+            fileSize: fileSize,
+            durationSeconds: 1440,
+            localFileURL: nil,
+            remoteURL: URL(string: "https://media.example.com/video.mp4"),
+            remoteHeaders: ["Authorization": "Bearer x"]
+        )
+    }
+
+    private func makeConfiguration() -> DandanplayConfiguration {
+        DandanplayConfiguration(
+            baseURL: URL(string: "https://gateway.example.com")!,
+            apiKey: "test-key",
+            userAgent: "OcPlay/test (macOS; arm64)"
+        )
+    }
+
+    // MARK: 全链路
+
+    func testFullPipelineHashThenMatchThenLoad() async throws {
+        let configuration = makeConfiguration()
+        let context = makeContext()
+        let fingerprint = makeFingerprintData()
+        let matchBody = """
+        {"success":true,"errorCode":0,"resultCount":1,"isMatched":true,
+         "matches":[{"episodeId":1001,"animeTitle":"葬送的芙莉莲","episodeTitle":"第1话","shift":2}]}
+        """
+        let commentsBody = """
+        {"count":2,"comments":[
+          {"cid":1,"p":"0.5,1,16777215,100","m":"你好"},
+          {"cid":2,"p":"2.0,5,16711680,100","m":"顶部"}
+        ]}
+        """
+        MockURLProtocol.handler = { request in
+            switch request.url!.path {
+            case "/v1/match":
+                return TestSupport.response(matchBody, url: request.url!)
+            case "/v1/comments/1001":
+                return TestSupport.response(commentsBody, url: request.url!)
+            case "/video.mp4":
+                return makeRange206Response(fingerprint, url: request.url!)
+            default:
+                return TestSupport.response("{}", status: 404, url: request.url!)
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        XCTAssertEqual(outcome, .loaded(episodeID: 1001, commentCount: 2, title: "葬送的芙莉莲 · 第1话", introHint: nil))
+        try assertInjectedJSON(commentCount: 2, firstContent: "你好", firstTime: 0.5)
+        XCTAssertEqual(playback.injectedOffset, .seconds(2))
+        let cached = await service.cachedMatch(for: context.cacheKey)
+        XCTAssertNotNil(cached)
+    }
+
+    // MARK: 降级瀑布总预算（P1-16）
+
+    /// 「慢但成功」是唯一能跑完四层的真实坏路径（超时/5xx 会被 `gatewayDown` 短路）。
+    /// 关掉预算时它最坏发 8 个请求；打开预算后必须裁到「预算 + 一次在途请求」。
+    ///
+    /// **请求数是主判据，墙钟只做相对比较。** 两个漏网变异：
+    /// - 删掉层内全部 `guard budgetOpen()`（只留层间检查）→ **4 个**；
+    /// - `deadline` 设成「一进函数就过期」→ **0 个**。
+    /// 早先只写 `<= 4`，这两个变异都能过；现在用「>0 且 ≤ 无界的一半」，两端都钉住。
+    ///
+    /// ⚠️ **墙钟不能写绝对值**：本机 3 个请求 312–324 ms，但 CI runner 上同样
+    /// 3 个请求要 **421.9 ms** —— 而「删掉层内闸门」在本机是 4 个 / 418 ms。
+    /// 两个区间重叠，绝对阈值必然在某一侧误判（CI 就是这么红的）。所以改成
+    /// **和自己那一轮的 unbounded 基线比**（同机同负载，机器无关）。
+    func testWaterfallRespectsTotalBudget() async throws {
+        // 基线：预算关闭 = 旧行为。
+        let unbounded = try await countRequests(slowMs: 100, budget: .zero)
+        XCTAssertGreaterThan(unbounded.count, 4,
+                             "预算关闭时应跑完整个瀑布（实测 8 个请求）")
+
+        // 预算 250 ms + 100 ms/请求 ⇒ 本机理论 2–3 个（预算 + 一次在途）。
+        //
+        // ⚠️ **不用固定区间断言**：CI runner 上同一条用例实测只发出 **1 个**请求
+        // （调度慢到 250 ms 只够跑完一次「100 ms 睡眠 + 开销」），区间 `2...3` 当场红。
+        // 请求数的**上界**仍然由「预算 + 一次在途」给出，但下界取决于机器——
+        // 所以判据换成**比例**：有界必须显著少于无界（8 个）。
+        let bounded = try await countRequests(slowMs: 100, budget: .milliseconds(250))
+        XCTAssertLessThan(bounded.count, unbounded.count,
+                          "预算必须真的减少请求数：有界 \(bounded.count) vs 无界 \(unbounded.count)")
+        XCTAssertGreaterThan(bounded.count, 0,
+                             "0 个 = 闸门提前失效（deadline 一进函数就过期）")
+        // 必须**严格**少于一半：只做层间检查时实测恰好是 4 个（无界 8 个的一半），
+        // 用 `<` 才能把它与真正的层内闸门（2–3 个）分开。
+        XCTAssertLessThan(bounded.count * 2, unbounded.count,
+                          "有界请求数 \(bounded.count) 必须不到无界 \(unbounded.count) 的一半"
+                          + "（只做层间检查时是 \(unbounded.count / 2) 个，层内闸门才裁得下去）")
+        // 相对耗时：有界必须显著短于无界（同机同轮，不受 runner 快慢影响）。
+        // 2–3 个请求 vs 8 个请求，正常应在 0.5 倍以内；留到 0.75 容忍调度抖动。
+        XCTAssertLessThan(bounded.elapsedMs, unbounded.elapsedMs * 0.75,
+                          "有界耗时 \(bounded.elapsedMs) ms 应显著短于无界 "
+                          + "\(unbounded.elapsedMs) ms")
+    }
+
+    /// **预算切掉的那次运行不能报「未匹配到剧集」。**
+    ///
+    /// 审查给的反例：把唯一命中放在 Tier 4 —— `.zero` 预算能 `loaded`，
+    /// 250 ms 预算却落 `.noMatch`。那不是「服务端没有这一集」，是我们**没跑完**。
+    /// 与 P1-03 同一立场：不准把「我们这边没跑完」说成「服务端没有」。
+    func testBudgetCutReportsRetryableFailureNotNoMatch() async throws {
+        let fingerprint = makeFingerprintData()
+        let noMatchBody = """
+        {"success":true,"errorCode":0,"resultCount":0,"isMatched":false,"matches":[]}
+        """
+        let emptySearch = #"{"success":true,"errorCode":0,"animes":[]}"#
+        // 只有「纯化标题」那次搜索能命中 —— 它只出现在 Tier 4。
+        let cleanTitleHit = """
+        {"success":true,"errorCode":0,"animes":[{"animeId":10,"animeTitle":"葬送的芙莉莲","type":"tvseries","episodes":[{"episodeId":5001,"episodeTitle":"第1话"}]}]}
+        """
+        let commentsBody = """
+        {"count":1,"comments":[{"cid":1,"p":"1,1,16777215,1","m":"x"}]}
+        """
+
+        func run(budget: Duration) async throws -> DanmakuLoadOutcome {
+            let orchestrator = DanmakuLoadOrchestrator(
+                service: service,
+                session: TestSupport.mockedSession(),
+                retryPolicy: RetryPolicy(attempts: 1, base: 0, jitter: 0.0...0.0),
+                totalBudget: budget
+            )
+            MockURLProtocol.handler = { request in
+                if request.url!.path == "/video.mp4" {
+                    return makeRange206Response(fingerprint, url: request.url!)
+                }
+                if request.url!.path == "/v1/match" {
+                    Thread.sleep(forTimeInterval: 0.1)
+                    return TestSupport.response(noMatchBody, url: request.url!)
+                }
+                if request.url!.path.hasPrefix("/v1/comments/") {
+                    return TestSupport.response(commentsBody, url: request.url!)
+                }
+                // 搜索：只有日语原名（纯化标题 = Tier 4）命中。
+                Thread.sleep(forTimeInterval: 0.1)
+                let raw = request.url!.absoluteString
+                let jp = "葬送的芙莉莲".addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+                if raw.contains(jp) {
+                    return TestSupport.response(cleanTitleHit, url: request.url!)
+                }
+                return TestSupport.response(emptySearch, url: request.url!)
+            }
+            defer { MockURLProtocol.handler = nil }
+            // 关键：`animeTitle` 与文件名解析出的标题**必须不同**，Tier 4 才会执行
+            // （Tier 3 用 animeTitle，Tier 4 用 parsed.title；两者相同则 Tier 4 被跳过）。
+            // 命中只给 parsed.title 那一次 —— 于是命中一定落在 Tier 4。
+            let context = DanmakuMatchContext(
+                uuid: UUID(),
+                cacheKey: "budget-honest-\(budget)",
+                allowsCachedMatchReuse: false,
+                fileName: "葬送的芙莉莲 01",
+                fileSize: 64,
+                durationSeconds: 1440,
+                localFileURL: nil,
+                remoteURL: URL(string: "https://media.example.com/video.mp4"),
+                remoteHeaders: ["Authorization": "Bearer x"],
+                animeTitle: "完全不同的标题"
+            )
+            return await orchestrator.runAutomatic(
+                matchContext: context,
+                configuration: makeConfiguration(),
+                playback: playback,
+                revision: 1
+            )
+        }
+
+        let unbounded = try await run(budget: .zero)
+        guard case .loaded = unbounded else {
+            return XCTFail("预算关闭时应能命中 Tier 4，实际 \(unbounded)")
+        }
+
+        let bounded = try await run(budget: .milliseconds(150))
+        if case .noMatch = bounded {
+            return XCTFail("预算提前放弃不能报 .noMatch（那是在说服务端没有这一集）")
+        }
+        guard case .failed = bounded else {
+            return XCTFail("预算提前放弃应为可重试的 .failed，实际 \(bounded)")
+        }
+    }
+
+    /// 预算耗尽但已经有过 `tierError` 时，结果仍必须是 `.failed`（可重试），
+    /// **不能**退化成 `.noMatch` —— 那是 P1-03 修的边界，不能被预算改回去。
+    func testBudgetExhaustedStillReportsFailure() async throws {
+        let boundedOrchestrator = DanmakuLoadOrchestrator(
+            service: service,
+            session: TestSupport.mockedSession(),
+            retryPolicy: RetryPolicy(attempts: 1, base: 0, jitter: 0.0...0.0),
+            totalBudget: .milliseconds(150)
+        )
+        let fingerprint = makeFingerprintData()
+        MockURLProtocol.handler = { request in
+            if request.url!.path == "/video.mp4" {
+                return makeRange206Response(fingerprint, url: request.url!)
+            }
+            // 慢 + 404：4xx 不在 gatewayDown 白名单里 → 不短路，但会记 tierError。
+            Thread.sleep(forTimeInterval: 0.2)
+            return TestSupport.response("{}", status: 404, url: request.url!)
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await boundedOrchestrator.runAutomatic(
+            matchContext: makeContext(cacheKey: "budget-failed"),
+            configuration: makeConfiguration(),
+            playback: playback,
+            revision: 1
+        )
+        guard case .failed = outcome else {
+            return XCTFail("预算耗尽 + 有 tierError 时应为 .failed，实际 \(outcome)")
+        }
+    }
+
+    /// 缓存命中的路径完全不受预算影响（零网络请求，也不该被预算判据碰）。
+    func testBudgetDoesNotAffectCachedMatchPath() async throws {
+        let tinyBudgetOrchestrator = DanmakuLoadOrchestrator(
+            service: service,
+            session: TestSupport.mockedSession(),
+            retryPolicy: RetryPolicy(attempts: 1, base: 0, jitter: 0.0...0.0),
+            // 极小预算：即便 1 ns 也该走完缓存路径。
+            totalBudget: .nanoseconds(1)
+        )
+        let context = makeContext(cacheKey: "budget-cached")
+        await service.remember(
+            match: DanmakuEpisodeMatch(episodeID: 3003, shiftSeconds: 0),
+            cacheKey: context.cacheKey,
+            revision: 0
+        )
+        await service.persistComments(
+            [DanmakuComment(cid: 1, p: "1,1,16777215,1", m: "缓存弹幕")],
+            for: 3003
+        )
+        MockURLProtocol.handler = { _ in throw URLError(.badServerResponse) }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await tinyBudgetOrchestrator.runAutomatic(
+            matchContext: context,
+            configuration: makeConfiguration(),
+            playback: playback,
+            revision: 1
+        )
+        guard case .loaded(let episodeID, let count, _, _) = outcome else {
+            return XCTFail("缓存命中应直接装载，实际 \(outcome)")
+        }
+        XCTAssertEqual(episodeID, 3003)
+        XCTAssertEqual(count, 1)
+    }
+
+    /// **指纹下载不占预算**：`mediaHash` 拉的是媒体服务器的前 16 MiB，成本由
+    /// `URLSession` 超时管着，闸门既管不到也不该管。
+    ///
+    /// 修前实测：指纹 500 ms + 预算 300 ms ⇒ 进到 Tier 1 预算已耗尽，
+    /// **零次搜索请求**且落成 `.noMatch`（谎报「未匹配到剧集」）。慢媒体服务器上可达。
+    func testSlowFingerprintDoesNotConsumeBudget() async throws {
+        final class Counter: @unchecked Sendable {
+            var searches = 0
+        }
+        let boundedOrchestrator = DanmakuLoadOrchestrator(
+            service: service,
+            session: TestSupport.mockedSession(),
+            retryPolicy: RetryPolicy(attempts: 1, base: 0, jitter: 0.0...0.0),
+            totalBudget: .milliseconds(300)
+        )
+        let counter = Counter()
+        let fingerprint = makeFingerprintData()
+        MockURLProtocol.handler = { request in
+            if request.url!.path == "/video.mp4" {
+                // 慢但成功：吃掉的时间必须**不计入**预算。
+                Thread.sleep(forTimeInterval: 0.5)
+                return makeRange206Response(fingerprint, url: request.url!)
+            }
+            counter.searches += 1
+            return TestSupport.response("{}", status: 404, url: request.url!)
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await boundedOrchestrator.runAutomatic(
+            matchContext: makeContext(cacheKey: "slow-fingerprint"),
+            configuration: makeConfiguration(),
+            playback: playback,
+            revision: 1
+        )
+        XCTAssertGreaterThan(counter.searches, 0,
+                             "指纹耗时不该耗尽预算 —— 四层至少要尝试一次")
+        // 有 tierError（404 会记）时必须是可重试的失败，不能谎报未匹配。
+        guard case .failed = outcome else {
+            return XCTFail("应有 tierError → .failed，实际 \(outcome)")
+        }
+    }
+
+    /// 数一遍「慢但成功」路径下真实发出的搜索请求数。
+    private func countRequests(
+        slowMs: Double,
+        budget: Duration
+    ) async throws -> (count: Int, elapsedMs: Double) {
+        final class Counter: @unchecked Sendable {
+            var searches = 0
+        }
+        // 每轮用独立的 orchestrator 与缓存键，避免上一轮的映射命中缓存。
+        let boundedOrchestrator = DanmakuLoadOrchestrator(
+            service: service,
+            session: TestSupport.mockedSession(),
+            retryPolicy: RetryPolicy(attempts: 1, base: 0, jitter: 0.0...0.0),
+            totalBudget: budget
+        )
+        let counter = Counter()
+        let fingerprint = makeFingerprintData()
+        MockURLProtocol.handler = { request in
+            if request.url!.path == "/video.mp4" {
+                return makeRange206Response(fingerprint, url: request.url!)
+            }
+            counter.searches += 1
+            Thread.sleep(forTimeInterval: slowMs / 1000)
+            // 200 + 空结果：层内循环会继续，且不触发 gatewayDown —— 真正的坏路径。
+            let body = #"{"success":true,"errorCode":0,"animes":[],"episodes":[]}"#
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil,
+                                    headerFields: ["Content-Type": "application/json"])!,
+                    Data(body.utf8))
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let context = DanmakuMatchContext(
+            uuid: UUID(),
+            cacheKey: "budget-bench-\(slowMs)-\(budget)",
+            allowsCachedMatchReuse: false,
+            fileName: "[Sub] 葬送的芙莉莲 - 03 [1080p].mkv",
+            fileSize: 64,
+            durationSeconds: 1440,
+            localFileURL: nil,
+            remoteURL: URL(string: "https://media.example.com/video.mp4"),
+            remoteHeaders: ["Authorization": "Bearer x"],
+            animeTitle: "完全不同的标题",
+            tmdbID: 123_456
+        )
+        let started = CFAbsoluteTimeGetCurrent()
+        _ = await boundedOrchestrator.runAutomatic(
+            matchContext: context,
+            configuration: makeConfiguration(),
+            playback: playback,
+            revision: 1
+        )
+        return (counter.searches, (CFAbsoluteTimeGetCurrent() - started) * 1000)
+    }
+
+    // MARK: 缓存命中
+
+    func testCachedMatchReuseSkipsHashAndGateway() async throws {
+        let configuration = makeConfiguration()
+        let context = makeContext()
+        await service.remember(
+            match: DanmakuEpisodeMatch(episodeID: 2002, shiftSeconds: 0, animeTitle: "旧番", episodeTitle: "第2话"),
+            cacheKey: context.cacheKey,
+            revision: 0
+        )
+        // 预置正文缓存 → 匹配与正文都命中本地，网络在测试中完全不可达。
+        let comments = [DanmakuComment(cid: 1, p: "1,1,16777215,1", m: "缓存弹幕")]
+        await service.persistComments(comments, for: 2002)
+        // 任何网关请求都视为测试失败（缓存的语义就是零请求）。
+        MockURLProtocol.handler = { _ in
+            throw URLError(.badServerResponse)
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        XCTAssertEqual(outcome, .loaded(episodeID: 2002, commentCount: 1, title: "旧番 · 第2话", introHint: nil))
+    }
+
+    func testOverlayRouteDoesNotBuildKernelJSON() async throws {
+        let configuration = makeConfiguration()
+        let context = makeContext()
+        await service.remember(
+            match: DanmakuEpisodeMatch(episodeID: 2012, shiftSeconds: 0, animeTitle: "旧番", episodeTitle: "第 1 话"),
+            cacheKey: context.cacheKey,
+            revision: 0
+        )
+        await service.persistComments(
+            [DanmakuComment(cid: 1, p: "1,1,16777215,1", m: "overlay")],
+            for: 2012
+        )
+        playback.danmakuPayloadFormat = .overlay
+        MockURLProtocol.handler = { _ in
+            XCTFail("缓存命中不应请求网络")
+            throw URLError(.badServerResponse)
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+
+        XCTAssertEqual(outcome, .loaded(episodeID: 2012, commentCount: 1, title: "旧番 · 第 1 话", introHint: nil))
+        XCTAssertEqual(playback.injectedEntries?.count, 1)
+        XCTAssertNil(playback.injectedJSON)
+    }
+
+    func testKernelTrackRouteInjectsJSONWithoutOverlayEntries() async throws {
+        let configuration = makeConfiguration()
+        let context = makeContext()
+        await service.remember(
+            match: DanmakuEpisodeMatch(episodeID: 2022, shiftSeconds: 0, animeTitle: "旧番", episodeTitle: "第 1 话"),
+            cacheKey: context.cacheKey,
+            revision: 0
+        )
+        await service.persistComments(
+            [DanmakuComment(cid: 1, p: "1,1,16777215,1", m: "kernel")],
+            for: 2022
+        )
+        playback.danmakuPayloadFormat = .kernelTrack
+        MockURLProtocol.handler = { _ in
+            XCTFail("缓存命中不应请求网络")
+            throw URLError(.badServerResponse)
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+
+        XCTAssertEqual(outcome, .loaded(episodeID: 2022, commentCount: 1, title: "旧番 · 第 1 话", introHint: nil))
+        XCTAssertEqual(playback.injectedEntries, [])
+        XCTAssertNotNil(playback.injectedJSON)
+    }
+
+    func testNoMatchOutcome() async throws {
+        let configuration = makeConfiguration()
+        let context = makeContext()
+        let fingerprint = makeFingerprintData()
+        let body = """
+        {"success":true,"errorCode":0,"resultCount":0,"isMatched":false,"matches":[]}
+        """
+        MockURLProtocol.handler = { request in
+            switch request.url!.path {
+            case "/v1/match":
+                return TestSupport.response(body, url: request.url!)
+            case "/v1/search/episodes":
+                // 干净的空搜索结果（旧 mock 这里返回二进制、靠旧版吞错兜底；
+                // 分流后错误会走 failed，这里必须模拟网关真的返回空）。
+                return TestSupport.response("{\"success\":true,\"errorCode\":0,\"animes\":[]}", url: request.url!)
+            default:
+                return makeRange206Response(fingerprint, url: request.url!)
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        XCTAssertEqual(outcome, .noMatch)
+        XCTAssertNil(playback.injectedJSON)
+    }
+
+    /// 网关全线失败（match + search 都 500）：必须报「失败可重试」，
+    /// 不得谎报「未匹配到剧集」；请求层重试耗尽后短路剩余降级层。
+    func testGatewayErrorsYieldFailedInsteadOfNoMatch() async throws {
+        let configuration = makeConfiguration()
+        let context = makeContext()
+        let fingerprint = makeFingerprintData()
+        let matchRequests = TestSupport.RequestCounter()
+        let searchRequests = TestSupport.RequestCounter()
+        MockURLProtocol.handler = { request in
+            switch request.url!.path {
+            case "/video.mp4":
+                return makeRange206Response(fingerprint, url: request.url!)
+            case "/v1/match":
+                matchRequests.count += 1
+                return TestSupport.response("{\"error\":\"boom\"}", status: 500, url: request.url!)
+            default:
+                searchRequests.count += 1
+                return TestSupport.response("{\"error\":\"boom\"}", status: 500, url: request.url!)
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        guard case .failed(let message) = outcome else {
+            return XCTFail("网关错误应报失败，got \(outcome)")
+        }
+        XCTAssertEqual(message, "弹幕服务暂时不可用", "httpStatus(500) 应复用既有用户文案")
+        XCTAssertNil(playback.injectedJSON, "失败路径不应注入弹幕")
+        XCTAssertEqual(matchRequests.count, 3, "500 在可重试集：请求层耗尽全部尝试")
+        XCTAssertEqual(searchRequests.count, 0, "网关故障应短路剩余降级层")
+    }
+
+    /// 可重试的网关故障（503）：请求层把 match 重试耗尽后短路剩余降级层，
+    /// 不再连打必败的 search 请求。
+    func testRetryableGatewayErrorRetriesThenShortCircuits() async throws {
+        let configuration = makeConfiguration()
+        let context = makeContext()
+        let fingerprint = makeFingerprintData()
+        let matchRequests = TestSupport.RequestCounter()
+        let searchRequests = TestSupport.RequestCounter()
+        MockURLProtocol.handler = { request in
+            switch request.url!.path {
+            case "/video.mp4":
+                return makeRange206Response(fingerprint, url: request.url!)
+            case "/v1/match":
+                matchRequests.count += 1
+                return TestSupport.response("{\"error\":\"boom\"}", status: 503, url: request.url!)
+            default:
+                searchRequests.count += 1
+                return TestSupport.response("{\"error\":\"boom\"}", status: 503, url: request.url!)
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        guard case .failed(let message) = outcome else {
+            return XCTFail("网关错误应报失败，got \(outcome)")
+        }
+        XCTAssertEqual(message, "弹幕服务暂时不可用", "httpStatus(503) 应复用既有用户文案")
+        XCTAssertNil(playback.injectedJSON, "失败路径不应注入弹幕")
+        XCTAssertEqual(matchRequests.count, 3, "503 可重试：请求层耗尽全部尝试")
+        XCTAssertEqual(searchRequests.count, 0, "重试耗尽后短路剩余降级层")
+    }
+
+    /// 混合结局：tier 1 干净返回无匹配、tier 3 搜索网络断 → 仍应报失败。
+    func testMixedCleanAndErrorTiersYieldFailed() async throws {
+        let configuration = makeConfiguration()
+        let context = makeContext()
+        let fingerprint = makeFingerprintData()
+        let noMatchBody = """
+        {"success":true,"errorCode":0,"resultCount":0,"isMatched":false,"matches":[]}
+        """
+        MockURLProtocol.handler = { request in
+            switch request.url!.path {
+            case "/v1/match":
+                return TestSupport.response(noMatchBody, url: request.url!)
+            case "/video.mp4":
+                return makeRange206Response(fingerprint, url: request.url!)
+            default:
+                throw URLError(.notConnectedToInternet)
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        guard case .failed(let message) = outcome else {
+            return XCTFail("混合结局应报失败，got \(outcome)")
+        }
+        XCTAssertEqual(message, "弹幕网络请求失败", "URLError 应映射为网络失败文案")
+    }
+
+    func testForceRematchClearsRememberedMatch() async throws {
+        let configuration = makeConfiguration()
+        let context = makeContext()
+        let fingerprint = makeFingerprintData()
+        await service.remember(
+            match: DanmakuEpisodeMatch(episodeID: 3003),
+            cacheKey: context.cacheKey,
+            revision: 0
+        )
+        let noMatchBody = """
+        {"success":true,"errorCode":0,"resultCount":0,"isMatched":false,"matches":[]}
+        """
+        MockURLProtocol.handler = { request in
+            switch request.url!.path {
+            case "/v1/match":
+                return TestSupport.response(noMatchBody, url: request.url!)
+            case "/v1/search/episodes":
+                return TestSupport.response("{\"success\":true,\"errorCode\":0,\"animes\":[]}", url: request.url!)
+            default:
+                return makeRange206Response(fingerprint, url: request.url!)
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 2,
+            forceRematch: true
+        )
+        XCTAssertEqual(outcome, .noMatch)
+        let cached = await service.cachedMatch(for: context.cacheKey)
+        XCTAssertNil(cached, "forceRematch 未命中时应清除已记住的映射")
+        XCTAssertTrue(playback.didClear, "forceRematch 应先清掉旧弹幕")
+    }
+
+    // MARK: 空弹幕 / 指纹不可用
+
+    func testEmptyPayloadBecomesEmptyOutcome() async throws {
+        let configuration = makeConfiguration()
+        let context = makeContext()
+        let fingerprint = makeFingerprintData()
+        let matchBody = """
+        {"success":true,"errorCode":0,"resultCount":1,"isMatched":true,
+         "matches":[{"episodeId":4004}]}
+        """
+        let emptyBody = """
+        {"count":0,"comments":[]}
+        """
+        MockURLProtocol.handler = { request in
+            switch request.url!.path {
+            case "/v1/match":
+                return TestSupport.response(matchBody, url: request.url!)
+            case "/v1/comments/4004":
+                return TestSupport.response(emptyBody, url: request.url!)
+            default:
+                return makeRange206Response(fingerprint, url: request.url!)
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        XCTAssertEqual(outcome, .empty(episodeID: 4004, title: "弹弹play", introHint: nil))
+    }
+
+    func testFingerprintUnavailableFailsWithManualSuggestion() async throws {
+        let configuration = makeConfiguration()
+        let context = makeContext(
+            cacheKey: "standalone:remote-no-range",
+            allowsCachedMatchReuse: false,
+            fileSize: 17 * 1024 * 1024
+        )
+        let data = makeFingerprintData()
+        // 服务器忽略 Range 返回 200 且文件大于 16 MiB 上限 → 指纹不可用。
+        MockURLProtocol.handler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: [
+                    "Content-Type": "application/octet-stream",
+                ]
+            )!
+            return (response, data)
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        guard case .failed(let message) = outcome else {
+            return XCTFail("expected failed, got \(outcome)")
+        }
+        XCTAssertEqual(message, "无法读取媒体指纹，请手动选择弹幕")
+    }
+
+    // MARK: 竞态 / 取消
+
+    func testInjectionUsesPlaybackUUIDNotCacheKey() async throws {
+        // 回归：uuid 必须原样透传给播放器（真实 PlaybackRequest.id），
+        // 不能从 cacheKey 派生——那会造成注入永远不匹配当前源。
+        let configuration = makeConfiguration()
+        let context = makeContext()
+        await service.remember(
+            match: DanmakuEpisodeMatch(episodeID: 6006, shiftSeconds: 0, animeTitle: "透传", episodeTitle: "第6话"),
+            cacheKey: context.cacheKey,
+            revision: 0
+        )
+        let comments = [DanmakuComment(cid: 1, p: "1,1,16777215,1", m: "x")]
+        await service.persistComments(comments, for: 6006)
+        MockURLProtocol.handler = { _ in
+            throw URLError(.badServerResponse)
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        XCTAssertEqual(outcome, .loaded(episodeID: 6006, commentCount: 1, title: "透传 · 第6话", introHint: nil))
+        XCTAssertEqual(playback.waitedUUIDs.last, context.uuid, "就绪等待与注入必须使用请求的 uuid")
+    }
+
+    func testWaitUntilReadyTimeoutFailsWithoutInjection() async throws {
+        let configuration = makeConfiguration()
+        let context = makeContext()
+        await service.remember(
+            match: DanmakuEpisodeMatch(episodeID: 7007),
+            cacheKey: context.cacheKey,
+            revision: 0
+        )
+        let comments = [DanmakuComment(cid: 1, p: "1,1,16777215,1", m: "x")]
+        await service.persistComments(comments, for: 7007)
+        MockURLProtocol.handler = { _ in
+            throw URLError(.badServerResponse)
+        }
+        defer { MockURLProtocol.handler = nil }
+        // 假播放器就绪等待永远被取消（等价于 30s 超时），编排器应失败且不注入。
+        playback.readyNeverResolves = true
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        guard case .failed(let message) = outcome else {
+            return XCTFail("就绪超时应失败，got \(outcome)")
+        }
+        XCTAssertEqual(message, "视频未就绪，弹幕未装载")
+        XCTAssertNil(playback.injectedJSON, "就绪超时不应注入")
+    }
+
+    func testStaleRevisionCannotInjectAfterSwitch() async throws {
+        let configuration = makeConfiguration()
+        let context = makeContext()
+        let fingerprint = makeFingerprintData()
+        // 新任务已 claim 更高的 revision；旧任务（revision 1）即使拿到匹配结果，
+        // 写入与注入都必须被 revision 屏障挡掉。
+        await service.claimMatchRevision(cacheKey: context.cacheKey, revision: 2)
+        let matchBody = """
+        {"success":true,"errorCode":0,"resultCount":1,"isMatched":true,
+         "matches":[{"episodeId":5005}]}
+        """
+        MockURLProtocol.handler = { request in
+            switch request.url!.path {
+            case "/v1/match":
+                return TestSupport.response(matchBody, url: request.url!)
+            default:
+                return makeRange206Response(fingerprint, url: request.url!)
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        guard case .failed = outcome else {
+            return XCTFail("过期代次应失败而非装载，got \(outcome)")
+        }
+        XCTAssertNil(playback.injectedJSON, "过期代次不应注入弹幕")
+    }
+
+    func testCancellationPreventsInjection() async throws {
+        let configuration = makeConfiguration()
+        let context = makeContext()
+        // 只捕获 Sendable 局部值，避免把 XCTestCase 自身带入 Task。
+        let orch = orchestrator!
+        let pb = playback!
+        let task = Task { await orch.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: pb,
+            revision: 1
+        ) }
+        task.cancel()
+        _ = await task.value
+        XCTAssertNil(pb.injectedJSON, "取消后不应注入弹幕")
+    }
+
+    // MARK: - 智能多级降级检索测试
+
+    func testMatchFallbackToTitleSearchWhenHashFails() async throws {
+        let configuration = makeConfiguration()
+        let context = makeContext()
+        let fingerprint = makeFingerprintData()
+        let noMatchBody = """
+        {"success":true,"errorCode":0,"resultCount":0,"isMatched":false,"matches":[]}
+        """
+        let searchBody = """
+        {"success":true,"errorCode":0,"animes":[{"animeId":10,"animeTitle":"葬送的芙莉莲","type":"tvseries","episodes":[{"episodeId":5001,"episodeTitle":"第1话"}]}]}
+        """
+        let commentsBody = """
+        {"count":1,"comments":[{"cid":1,"p":"1,1,16777215,1","m":"降级搜索弹幕"}]}
+        """
+        MockURLProtocol.handler = { request in
+            switch request.url!.path {
+            case "/v1/match":
+                return TestSupport.response(noMatchBody, url: request.url!)
+            case "/v1/search/episodes":
+                return TestSupport.response(searchBody, url: request.url!)
+            case "/v1/comments/5001":
+                return TestSupport.response(commentsBody, url: request.url!)
+            default:
+                return makeRange206Response(fingerprint, url: request.url!)
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        XCTAssertEqual(outcome, .loaded(episodeID: 5001, commentCount: 1, title: "葬送的芙莉莲 · 第1话", introHint: nil))
+    }
+
+    func testMatchFallbackToTMDBIdSearch() async throws {
+        let configuration = makeConfiguration()
+        let context = DanmakuMatchContext(
+            uuid: UUID(),
+            cacheKey: "jellyfin:tmdb-test",
+            allowsCachedMatchReuse: true,
+            fileName: "02.mkv",
+            fileSize: 64,
+            durationSeconds: 1440,
+            localFileURL: nil,
+            remoteURL: URL(string: "https://media.example.com/video.mp4"),
+            remoteHeaders: [:],
+            animeTitle: "葬送的芙莉莲",
+            episodeNumber: 2,
+            seasonNumber: 1,
+            tmdbID: 209867
+        )
+        let fingerprint = makeFingerprintData()
+        let noMatchBody = """
+        {"success":true,"errorCode":0,"resultCount":0,"isMatched":false,"matches":[]}
+        """
+        let tmdbSearchBody = """
+        {"success":true,"errorCode":0,"animes":[{"animeId":10,"animeTitle":"葬送的芙莉莲","type":"tvseries","episodes":[{"episodeId":5002,"episodeTitle":"第2话"}]}]}
+        """
+        let commentsBody = """
+        {"count":1,"comments":[{"cid":1,"p":"1,1,16777215,1","m":"TMDB命中弹幕"}]}
+        """
+        MockURLProtocol.handler = { request in
+            switch request.url!.path {
+            case "/v1/match":
+                return TestSupport.response(noMatchBody, url: request.url!)
+            case "/v1/search/episodes":
+                let items = TestSupport.queryItems(of: request)
+                if items["tmdbId"] == "209867" {
+                    return TestSupport.response(tmdbSearchBody, url: request.url!)
+                }
+                return TestSupport.response("{\"success\":true,\"animes\":[]}", url: request.url!)
+            case "/v1/comments/5002":
+                return TestSupport.response(commentsBody, url: request.url!)
+            default:
+                return makeRange206Response(fingerprint, url: request.url!)
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        XCTAssertEqual(outcome, .loaded(episodeID: 5002, commentCount: 1, title: "葬送的芙莉莲 · 第2话", introHint: nil))
+    }
+
+    func testCandidateAcceptedWhenIsMatchedIsFalse() async throws {
+        let configuration = makeConfiguration()
+        let context = makeContext()
+        let fingerprint = makeFingerprintData()
+        let fuzzyMatchBody = """
+        {"success":true,"errorCode":0,"resultCount":1,"isMatched":false,
+         "matches":[{"episodeId":5003,"animeTitle":"葬送的芙莉莲","episodeTitle":"第1话","shift":0}]}
+        """
+        let commentsBody = """
+        {"count":1,"comments":[{"cid":1,"p":"1,1,16777215,1","m":"模糊命中弹幕"}]}
+        """
+        MockURLProtocol.handler = { request in
+            switch request.url!.path {
+            case "/v1/match":
+                return TestSupport.response(fuzzyMatchBody, url: request.url!)
+            case "/v1/comments/5003":
+                return TestSupport.response(commentsBody, url: request.url!)
+            default:
+                return makeRange206Response(fingerprint, url: request.url!)
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        XCTAssertEqual(outcome, .loaded(episodeID: 5003, commentCount: 1, title: "葬送的芙莉莲 · 第1话", introHint: nil))
+    }
+
+    func testFingerprintUnavailableFallbackToSearchSuccess() async throws {
+        let configuration = makeConfiguration()
+        let context = makeContext(
+            cacheKey: "standalone:remote-no-range-fallback",
+            allowsCachedMatchReuse: false,
+            fileSize: 17 * 1024 * 1024
+        )
+        let data = makeFingerprintData()
+        let searchBody = """
+        {"success":true,"errorCode":0,"animes":[{"animeId":10,"animeTitle":"葬送的芙莉莲","type":"tvseries","episodes":[{"episodeId":5004,"episodeTitle":"第1话"}]}]}
+        """
+        let commentsBody = """
+        {"count":1,"comments":[{"cid":1,"p":"1,1,16777215,1","m":"无指纹搜索命中"}]}
+        """
+        MockURLProtocol.handler = { request in
+            switch request.url!.path {
+            case "/v1/search/episodes":
+                return TestSupport.response(searchBody, url: request.url!)
+            case "/v1/comments/5004":
+                return TestSupport.response(commentsBody, url: request.url!)
+            default:
+                let response = HTTPURLResponse(
+                    url: request.url!, statusCode: 200, httpVersion: nil, headerFields: [
+                        "Content-Type": "application/octet-stream",
+                    ]
+                )!
+                return (response, data)
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        XCTAssertEqual(outcome, .loaded(episodeID: 5004, commentCount: 1, title: "葬送的芙莉莲 · 第1话", introHint: nil))
+    }
+
+    // MARK: 跳过片头（AniSkip > 弹幕检测）
+
+    func testAniSkipHintWinsOverDanmakuDetectionAndPersists() async throws {
+        let configuration = makeConfiguration()
+        let fingerprint = makeFingerprintData()
+        // 弹幕里有报点（推导出 132s），AniSkip 也有精确区间（728.489s）——后者胜出。
+        let matchBody = """
+        {"success":true,"errorCode":0,"resultCount":1,"isMatched":true,
+         "matches":[{"episodeId":2001,"animeTitle":"命运石之门","episodeTitle":"第1话"}]}
+        """
+        let commentsBody = """
+        {"count":3,"comments":[
+          {"cid":1,"p":"40.5,1,16777215,100","m":"跳伞02:12"},
+          {"cid":2,"p":"44.2,1,16777215,100","m":"跳伞02:13"},
+          {"cid":3,"p":"131.5,1,16777215,100","m":"空降成功"}
+        ]}
+        """
+        let aniskipBody = """
+        {"found":true,"results":[
+          {"interval":{"startTime":638.489,"endTime":728.489},"skipType":"op","skipId":"x"},
+          {"interval":{"startTime":1331.7,"endTime":1421.7},"skipType":"ed","skipId":"y"}
+        ],"statusCode":200}
+        """
+        MockURLProtocol.handler = { request in
+            switch request.url!.host {
+            case "gateway.example.com":
+                switch request.url!.path {
+                case "/v1/match": return TestSupport.response(matchBody, url: request.url!)
+                case "/v1/comments/2001": return TestSupport.response(commentsBody, url: request.url!)
+                default: return TestSupport.response("{}", status: 404, url: request.url!)
+                }
+            case "media.example.com":
+                return makeRange206Response(fingerprint, url: request.url!)
+            case "api.aniskip.com":
+                return TestSupport.response(aniskipBody, url: request.url!)
+            default:
+                return TestSupport.response("{}", status: 404, url: request.url!)
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let context = DanmakuMatchContext(
+            uuid: UUID(),
+            cacheKey: "jellyfin:abcdef",
+            allowsCachedMatchReuse: true,
+            fileName: "命运石之门 01",
+            fileSize: 64,
+            durationSeconds: 1424,
+            remoteURL: URL(string: "https://media.example.com/video.mp4"),
+            animeTitle: "命运石之门",
+            episodeNumber: 1,
+            malID: 9253
+        )
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        XCTAssertEqual(outcome, .loaded(
+            episodeID: 2001, commentCount: 3, title: "命运石之门 · 第1话",
+            introHint: DanmakuIntroHint(startSeconds: 638.489, endSeconds: 728.489, evidenceCount: 1, source: .aniskip)))
+        let persisted = await service.cachedIntroHint(for: 2001)
+        XCTAssertEqual(persisted?.source, .aniskip)
+    }
+
+    /// 2026 夏番实测场景：dandanplay 中文标题在 AniList 零召回，原生标题命中。
+    /// 验证 originalTitle 进了候选、多候选搜索生效、最终拿到 AniSkip 提示。
+    func testAniSkipResolutionFallsBackToOriginalTitle() async throws {
+        let configuration = makeConfiguration()
+        let fingerprint = makeFingerprintData()
+        let matchBody = """
+        {"success":true,"errorCode":0,"resultCount":1,"isMatched":true,
+         "matches":[{"episodeId":5001,"animeTitle":"二十世纪电气目录","episodeTitle":"第9话 分别时刻"}]}
+        """
+        let commentsBody = """
+        {"count":1,"comments":[{"cid":1,"p":"30.0,1,16777215,100","m":"日常"}]}
+        """
+        let aniskipBody = """
+        {"found":true,"results":[
+          {"interval":{"startTime":52.241,"endTime":142.241},"skipType":"op","skipId":"x"}
+        ],"statusCode":200}
+        """
+        let searches = SearchRecorder()
+        MockURLProtocol.handler = { request in
+            switch request.url!.host {
+            case "gateway.example.com":
+                switch request.url!.path {
+                case "/v1/match": return TestSupport.response(matchBody, url: request.url!)
+                case "/v1/comments/5001": return TestSupport.response(commentsBody, url: request.url!)
+                default: return TestSupport.response("{}", status: 404, url: request.url!)
+                }
+            case "media.example.com":
+                return makeRange206Response(fingerprint, url: request.url!)
+            case "graphql.anilist.co":
+                if let search = GraphQLRequestBody.searchVariable(of: request) {
+                    searches.list.append(search)
+                }
+                if searches.list.count == 1 {
+                    return TestSupport.response(#"{"data":{"Page":{"media":[]}}}"#, url: request.url!)
+                }
+                return TestSupport.response(
+                    #"{"data":{"Page":{"media":[{"id":103303,"idMal":62856,"title":{"native":"二十世紀電氣目録 -ユーレカ・エヴリカ-"}}]}}}"#,
+                    url: request.url!)
+            case "api.aniskip.com":
+                return TestSupport.response(aniskipBody, url: request.url!)
+            default:
+                return TestSupport.response("{}", status: 404, url: request.url!)
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let context = DanmakuMatchContext(
+            uuid: UUID(),
+            cacheKey: "jellyfin:original-title-fallback",
+            allowsCachedMatchReuse: true,
+            fileName: "二十世纪电气目录 - S01E09 - 第 9 集",
+            fileSize: 64,
+            durationSeconds: 1529,
+            remoteURL: URL(string: "https://media.example.com/video.mp4"),
+            animeTitle: "二十世纪电气目录",
+            originalTitle: "二十世紀電氣目録 -ユーレカ・エヴリカ-",
+            episodeNumber: 9
+        )
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        XCTAssertEqual(searches.list, ["二十世纪电气目录", "二十世紀電氣目録 -ユーレカ・エヴリカ-"])
+        XCTAssertEqual(outcome, .loaded(
+            episodeID: 5001, commentCount: 1, title: "二十世纪电气目录 · 第9话 分别时刻",
+            introHint: DanmakuIntroHint(startSeconds: 52.241, endSeconds: 142.241, evidenceCount: 1, source: .aniskip)))
+        let persisted = await service.cachedIntroHint(for: 5001)
+        XCTAssertEqual(persisted?.source, .aniskip)
+    }
+
+    /// 别名桥（Bangumi 日文原名）作为第三路候选注入 AniSkip 解析。
+    func testAniSkipResolutionMergesAliasProviderTitles() async throws {
+        let configuration = makeConfiguration()
+        let fingerprint = makeFingerprintData()
+        let matchBody = """
+        {"success":true,"errorCode":0,"resultCount":1,"isMatched":true,
+         "matches":[{"episodeId":5002,"animeTitle":"与你相恋到生命尽头","episodeTitle":"第13话 会いたい"}]}
+        """
+        let commentsBody = """
+        {"count":1,"comments":[{"cid":1,"p":"30.0,1,16777215,100","m":"日常"}]}
+        """
+        let aniskipBody = """
+        {"found":true,"results":[
+          {"interval":{"startTime":48.0,"endTime":138.0},"skipType":"op","skipId":"x"}
+        ],"statusCode":200}
+        """
+        let searches = SearchRecorder()
+        MockURLProtocol.handler = { request in
+            switch request.url!.host {
+            case "gateway.example.com":
+                switch request.url!.path {
+                case "/v1/match": return TestSupport.response(matchBody, url: request.url!)
+                case "/v1/comments/5002": return TestSupport.response(commentsBody, url: request.url!)
+                default: return TestSupport.response("{}", status: 404, url: request.url!)
+                }
+            case "media.example.com":
+                return makeRange206Response(fingerprint, url: request.url!)
+            case "graphql.anilist.co":
+                if let search = GraphQLRequestBody.searchVariable(of: request) {
+                    searches.list.append(search)
+                }
+                if searches.list.count == 1 {
+                    return TestSupport.response(#"{"data":{"Page":{"media":[]}}}"#, url: request.url!)
+                }
+                return TestSupport.response(
+                    #"{"data":{"Page":{"media":[{"id":187260,"idMal":61126,"title":{"native":"きみが死ぬまで恋をしたい"}}]}}}"#,
+                    url: request.url!)
+            case "api.aniskip.com":
+                return TestSupport.response(aniskipBody, url: request.url!)
+            default:
+                return TestSupport.response("{}", status: 404, url: request.url!)
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let aliasOrchestrator = DanmakuLoadOrchestrator(
+            service: service,
+            session: TestSupport.mockedSession(),
+            titleAliases: FakeTitleAliasProvider(aliases: ["きみが死ぬまで恋をしたい"])
+        )
+        let context = DanmakuMatchContext(
+            uuid: UUID(),
+            cacheKey: "jellyfin:alias-merge",
+            allowsCachedMatchReuse: true,
+            fileName: "与你相恋到生命尽头 - S01E13 - 第 13 集",
+            fileSize: 64,
+            durationSeconds: 1420,
+            remoteURL: URL(string: "https://media.example.com/video.mp4"),
+            animeTitle: "与你相恋到生命尽头",
+            episodeNumber: 13
+        )
+        let outcome = await aliasOrchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        XCTAssertEqual(searches.list, ["与你相恋到生命尽头", "きみが死ぬまで恋をしたい"])
+        XCTAssertEqual(outcome, .loaded(
+            episodeID: 5002, commentCount: 1, title: "与你相恋到生命尽头 · 第13话 会いたい",
+            introHint: DanmakuIntroHint(startSeconds: 48.0, endSeconds: 138.0, evidenceCount: 1, source: .aniskip)))
+    }
+
+    func testCachedIntroHintWinsWithoutAniSkipRequest() async throws {        let configuration = makeConfiguration()
+        // 预置永久提示：缓存命中后 AniSkip/弹幕都不该被查询。
+        let context = makeContext()
+        let cached = DanmakuIntroHint(startSeconds: 0, endSeconds: 90, evidenceCount: 5)
+        await orchestrator.service.persistIntroHint(cached, for: 3001)
+        // 提示以 episodeID 为键，缓存匹配路径同样生效——预置映射直接命中。
+        await orchestrator.service.remember(
+            match: DanmakuEpisodeMatch(episodeID: 3001), cacheKey: context.cacheKey, revision: 1)
+        await orchestrator.service.claimMatchRevision(cacheKey: context.cacheKey, revision: 1)
+
+        MockURLProtocol.handler = { request in
+            if request.url!.host == "api.aniskip.com" || request.url!.host == "graphql.anilist.co" {
+                XCTFail("缓存命中不应查询 AniSkip/AniList")
+            }
+            switch request.url!.path {
+            case "/v1/comments/3001":
+                return TestSupport.response(
+                    #"{"count":1,"comments":[{"cid":1,"p":"1,1,16777215,100","m":"你好"}]}"#,
+                    url: request.url!)
+            default:
+                return TestSupport.response("{}", status: 404, url: request.url!)
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        XCTAssertEqual(outcome, .loaded(
+            episodeID: 3001, commentCount: 1, title: "弹弹play",
+            introHint: cached))
+    }
+
+    // MARK: 类型硬门槛 / 特典目标
+
+    /// 回归（用户实报）：中二病 S00E29 特典，弹弹play 的模糊/搜索候选里有同 IP 剧场版的
+    /// S29 特典（「映画公開記念! 暗黒謝肉祭!」，弹幕为空）。剧场版与剧集是不同作品，
+    /// 类型硬门槛必须让它出局——落到 noMatch 手动选，而不是错匹配。
+    func testMovieCandidatesAreExcludedForSpecialTarget() async throws {
+        let configuration = makeConfiguration()
+        let context = DanmakuMatchContext(
+            uuid: UUID(),
+            cacheKey: "jellyfin:special-movie-gate",
+            allowsCachedMatchReuse: true,
+            fileName: "中二病也要谈恋爱! - S00E29 - 第 29 集",
+            fileSize: 64,
+            durationSeconds: 1417,
+            localFileURL: nil,
+            remoteURL: URL(string: "https://media.example.com/video.mp4"),
+            remoteHeaders: [:],
+            animeTitle: "中二病也要谈恋爱!",
+            episodeNumber: 29,
+            seasonNumber: 0,
+            special: DanmakuSpecialTarget(index: 29, kinds: DanmakuSpecialKind.fallbackOrder)
+        )
+        let fingerprint = makeFingerprintData()
+        let noMatchBody = """
+        {"success":true,"errorCode":0,"resultCount":0,"isMatched":false,"matches":[]}
+        """
+        // 真实候选形态：剧场版第1话 + 同 IP 剧场版的 S29（打分本可以靠序号命中 +2000）
+        let searchBody = """
+        {"success":true,"errorCode":0,"animes":[
+          {"animeId":13176,"animeTitle":"剧场版 中二病也要谈恋爱！ -Take On Me- ","type":"movie","typeDescription":"剧场版","episodes":[
+            {"episodeId":131760001,"episodeTitle":"第1话 剧场版 中二病也要谈恋爱！ -Take On Me- "},
+            {"episodeId":131769029,"episodeTitle":"S29 映画公開記念! 暗黒謝肉祭!"}]}]}
+        """
+        MockURLProtocol.handler = { request in
+            switch request.url!.path {
+            case "/v1/match":
+                return TestSupport.response(noMatchBody, url: request.url!)
+            case "/v1/search/episodes":
+                return TestSupport.response(searchBody, url: request.url!)
+            default:
+                return makeRange206Response(fingerprint, url: request.url!)
+            }
+        }
+        defer { MockURLProtocol.handler = nil }
+
+        let outcome = await orchestrator.runAutomatic(
+            matchContext: context,
+            configuration: configuration,
+            playback: playback,
+            revision: 1
+        )
+        XCTAssertEqual(outcome, .noMatch, "剧场版候选应被类型硬门槛排除，落 noMatch 而非错匹配")
+    }
+
+    // MARK: 辅助
+
+    private func assertInjectedJSON(commentCount: Int, firstContent: String, firstTime: Double) throws {
+        let data = try XCTUnwrap(playback.injectedJSON?.data(using: .utf8), "应注入弹幕 JSON")
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any],
+            "注入 JSON 应为对象"
+        )
+        let comments = try XCTUnwrap(object["comments"] as? [[String: Any]], "缺少 comments 数组")
+        XCTAssertEqual(comments.count, commentCount)
+        let first = comments[0]
+        XCTAssertEqual(first["content"] as? String, firstContent)
+        XCTAssertEqual(first["time"] as? Double, firstTime)
+    }
+}
+
+/// 假播放器：记录注入内容与调用序列，并把每个动作当作「当前代次有效」。
+@MainActor
+private final class FakePlaybackHost: DanmakuPlaybackHosting {
+    var danmakuPayloadFormat: DanmakuPayloadFormat = .both
+    var injectedJSON: String?
+    var injectedEntries: [DanmakuJSONParser.Entry]?
+    var injectedOffset: Duration?
+    var didClear = false
+    /// 记录调用 waitUntilReady 时的 uuid，供断言（必须与请求 id 一致）。
+    var waitedUUIDs: [UUID] = []
+    /// 为 true 时就绪等待直接失败（等价于 30s 超时）。
+    var readyNeverResolves = false
+
+    func waitUntilReady(uuid: UUID, timeout: Duration) async -> Bool {
+        waitedUUIDs.append(uuid)
+        return !readyNeverResolves
+    }
+
+    func replaceDanmaku(
+        uuid: UUID,
+        entries: [DanmakuJSONParser.Entry],
+        json: String?,
+        name: String,
+        offset: Duration
+    ) throws -> Bool {
+        injectedEntries = entries
+        injectedJSON = json
+        injectedOffset = offset
+        return true
+    }
+
+    func clearDanmaku(uuid: UUID) throws -> Bool {
+        didClear = true
+        return true
+    }
+}
+
+// MARK: - 文件级辅助（非隔离，供 @Sendable mock 闭包调用）
+
+private func makeFingerprintData() -> Data {
+    // 必须与 makeContext 的 fileSize（64）一致，206 截断校验按该值比对。
+    Data(repeating: 0xAB, count: 64)
+}
+
+private func makeRange206Response(_ data: Data, url: URL) -> (HTTPURLResponse, Data) {
+    let headers = [
+        "Content-Type": "application/octet-stream",
+        "Content-Range": "bytes 0-\(data.count - 1)/\(data.count)",
+    ]
+    let response = HTTPURLResponse(url: url, statusCode: 206, httpVersion: nil, headerFields: headers)!
+    return (response, data)
+}
+
+/// AniSkip 候选标题增强测试用的别名桥替身（Bangumi 日文原名模拟）。
+private struct FakeTitleAliasProvider: DanmakuTitleAliasProviding {
+    var aliases: [String]
+    func aliases(for title: String) async -> [String] { aliases }
+}

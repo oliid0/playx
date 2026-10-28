@@ -31,7 +31,7 @@ public final class ErikaEngine: PlaybackEngine, @unchecked Sendable {
 
     public static let descriptor = PlaybackEngineDescriptor(
         id: "erika",
-        displayName: "Erika",
+        displayName: "liberika",
         version: ErikaVersion.tag,
         summary: "Rust · FFmpeg · libass · Metal",
         supportsKernelDanmaku: true,
@@ -65,7 +65,7 @@ public final class ErikaEngine: PlaybackEngine, @unchecked Sendable {
     private var backgroundTimer: DispatchSourceTimer?
     /// 定时器队列。**不能复用渲染线程**：那条线程跑的是 `CADisplayLink` 的 runloop，
     /// 后台没有 vsync，它跟着一起停摆。
-    private static let backgroundQueueLabel = "com.oliid0.playerx.audio-only"
+    private static let backgroundQueueLabel = "dev.jumusu.OcPlayer.audio-only"
     private let backgroundQueue = DispatchQueue(
         label: ErikaEngine.backgroundQueueLabel,
         qos: .userInteractive

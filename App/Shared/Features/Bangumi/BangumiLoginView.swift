@@ -1,0 +1,143 @@
+import AppDesignKit
+import BangumiKit
+import SwiftUI
+
+#if os(iOS)
+import AuthenticationServices
+import UIKit
+#endif
+
+/// Bangumi 登录视图：未登录时显示登录引导，已登录时显示用户信息。
+/// 放在 Bangumi 功能区的根，作为未登录态的门面。
+///
+/// 错误文案统一记在 `BangumiCoordinator.authError`：macOS 走系统浏览器 + `onOpenURL`
+/// 回来，换 token 失败发生在这个视图之外，只有存在协调器上才显示得出来。
+struct BangumiLoginView: View {
+    @Environment(BangumiCoordinator.self) private var bangumi
+    /// 网关设置（地址 + API Key）是登录的前置条件，与弹幕共用同一份配置。
+    @Environment(DanmakuModel.self) private var danmakuModel
+
+    @State private var pendingAuthURL: URL?
+    #if os(iOS)
+    /// ASWebAuthenticationSession 必须被强引用住，否则 start() 之后立刻释放、回调永不触发。
+    @State private var authSession: ASWebAuthenticationSession?
+    @State private var presentationProvider = BangumiAuthPresentationProvider()
+    #endif
+
+    var body: some View {
+        // **必须包在 `PageFillingState` 里**：本视图是 Bangumi 分区的根（未登录态的
+        // 门面），而抱紧内容的 `VStack` 理想尺寸与窗口无关——整条尺寸链（根视图 →
+        // 导航栈 → 外壳 → 背景）会跟着塌成中间那一块，macOS 顶栏的玻璃底下没了内容，
+        // 系统改画不透明的窗口底色（实机顶栏条带是一条 sd≈3 的死灰平条，与首页 /
+        // 设置页 / MoviePilot 门控页透过氛围图的玻璃顶栏完全两样）。
+        // 载体理由与实测见 `PageFillingState`（`frame(maxWidth:maxHeight:)` 救不回来）。
+        PageFillingState {
+            VStack(spacing: 18) {
+                Image(systemName: "arrow.triangle.branch")
+                    .font(.system(size: 44))
+                    .foregroundStyle(.tint)
+                Text("连接 Bangumi")
+                    .font(.title2.weight(.semibold))
+                Text("登录后可以在这里管理你的观看进度、收藏和个人主页。\nOcPlayer 会同步你标记的「在看 / 看过」，播放器联动章节进度。")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 420)
+
+                if !danmakuModel.dandanplayIsConfigured {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label("尚未配置弹幕网关", systemImage: "key.slash")
+                            .font(.callout.weight(.medium))
+                        Text("Bangumi 登录经网关换取令牌，需要先在「设置 → 弹幕」里填好网关地址与 API Key（Key 需带 bgm:oauth 权限）。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(14)
+                    .frame(maxWidth: 420, alignment: .leading)
+                    .background(.quinary, in: RoundedRectangle(cornerRadius: 12))
+                } else {
+                    Button {
+                        Task { await startOAuth() }
+                    } label: {
+                        if bangumi.isAuthenticated {
+                            Label("已登录，打开 Bangumi", systemImage: "checkmark.circle.fill")
+                        } else {
+                            Label("登录 Bangumi", systemImage: "arrow.right.circle")
+                        }
+                    }
+                    .neutralProminentButton()
+                    .controlSize(.large)
+                }
+
+                if let authError = bangumi.authError {
+                    ErrorNotice(authError)
+                        .frame(maxWidth: 420)
+                }
+            }
+            .padding(32)
+        }
+        .onChange(of: pendingAuthURL) { _, url in
+            guard let url else { return }
+            presentAuthSession(url: url)
+        }
+    }
+
+    private func startOAuth() async {
+        bangumi.authError = nil
+        do {
+            pendingAuthURL = try await BangumiAuthService.buildOAuthURL()
+        } catch {
+            bangumi.authError = (error as? BangumiError)?.userMessage ?? "\(error)"
+        }
+    }
+
+    #if os(macOS)
+    private func presentAuthSession(url: URL) {
+        // macOS 打开系统浏览器完成授权，回调经 RootView 的 onOpenURL 回到 App。
+        NSWorkspace.shared.open(url)
+        pendingAuthURL = nil
+    }
+    #else
+    private func presentAuthSession(url: URL) {
+        let session = ASWebAuthenticationSession(
+            url: url,
+            callbackURLScheme: "ocplayer"
+        ) { callbackURL, error in
+            Task { @MainActor in
+                pendingAuthURL = nil
+                authSession = nil
+                if let error {
+                    // 用户自己取消不算错误，不用报红。
+                    if (error as? ASWebAuthenticationSessionError)?.code == .canceledLogin { return }
+                    bangumi.authError = "授权失败：\(error.localizedDescription)"
+                    return
+                }
+                guard let callbackURL else {
+                    bangumi.authError = "授权回调为空"
+                    return
+                }
+                await bangumi.handleOAuthCallback(url: callbackURL)
+            }
+        }
+        session.presentationContextProvider = presentationProvider
+        session.prefersEphemeralWebBrowserSession = false
+        // 先持有再 start：局部变量出作用域就会被释放，回调也就没了。
+        authSession = session
+        session.start()
+    }
+    #endif
+}
+
+#if os(iOS)
+/// ASWebAuthenticationSession 的呈现锚点。iOS 上没有它 start() 直接失败。
+final class BangumiAuthPresentationProvider: NSObject, ASWebAuthenticationPresentationContextProviding {
+    func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        let scene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+            ?? UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        return scene?.keyWindow ?? scene?.windows.first ?? ASPresentationAnchor()
+    }
+}
+#endif

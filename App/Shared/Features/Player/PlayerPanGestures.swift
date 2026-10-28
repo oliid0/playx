@@ -1,0 +1,161 @@
+import SwiftUI
+
+/// iOS 画面手势（长按 2x / 横滑 seek / 左右半屏纵滑亮度音量）的纯逻辑。
+/// 不碰 UIKit，方便在 macOS 测试靶上直接跑；UIKit 侧只在 PlayerScreen 的 iOS 分支。
+enum PlayerPanGestureModel {
+    enum Mode: Equatable {
+        /// 横向拖动快进快退（拖动中只出预览，松手才 seek）。
+        case seek
+        /// 左半屏上滑增亮。
+        case brightness
+        /// 右半屏上滑增音量。
+        case volume
+    }
+
+    /// 按主轴方向 + 起点落在哪半屏分类。宽高无效时返回 nil（不进任何模式）。
+    static func mode(translation: CGSize, startX: CGFloat, width: CGFloat) -> Mode? {
+        guard width > 1 else { return nil }
+        if abs(translation.width) >= abs(translation.height) { return .seek }
+        return startX < width / 2 ? .brightness : .volume
+    }
+
+    /// 横滑映射：满屏宽 = max(60s, 时长的 1/4)。纯比例映射在长片上一格跨半小时，
+    /// 用 60s 兜底也让短视频不用拖满全屏。
+    static func seekTarget(
+        startSeconds: Double,
+        translation: CGFloat,
+        width: CGFloat,
+        duration: Double
+    ) -> Double {
+        guard width > 1, duration > 0 else { return startSeconds }
+        let fullSwipe = max(60, duration / 4)
+        let delta = Double(translation / width) * fullSwipe
+        return min(max(startSeconds + delta, 0), duration)
+    }
+
+    /// 纵滑映射：满屏高 = 全量程（0…1），上滑（translation 为负）增大。
+    // MARK: - 系统音量量化（`P1-14`）
+
+    /// `MPVolumeView` 的系统音量是 **1/16 量化**的（`volumeStep`）。
+    ///
+    /// 放在这个跨平台纯逻辑文件里，而不是 `SystemVolumeControl`（`#if os(iOS)`）——
+    /// 后者在 macOS 测试靶上根本编不进去，量化逻辑就没法测。
+    static let volumeStep: Float = 1 / 16
+
+    /// 半档容差：目标与当前值差不到半档，就算「已经在这一档」，不写系统音量。
+    static let volumeHalfStep: Float = volumeStep / 2
+
+    /// 把连续值量化到最近的 1/16 档位。
+    ///
+    /// ## 为什么必须量化后再写
+    ///
+    /// 原先的守卫是「`abs(slider.value - value) > 0.005` 就写」—— 而 **0.005 远小于
+    /// 1/16 = 0.0625**。`MPVolumeView` 会把写入值自己取整，`slider.value` 读回来是
+    /// 取整后的值，于是下一次比较「差」仍大于 0.005，**几乎每个触摸事件都通过守卫**：
+    /// 一次 1 秒纵滑就是数百次跨进程系统音量写入 + KVO + 主 actor Task 回写。
+    ///
+    /// 量化到同一档后，档内连续拖动**一次都不写**；写入次数从 O(事件数) 降到
+    /// O(跨越的档数)。
+    static func quantizedVolume(_ value: Float) -> Float {
+        let clamped = min(max(value, 0), 1)
+        return (clamped / volumeStep).rounded() * volumeStep
+    }
+
+    /// **是否该把 `target` 写进系统音量**（`P1-14` 的守卫本体）。
+    ///
+    /// 抽成纯函数是**为了让这段判定可测** —— 它原本嵌在
+    /// `SystemVolumeControl.updateUIView` 里，而后者在 `#if os(iOS)` 中，
+    /// macOS 测试靶根本编不进去。审查实测：把守卫改回老的 `> 0.005`，
+    /// 7 条只测 `quantizedVolume` 的用例**全绿** —— 也就是说
+    /// **本批真正改变行为的那 4 行零覆盖**。这个函数就是补那个洞。
+    ///
+    /// - Parameters:
+    ///   - current: 滑块当前值（系统音量，已在 1/16 网格上）。
+    ///   - target: 已经过 `quantizedVolume` 的目标值。
+    /// - Returns: 差值达到**半档**才写。
+    ///
+    /// ## 为什么是半档而不是「任何不等」
+    ///
+    /// `current` 可能因为蓝牙 / AirPlay / 硬件音量键而落在网格的**偏移**位置。
+    /// 用「差 ≥ 半档」判：偏移不到半档时**不动**（避免一次滑动反复写），
+    /// 到半档才吸附到最近的档 —— 这也切断了「写 → KVO 回声 → 再写」的放大环。
+    static func shouldWriteVolume(current: Float, target: Float) -> Bool {
+        abs(min(max(current, 0), 1) - target) >= volumeHalfStep
+    }
+
+    static func verticalTarget(start: Double, translation: CGFloat, extent: CGFloat) -> Double {
+        guard extent > 1 else { return start }
+        return min(max(start - Double(translation / extent), 0), 1)
+    }
+
+    static func fraction(seconds: Double, duration: Double) -> Double {
+        guard duration > 0 else { return 0 }
+        return min(max(seconds / duration, 0), 1)
+    }
+
+    /// 轻点判定：按压时长短、位移在 slop 内（单击 / 双击共用的前置条件）。
+    static func isQuickTap(
+        elapsed: TimeInterval,
+        translation: CGSize,
+        slop: CGFloat,
+        maxDuration: TimeInterval
+    ) -> Bool {
+        elapsed < maxDuration
+            && abs(translation.width) < slop
+            && abs(translation.height) < slop
+    }
+
+    /// 双击判定：两击间隔落在窗口内。
+    static func isDoubleTap(interval: TimeInterval, window: TimeInterval) -> Bool {
+        interval >= 0 && interval <= window
+    }
+}
+
+/// 一次滑动的全程状态（nil = 手指不在屏上 / 无活动手势）。
+/// 拖动中每帧更新，驱动预览条与 OSD；松手按 mode 落盘。
+struct PlayerPanSession: Equatable {
+    let mode: PlayerPanGestureModel.Mode
+    let startSeconds: Double
+    let durationSeconds: Double
+    /// 亮度 / 音量的起点（0…1）。
+    var verticalStart: Double = 0
+    var verticalValue: Double = 0
+    /// seek 预览位置（秒），拖动中持续更新，松手才真正 seek。
+    var previewSeconds: Double = 0
+}
+
+#if os(iOS)
+/// 亮度 / 音量纵滑的 OSD 徽章：顶部居中，拖动期间实时反映当前值。
+struct PlayerAdjustOSDBadge: View {
+    let systemImage: String
+    let value: Double
+
+    var body: some View {
+        PlayerHUDPanel(in: Capsule()) {
+            HStack(spacing: 10) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 13, weight: .semibold))
+                GeometryReader { proxy in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(.white.opacity(0.25))
+                        Capsule()
+                            .fill(.white)
+                            .frame(width: proxy.size.width * max(0, min(1, value)))
+                    }
+                }
+                .frame(width: 84, height: 4)
+                Text("\(Int((value * 100).rounded()))%")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(PlayerHUDPalette.secondary)
+                    .frame(minWidth: 34, alignment: .trailing)
+            }
+            .foregroundStyle(PlayerHUDPalette.primary)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 9)
+        }
+        .fixedSize()
+        .allowsHitTesting(false)
+        .transition(.section)
+    }
+}
+#endif

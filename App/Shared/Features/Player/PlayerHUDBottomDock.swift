@@ -1,0 +1,165 @@
+import PlaybackKit
+import Foundation
+import Observation
+import SwiftUI
+
+#if os(macOS)
+import AppKit
+#endif
+
+struct PlayerHUDBottomDock: View {
+    @Environment(\.playerChromeInsets) private var chromeInsets
+
+    let isNarrow: Bool
+    let playbackID: String
+    let title: String
+    let kicker: String
+    let panFeedback: PlayerPanFeedback
+
+    let onInteractionChanged: (PlayerHUDInteraction, Bool) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: isNarrow ? 10 : 14) {
+            PlayerHUDTitleBlock(title: title, kicker: kicker, isNarrow: isNarrow)
+
+            PlayerHUDTimeline(
+                playbackID: playbackID,
+                panFeedback: panFeedback,
+                onInteractionChanged: onInteractionChanged
+            )
+        }
+        // 水平与顶栏同口径让位侧边灵动岛/圆角禁区；垂直方向 home indicator 已被
+        // persistentSystemOverlays(.hidden) 藏掉、无实体遮挡，底距维持原值。
+        .padding(.horizontal, PlayerChromeMetrics.sidePadding(chromeInsets, isNarrow: isNarrow))
+        .padding(.bottom, isNarrow ? 16 : 28)
+        .frame(maxWidth: .infinity)
+    }
+}
+
+struct PlayerHUDTitleBlock: View {
+    let title: String
+    let kicker: String
+    let isNarrow: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if !kicker.isEmpty {
+                Text(kicker)
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(PlayerHUDPalette.secondary)
+                    .lineLimit(1)
+            }
+            Text(title)
+                .font((isNarrow ? Font.headline : Font.title2).weight(.semibold))
+                .foregroundStyle(PlayerHUDPalette.primary)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .shadow(color: .black.opacity(0.72), radius: 3, y: 1)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// 高频 position/duration 只在这一棵子树观察，顶部和其他 Glass 不随播放 tick 重建。
+struct PlayerHUDTimeline: View {
+    @Environment(PlaybackController.self) private var controller
+
+    let playbackID: String
+    let panFeedback: PlayerPanFeedback
+    let onInteractionChanged: (PlayerHUDInteraction, Bool) -> Void
+
+    @State private var draftFraction: Double?
+
+    private var timeline: PlayerTimeline {
+        controller.state.timeline
+    }
+
+    var body: some View {
+        VStack(spacing: 4) {
+            Slider(value: progressBinding, in: 0...1) {
+                Text("播放进度")
+            } onEditingChanged: { editing in
+                if editing {
+                    beginScrubbing()
+                } else {
+                    finishScrubbing()
+                }
+            }
+            .labelsHidden()
+            .tint(PlayerHUDPalette.primary)
+            .controlSize(.regular)
+            .frame(minHeight: 44)
+            .disabled(timeline.duration == .zero)
+            .accessibilityValue(
+                "\(playerHUDTimeLabel(displayedPosition)) / \(playerHUDTimeLabel(timeline.duration))"
+            )
+            .accessibilityAdjustableAction { direction in
+                switch direction {
+                case .increment: controller.skip(by: 10)
+                case .decrement: controller.skip(by: -10)
+                @unknown default: break
+                }
+            }
+
+            HStack {
+                Text(playerHUDTimeLabel(displayedPosition))
+                Spacer(minLength: 16)
+                Text(playerHUDTimeLabel(timeline.duration))
+            }
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(PlayerHUDPalette.secondary)
+            .shadow(color: .black.opacity(0.7), radius: 2, y: 1)
+        }
+        .onChange(of: playbackID) { resetScrubbing() }
+        .onDisappear { resetScrubbing() }
+    }
+
+    private var progressBinding: Binding<Double> {
+        Binding(
+            get: { draftFraction ?? seekPreviewFraction ?? timeline.progress },
+            set: { draftFraction = min(max($0, 0), 1) }
+        )
+    }
+
+    private var displayedPosition: Duration {
+        if let draftFraction, timeline.duration > .zero {
+            return .microseconds(Int64(Double(timeline.duration.microseconds) * draftFraction))
+        }
+        if let session = seekPreview {
+            return .seconds(session.previewSeconds)
+        }
+        return timeline.displayPosition
+    }
+
+    private var seekPreview: PlayerPanSession? {
+        guard let session = panFeedback.session, session.mode == .seek else { return nil }
+        return session
+    }
+
+    private var seekPreviewFraction: Double? {
+        guard let session = seekPreview else { return nil }
+        return PlayerPanGestureModel.fraction(
+            seconds: session.previewSeconds,
+            duration: session.durationSeconds
+        )
+    }
+
+    private func beginScrubbing() {
+        if draftFraction == nil { draftFraction = timeline.progress }
+        onInteractionChanged(.timelineDrag, true)
+    }
+
+    private func finishScrubbing() {
+        if let target = draftFraction {
+            controller.seek(toFraction: target)
+        }
+        draftFraction = nil
+        onInteractionChanged(.timelineDrag, false)
+    }
+
+    private func resetScrubbing() {
+        guard draftFraction != nil else { return }
+        draftFraction = nil
+        onInteractionChanged(.timelineDrag, false)
+    }
+}

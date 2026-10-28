@@ -1,0 +1,234 @@
+import Foundation
+#if os(macOS)
+import AppKit
+#endif
+
+/// 启动参数 / 环境变量入口。存在的唯一理由是**自动化验收**：
+/// 显示链 + Metal surface 这条路必须真的开着窗口才走得到，没法在单元测试里覆盖，
+/// 所以留一条命令行通道，让脚本能「开窗播一段 → 打印 stats → 自己退出」。
+///
+///     # 推荐：走 LaunchServices 的正常「打开文件」通道（文件进 .onOpenURL）
+///     open --env OCPLAYER_SELFTEST_TOKEN=<内部 token> \
+///          --env OCPLAYER_SELFTEST_SECONDS=9 --env OCPLAYER_SELFTEST_LOG=/tmp/ocp.log \
+///          -a <产物>/OcPlayer.app <视频文件>
+///
+///     # 或者直接跑二进制，文件用环境变量给
+///     OCPLAYER_SELFTEST_TOKEN=<内部 token> OCPLAYER_SELFTEST_SECONDS=9 \
+///     OCPLAYER_SELFTEST_FILE=<视频文件> \
+///       <产物>/OcPlayer.app/Contents/MacOS/OcPlayer
+///
+/// ⚠️ 千万别把文件路径当**命令行参数**传给 .app 里的二进制：实测 macOS 26.5 上那样启动，
+/// 窗口根本不会被创建（AppKit 把它当一次打不开的「打开文档」请求，进程活着但空转）。
+/// 平常双击运行时这些变量都不存在，行为与没有这段代码完全一致。
+///
+/// 🔒 **整条通道只在 `OCPLAYER_SELFTEST` 编译条件下存在**（Debug 配置定义它，
+/// Release 不定义）。此前它无条件编进 Release，而这条通道能做两件危险的事：
+/// 按 `OCPLAYER_SELFTEST_LOG` 向任意可写路径追加内容、跑完 `exit(0)`。同用户的
+/// 任何进程都能用 `launchctl setenv` 给 GUI 应用铺环境变量，于是「用户下次从
+/// Finder 打开 App」就可能变成「5 秒后自己退出」。内置 token 硬编码在开源源码里，
+/// 只能防误触发，防不住有意为之——所以正确的边界是**不分发这段代码**，
+/// 而不是指望 token。
+///
+/// 需要验证 Release 构建的显示链时，给该配置临时加上 `OCPLAYER_SELFTEST`
+/// 编译条件即可（`SWIFT_ACTIVE_COMPILATION_CONDITIONS`），不必改代码。
+///
+/// 通道一览（全部 Debug-only）：
+///   * `OCPLAYER_START_SECTION` / `OCPLAYER_SECTION_SWITCH_SECONDS` —— 直落分区；
+///   * `OCPLAYER_START_ROUTE` —— 直落某个 push 页 / 设置子页 / 呈现式叶子页
+///     （语法见 `LaunchRoute`，验收台 `Scripts/verify-ambience.sh` 用它逐页截图）；
+///   * `OCPLAYER_SELFTEST_FILE` / `OCPLAYER_SELFTEST_SECONDS` —— 开窗播一段再自退。
+enum LaunchOptions {
+
+#if OCPLAYER_SELFTEST
+
+    /// 公开源码后仍能跑自检的内部口令。改 token 等同吊销旧脚本的资格。
+    /// （Swift 源码内联——不是用来对攻击者保密的，是防止误触发 + 给脚本一个能改的钩子。）
+    private static let expectedToken = "ocp-selftest-v1"
+
+    /// `OCPLAYER_START_SECTION=home|bangumi|moviepilot|settings`：启动直落某分区。
+    /// 模拟器无头跑（本机没有 Simulator.app）没法点按导航，自动化截图靠它进场。
+    static var initialSection: AppModel.Section? {
+        switch ProcessInfo.processInfo.environment["OCPLAYER_START_SECTION"] {
+        case "bangumi": .bangumi
+        case "moviepilot": .moviepilot
+        case "settings": .settings
+        case "home": .home
+        default: nil
+        }
+    }
+
+    /// `OCPLAYER_SECTION_SWITCH_SECONDS=<秒>`：配合上面的变量，先留首页跑轮播
+    /// （取图三元组要等轮播装载后才非 nil），到点再切到目标分区。
+    static var sectionSwitchSeconds: Double? {
+        guard initialSection != nil else { return nil }
+        return ProcessInfo.processInfo.environment["OCPLAYER_SECTION_SWITCH_SECONDS"]
+            .flatMap(Double.init)
+    }
+
+    /// `OCPLAYER_START_ROUTE=<目标页>`：启动后直接落到某个**非分区根页**的页面
+    /// （push 路由 / 设置子页 / 呈现式叶子页）。语法见 `LaunchRoute.parse`。
+    ///
+    /// 存在的理由与 `initialSection` 相同、覆盖范围互补：`initialSection` 只能到
+    /// 分区根页，而 iOS 上「push 进来的页面」与「设置子页」才是氛围背景最容易漏的
+    /// 地方（它们必须自己垫底），验收台要能逐页进场截图。解析失败按 nil 处理：
+    /// 脚本写错了目标名，等同于没给，不该让 App 起不来。
+    static var initialRoute: LaunchRoute? {
+        ProcessInfo.processInfo.environment["OCPLAYER_START_ROUTE"]
+            .flatMap(LaunchRoute.parse)
+    }
+
+    /// 启动动画的自动化通道：
+    /// 任一自检进场（`OCPLAYER_START_SECTION` / `OCPLAYER_START_ROUTE` /
+    /// `OCPLAYER_SELFTEST_FILE`）或显式 `OCPLAYER_LAUNCH_ANIMATION=0` → 跳过启动动画。
+    /// 验收台的逐页截图不能第一秒拍在标志上，所以这些通道一律静默跳过。
+    static var suppressesLaunchAnimation: Bool {
+        if ProcessInfo.processInfo.environment["OCPLAYER_LAUNCH_ANIMATION"] == "0" { return true }
+        return initialSection != nil || initialRoute != nil || fileFromEnvironment != nil
+    }
+
+    /// `OCPLAYER_LAUNCH_FREEZE_MS=<毫秒>`：把启动动画时间轴钉在该时刻（逐帧截图，
+    /// 与 HTML 预览的拖动时间轴同一套分镜常量）。冻结态永不自动撤除。
+    static var launchFreezeMs: Double? {
+        ProcessInfo.processInfo.environment["OCPLAYER_LAUNCH_FREEZE_MS"].flatMap(Double.init)
+    }
+
+    /// `OCPLAYER_LAUNCH_READY_MS=<毫秒>`：把「启动数据就绪」钉在该时刻。
+    /// 真机 bootstrap 太快（本机 ~60ms），抓不到呼吸等待态——配
+    /// `OCPLAYER_LAUNCH_FREEZE_MS=1300` + 本旋钮 2600 即可拍「慢启动呼吸」。
+    static var launchReadyMs: Double? {
+        ProcessInfo.processInfo.environment["OCPLAYER_LAUNCH_READY_MS"].flatMap(Double.init)
+    }
+
+    private static var providedTokenMatches: Bool {
+        ProcessInfo.processInfo.environment["OCPLAYER_SELFTEST_TOKEN"] == expectedToken
+    }
+
+    /// 自检要播的文件，只认环境变量（命令行参数会让窗口建不起来，见类型注释）。
+    static var fileFromEnvironment: URL? {
+        guard providedTokenMatches else { return nil }
+        return ProcessInfo.processInfo.environment["OCPLAYER_SELFTEST_FILE"]
+            .map { URL(fileURLWithPath: $0) }
+            .flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
+    }
+
+    /// 自检时长（秒）。为 nil 表示正常运行，不打印也不退出。
+    static var selfTestSeconds: Double? {
+        guard providedTokenMatches else { return nil }
+        return ProcessInfo.processInfo.environment["OCPLAYER_SELFTEST_SECONDS"].flatMap(Double.init)
+    }
+
+    /// `OCPLAYER_SELFTEST_CONTROLS=1` 时，自检期间按脚本连打 pause / seek / 倍速 / 窗口 resize。
+    static var exercisesControls: Bool {
+        guard providedTokenMatches else { return false }
+        return ProcessInfo.processInfo.environment["OCPLAYER_SELFTEST_CONTROLS"] == "1"
+    }
+
+    /// 自检日志落盘路径。经 `open -a` 启动时进程的 stdout 不归终端，只能写文件。
+    private static var logFile: URL? {
+        ProcessInfo.processInfo.environment["OCPLAYER_SELFTEST_LOG"].map { URL(fileURLWithPath: $0) }
+    }
+
+    private static func emit(_ line: String) {
+        print(line)
+        fflush(stdout)
+        guard let logFile else { return }
+        let text = line + "\n"
+        if let handle = try? FileHandle(forWritingTo: logFile) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: Data(text.utf8))
+        } else {
+            try? text.write(to: logFile, atomically: false, encoding: .utf8)
+        }
+    }
+
+    @MainActor
+    static func run(
+        with controller: PlaybackController,
+        presentPlayer: (@MainActor (URL) -> Void)? = nil
+    ) async {
+        if let file = fileFromEnvironment {
+            // 打开交给播放覆盖层（onAppear 会 openIfNeeded），这里只负责把文件递过去
+            presentPlayer?(file)
+        }
+        guard let seconds = selfTestSeconds else { return }
+
+        let controls = exercisesControls ? scriptedControls(controller) : [:]
+        let start = Date()
+        var tick = 0
+        emit("[selftest] start file=\(fileFromEnvironment?.path ?? "由 open 传入")")
+        while Date().timeIntervalSince(start) < seconds {
+            do {
+                try await Task.sleep(for: .milliseconds(500))
+            } catch {
+                // 自检循环响应取消（进程退出信号会取消任务），不再继续轮询。
+                emit("[selftest] cancelled")
+                exit(0)
+            }
+            tick += 1
+            if let step = controls[tick] {
+                emit("[selftest] >>> \(step.0)")
+                step.1()
+            }
+            emit("[selftest] \(controller.state.state) pos=\(controller.state.position.microseconds)µs " +
+                 "dur=\(controller.state.duration.microseconds)µs surface=\(controller.state.hasSurface) " +
+                 "| \(controller.statsLine())")
+            if let error = controller.state.lastError { emit("[selftest] error: \(error)") }
+        }
+        emit("[selftest] done")
+        exit(0)
+    }
+
+    /// 第 N 个 500ms 刻度上做什么。刻意把 resize 放在最后，验证「resize_surface 后还能继续上屏」。
+    @MainActor
+    private static func scriptedControls(
+        _ controller: PlaybackController
+    ) -> [Int: (String, @MainActor () -> Void)] {
+        [
+            4: ("pause", { controller.togglePlayPause() }),
+            6: ("play", { controller.togglePlayPause() }),
+            8: ("seek 3.5s", { controller.seek(toFraction: 0.7) }),
+            10: ("rate 2.0", { controller.applyRate(2.0) }),
+            12: ("resize window", { resizeWindow() }),
+            14: ("rate 1.0 + seek 1s", {
+                controller.applyRate(1.0)
+                controller.seek(toFraction: 0.2)
+            }),
+        ]
+    }
+
+    @MainActor
+    private static func resizeWindow() {
+        #if os(macOS)
+        // 换个非等比尺寸，逼 surface 走一次 resize + 重新算 letterbox。
+        guard let window = NSApplication.shared.windows.first else { return }
+        window.setContentSize(NSSize(width: 900, height: 700))
+        #endif
+    }
+
+#else
+
+    // MARK: - Release：整条通道惰性化
+    //
+    // 保持与上面**完全相同的 API**，让调用点（AppModel.init / RootView.task）一行都不用改，
+    // 同时保证 Release 里：
+    //   - 不读任何环境变量（外部无从影响启动行为）；
+    //   - 不向任何路径写文件；
+    //   - 不存在 exit(0) 路径。
+    // 编译器会把这里的空实现优化掉，Release 产物里不再有这套机器。
+
+    static var initialSection: AppModel.Section? { nil }
+
+    static var sectionSwitchSeconds: Double? { nil }
+
+    /// Release：深链通道同样不存在（与上面同一口径——不读环境变量、无副作用）。
+    static var initialRoute: LaunchRoute? { nil }
+
+    @MainActor
+    static func run(
+        with controller: PlaybackController,
+        presentPlayer: (@MainActor (URL) -> Void)? = nil
+    ) async {}
+
+#endif
+}

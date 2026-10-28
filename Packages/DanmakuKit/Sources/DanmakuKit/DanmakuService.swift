@@ -1,0 +1,218 @@
+import Foundation
+
+public enum DanmakuPayloadFormat: Sendable, Equatable {
+    case overlay
+    case kernelTrack
+    case both
+}
+
+/// A renderer-ready comment payload resolved from the permanent match and TTL cache.
+///
+/// `entries` 是 overlay 渲染器的直接输入（结构直传，装载侧不再解 JSON）；
+/// `json` 只服务内核弹幕轨（`ErikaEngine.addDanmakuTrack`，当前路线停用中）。
+/// 两者判据一致、都由本 actor 产出，主线程不做转换。
+public struct DanmakuPayload: Sendable, Equatable {
+    public let match: DanmakuEpisodeMatch
+    public let entries: [DanmakuJSONParser.Entry]?
+    public let json: String?
+    public let commentCount: Int
+    /// 弹幕正文现算出的片头提示（`DanmakuIntroDetector`，未持久化）。
+    /// 缓存命中 / AniSkip 解析 / 持久化时机由编排层（`DanmakuLoadOrchestrator`）统一决策。
+    public let detectedIntroHint: DanmakuIntroHint?
+
+    public init(
+        match: DanmakuEpisodeMatch,
+        entries: [DanmakuJSONParser.Entry]?,
+        json: String?,
+        commentCount: Int,
+        detectedIntroHint: DanmakuIntroHint? = nil
+    ) {
+        self.match = match
+        self.entries = entries
+        self.json = json
+        self.commentCount = commentCount
+        self.detectedIntroHint = detectedIntroHint
+    }
+}
+
+/// Coordinates the pure data path: match cache -> gateway match -> comment cache -> JSON.
+/// Playback generation checks and Erika mutations remain in the app layer.
+public actor DanmakuService {
+    private let cache: DanmakuCache
+    /// 缓存根目录（与 `cache.directory` 同源；伴生存储派生目录用）。
+    public let cacheDirectory: URL
+
+    public init(cache: DanmakuCache) {
+        self.cache = cache
+        self.cacheDirectory = cache.directory
+    }
+
+    /// Returns the permanent media-to-episode mapping without contacting the gateway.
+    /// Callers can use this before doing file or remote hashing work.
+    public func cachedMatch(for cacheKey: String) async -> DanmakuEpisodeMatch? {
+        await cache.episodeMatch(for: cacheKey)
+    }
+
+    /// TTL-cached comments for an episode, or nil when absent/expired. Load-only.
+    public func cachedComments(for episodeID: Int64) async -> [DanmakuComment]? {
+        await cache.comments(for: episodeID)
+    }
+
+    /// 永久缓存的片头提示（弹幕报点 / AniSkip 任一来源）。
+    public func cachedIntroHint(for episodeID: Int64) async -> DanmakuIntroHint? {
+        await cache.introHint(for: episodeID)
+    }
+
+    /// 持久化片头提示（编排层按优先级选出的最终结果）。
+    public func persistIntroHint(_ hint: DanmakuIntroHint, for episodeID: Int64) async {
+        await cache.setIntroHint(hint, for: episodeID)
+    }
+
+    /// 同一部番其他集的弹幕推导提示（跨集聚合用,零网络）。
+    /// 仅返回 `.danmaku` 源——`.aniskip`/`.learned` 等更高来源的兄弟集提示
+    /// 不能证明本集的落点（不同集可有冷开场/前情,位置本就会漂移,只聚合
+    /// 同源证据才有「同番 OP 一致」的前提）。
+    public func siblingIntroHints(animeID: Int64, excluding episodeID: Int64) async -> [DanmakuIntroHint] {
+        let siblings = await cache.allEpisodeMatches().compactMap { match -> Int64? in
+            guard match.episodeID != episodeID else { return nil }
+            let id = match.animeID ?? match.derivedAnimeID
+            return id == animeID ? match.episodeID : nil
+        }
+        var hints: [DanmakuIntroHint] = []
+        for id in Set(siblings) {
+            if let hint = await cache.introHint(for: id), hint.source == .danmaku {
+                hints.append(hint)
+            }
+        }
+        return hints
+    }
+
+    /// 同一部番已记住映射的全部集（学习提示推广写入用）。
+    public func episodeIDs(animeID: Int64) async -> [Int64] {
+        await cache.allEpisodeMatches().compactMap { match -> Int64? in
+            let id = match.animeID ?? match.derivedAnimeID
+            return id == animeID ? match.episodeID : nil
+        }
+    }
+
+    /// Persist comments directly (test seeding; production goes through `payload`).
+    public func persistComments(_ comments: [DanmakuComment], for episodeID: Int64) async {
+        await cache.setComments(comments, for: episodeID)
+    }
+
+    /// Claims the current playback generation before any cache/network awaits.
+    /// Older cancelled work can no longer overwrite this media mapping.
+    public func claimMatchRevision(cacheKey: String, revision: UInt64) async {
+        await cache.claimEpisodeMatchRevision(for: cacheKey, revision: revision)
+    }
+
+    /// The highest revision that claimed this media mapping. Writers compare against
+    /// this before persisting so stale work cannot clobber newer matches.
+    public func claimedRevision(for cacheKey: String) async -> UInt64? {
+        await cache.claimedRevision(for: cacheKey)
+    }
+
+    public func automaticMatch(
+        cacheKey: String,
+        request: MatchRequest,
+        client: DanmakuGatewayClient,
+        targetContext: DanmakuCandidateScorer.TargetContext? = nil,
+        ignoringCachedMatch: Bool = false,
+        persistingResult: Bool = true
+    ) async throws -> DanmakuEpisodeMatch? {
+        if !ignoringCachedMatch, let cached = await cache.episodeMatch(for: cacheKey) {
+            return cached
+        }
+
+        let response = try await client.match(request).payload
+        try Task.checkCancellation()
+
+        let match: DanmakuEpisodeMatch?
+        if response.isMatched == true, let first = response.matches.first {
+            match = DanmakuEpisodeMatch(
+                episodeID: first.episodeId,
+                shiftSeconds: first.shift ?? 0,
+                animeID: first.animeId.flatMap(Int64.init),
+                animeTitle: first.animeTitle,
+                episodeTitle: first.episodeTitle
+            )
+        } else if !response.matches.isEmpty {
+            let target: DanmakuCandidateScorer.TargetContext
+            if let targetContext {
+                target = targetContext
+            } else {
+                let parsed = DanmakuFilenameParser.parse(request.fileName ?? "")
+                target = DanmakuCandidateScorer.TargetContext(
+                    animeTitle: parsed.title,
+                    episodeNumber: parsed.episodeNumber,
+                    seasonNumber: parsed.seasonNumber,
+                    isFinal: parsed.isFinal
+                )
+            }
+            match = DanmakuCandidateScorer.pickBestMatch(from: response.matches, target: target)?.match
+        } else {
+            match = nil
+        }
+
+        guard let selected = match else { return nil }
+        if persistingResult {
+            await cache.setEpisodeMatch(selected, for: cacheKey)
+        }
+        return selected
+    }
+
+    /// - Parameter detectingIntro: 是否现算弹幕正文里的片头提示。编排层在「已有永久
+    ///   缓存且不是强制重匹配」时传 `false`——那时 `resolveIntroHint` 必然直接返回
+    ///   缓存，现算的结果会被整个丢掉，而 `DanmakuIntroDetector.detect` 要对每条弹幕
+    ///   做 2 次 `p.split` + 19 次子串搜索（3 万条约 57 万次 `String.contains`）。
+    public func payload(
+        for match: DanmakuEpisodeMatch,
+        client: DanmakuGatewayClient,
+        format: DanmakuPayloadFormat = .both,
+        detectingIntro: Bool = true
+    ) async throws -> DanmakuPayload {
+        let comments: [DanmakuComment]
+        if let cached = await cache.comments(for: match.episodeID) {
+            comments = cached
+        } else {
+            let fetched = try await client.comments(episodeId: match.episodeID).payload.comments ?? []
+            await cache.setComments(fetched, for: match.episodeID)
+            comments = fetched
+        }
+        let detected = detectingIntro ? DanmakuIntroDetector.detect(in: comments) : nil
+        return DanmakuPayload(
+            match: match,
+            entries: format == .kernelTrack ? nil : DanmakuJSONConverter.entries(from: comments),
+            json: format == .overlay ? nil : DanmakuJSONConverter.erikaJSON(from: comments),
+            commentCount: comments.count,
+            detectedIntroHint: detected
+        )
+    }
+
+    public func remember(
+        episode: Episode,
+        animeTitle: String?,
+        cacheKey: String,
+        revision: UInt64? = nil
+    ) async -> DanmakuEpisodeMatch {
+        let match = DanmakuEpisodeMatch(
+            episodeID: episode.episodeId,
+            animeTitle: animeTitle,
+            episodeTitle: episode.episodeTitle
+        )
+        await cache.setEpisodeMatch(match, for: cacheKey, revision: revision)
+        return match
+    }
+
+    public func remember(
+        match: DanmakuEpisodeMatch,
+        cacheKey: String,
+        revision: UInt64? = nil
+    ) async {
+        await cache.setEpisodeMatch(match, for: cacheKey, revision: revision)
+    }
+
+    public func forgetMatch(cacheKey: String, revision: UInt64? = nil) async {
+        await cache.removeEpisodeMatch(for: cacheKey, revision: revision)
+    }
+}

@@ -1,0 +1,355 @@
+import AppDesignKit
+import BangumiKit
+import CoreModel
+import MetadataKit
+import SwiftUI
+
+/// 详情页内嵌的 Bangumi 章节区块。
+///
+/// - 未关联：显示「关联 Bangumi 条目」按钮（自动匹配 + 手动搜索）
+/// - 已关联：显示章节网格（本篇 + SP 分区），单击标记，右键切其它状态
+///
+/// 标题与「剧集」等 section 同级（`.title3.weight(.bold)` + 同一组 padding），
+/// 章节格子与进度页共用 `BangumiEpisodeCell`。
+struct BangumiChapterSection: View {
+    /// 当前详情页的 Jellyfin 条目。
+    let item: MediaItem
+    /// 当前选中的季（若当前为剧集且有选季）。
+    var selectedSeason: MediaItem? = nil
+    /// 章节读到之后把**本篇**章节递出去（详情页拿它当选集轨道的兜底占位来源）。
+    ///
+    /// 让区块递而不是 VM 自己读库：区块今天已经在读全量章节，且它的 `.task` 已经受
+    /// 「启用开关 / 登录态 / 建库就绪」三道闸门保护；VM 复刻这三道闸门只会多一处漂移点。
+    var onCandidatesLoaded: (@MainActor ([EpisodeCandidate]) -> Void)? = nil
+
+    @Environment(AppModel.self) private var app
+    @Environment(BangumiCoordinator.self) private var bangumi
+    @Environment(\.contentLeading) private var contentLeading
+
+    /// 集成开关（设置页「启用 Bangumi」，默认开）：关闭时详情页不渲染本区块，
+    /// `.task` 里的自动匹配 / 远端补齐也就不会跑。
+    @AppStorage(SettingsKeys.bangumiEnabled) private var bangumiEnabled = true
+
+    @State private var linkedSubjectID: Int?
+    @State private var subject: BangumiSubjectDTO?
+    @State private var episodes: [BangumiEpisodeDTO] = []
+    @State private var isLoading = false
+    @State private var isMatching = false
+    @State private var attemptedAutoMatchIDs: Set<String> = []
+    @State private var showLinkPicker = false
+    @State private var loadError: String?
+    @State private var updatingEpisodeID: Int?
+    @State private var loadToken = 0
+    /// 本次读取的代次。actor 调用（`bangumi.context.…`）**不会**因为 task 被取消而抛，
+    /// 所以光靠 `.task(id:)` 的取消挡不住旧任务继续往下写：重新关联条目
+    /// （`loadToken += 1`）时若上一次 load 还在飞，旧条目的数据会压在新条目上面。
+    /// 每个写回点都对一次代次——和 DetailView / LibraryView / BangumiHomeView 的做法一致。
+    @State private var loadGeneration: UInt64 = 0
+
+    /// 剧集关联有季优先挂季上；单季/电影挂自身或 series。
+    private var linkItemID: MediaItem.ID {
+        if let selectedSeason {
+            return selectedSeason.id
+        }
+        return item.seriesID ?? item.id
+    }
+
+    /// 三个分类**一次扫完**（`P2-10`，与 `P2-09` 同款）。
+    ///
+    /// 原先三个独立 computed property 各含一次 `episodes.filter`，而 `episodeContent`
+    /// 一次 body 里把它们读了 **6 次**：三个 `if !xxx.isEmpty` + 三次 `episodeGrid(xxx)`。
+    /// 1000 集时就是 6 遍全量 filter + 6 个临时数组（DTO 384 B），
+    /// 而 `body` 会随 `isLoading` / `loadError` / 进度标记变化反复重算。
+    ///
+    /// 逻辑复用 `BangumiKit` 的 `Array<BangumiEpisodeDTO>.partitionedByEpisodeType()`
+    /// （`P2-09` 时抽出来的纯函数，已有等价性用例守着）。
+    private var partitionedEpisodes: EpisodePartition {
+        episodes.partitionedByEpisodeType()
+    }
+
+    var body: some View {
+        // 集成停用或没登录就整块不出现，别留一个空标题。
+        if bangumiEnabled, bangumi.isAuthenticated {
+            VStack(alignment: .leading, spacing: 0) {
+                header
+                    .padding(.top, 26)
+                    .padding(.bottom, 12)
+                sectionBody
+            }
+            .padding(.horizontal, contentLeading)
+            .task(id: "\(linkItemID)-\(loadToken)-\(bangumi.isDatabaseReady)") { await load() }
+            .onChange(of: app.detailRefreshGeneration) { _, _ in
+                loadToken += 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: BangumiProgressInvalidation.notificationName)) { note in
+                // 播放结束的自动标记不经过本区块：AppModel 直接 PATCH 后写库再广播失效通知，
+                // 而退出播放器触发的 detailRefreshGeneration 重载通常赶在标记落库之前，
+                // 不监听这条通知，格子会一直停在旧的已看状态（进度页/条目详情页同款机制）。
+                guard let noteSubjectID = (note.object as? NSNumber)?.intValue,
+                      noteSubjectID == linkedSubjectID else { return }
+                let generation = loadGeneration
+                Task { await readLocal(noteSubjectID, generation: generation) }
+            }
+            .sheet(isPresented: $showLinkPicker) {
+                BangumiLinkPicker(item: item, season: selectedSeason) { subjectID in
+                    BangumiMatcher.persistLink(subjectID, for: item, season: selectedSeason)
+                    linkedSubjectID = subjectID
+                    subject = nil
+                    episodes = []
+                    loadToken += 1
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var sectionBody: some View {
+        if subject != nil {
+            episodeContent
+        } else if isLoading {
+            ProgressView("正在加载 Bangumi 数据…")
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.vertical, 12)
+        } else if let loadError {
+            ErrorNotice(loadError) { loadToken += 1 }
+                .padding(.bottom, 4)
+        } else {
+            linkPrompt
+        }
+    }
+
+    // MARK: - 区块头
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Text("Bangumi")
+                .font(.title3.weight(.bold))
+            if let subject {
+                Button {
+                    app.openBangumiSubject(id: subject.id)
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(subject.nameCN.isEmpty ? subject.name : subject.nameCN)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
+            if subject != nil {
+                if isLoading {
+                    ProgressView().controlSize(.small)
+                }
+                Button {
+                    showLinkPicker = true
+                } label: {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("重新关联 Bangumi 条目")
+                .accessibilityLabel("重新关联 Bangumi 条目")
+            }
+        }
+    }
+
+    // MARK: - 未关联提示
+
+    private var linkPrompt: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("关联 Bangumi 条目")
+                    .font(.callout.weight(.medium))
+                Text("把这部作品连到 Bangumi，就能在这里标记章节进度、播放结束自动同步。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 12)
+            Button {
+                Task { await autoMatch() }
+            } label: {
+                if isMatching {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Text("自动匹配")
+                }
+            }
+            .disabled(isMatching)
+            Button("手动选择") { showLinkPicker = true }
+                .disabled(isMatching)
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        // 与 MoviePilot / 媒体信息区块同一档半透明填充，透出海报氛围底
+        // 2026-10-22：与下载页同一套液态玻璃
+        .liquidGlassCard()
+    }
+
+    // MARK: - 已关联内容
+
+    private var episodeContent: some View {
+        // 一次分区，后面 6 处读取全走 `parts`（`P2-10`）。
+        //
+        // 注：这里**去掉了 `@ViewBuilder`**。它原本只包着一个 `VStack` 表达式，
+        // 加了也是空转；而一旦为了写 `let parts` 而加显式 `return`，
+        // 编译器会警告「application of result builder 'ViewBuilder' disabled by
+        // explicit 'return' statement」—— 那说明 builder 根本没起作用。
+        // 去掉标记后语义不变（单表达式 `some View`），警告也消失。
+        let parts = partitionedEpisodes
+        return VStack(alignment: .leading, spacing: 10) {
+            if let loadError {
+                ErrorNotice(loadError) { loadToken += 1 }
+            }
+            // 「哪三组、什么顺序、每组标题」由 `EpisodePartition.displayGroups` 决定，
+            // 视图不再手写 tab —— 把 `.main` 写成 `.sp` 编译器不会报（两边同类型），
+            // 所以那层映射必须留在可测的包里。
+            ForEach(parts.displayGroups) { group in
+                if let title = group.title {
+                    Text(title)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+                episodeGrid(group.episodes)
+            }
+            if episodes.isEmpty, !isLoading {
+                Text("该条目暂无章节")
+                    .font(.footnote)
+                    .foregroundStyle(.tertiary)
+                    .padding(.vertical, 6)
+            }
+        }
+    }
+
+    private func episodeGrid(_ list: [BangumiEpisodeDTO]) -> some View {
+        LazyVGrid(columns: BangumiEpisodeCell.columns, alignment: .leading, spacing: 6) {
+            ForEach(list) { episode in
+                BangumiEpisodeCell(
+                    episode: episode,
+                    isBusy: updatingEpisodeID == episode.id
+                ) { action in
+                    await perform(action, on: episode)
+                }
+            }
+        }
+    }
+
+    // MARK: - 数据
+
+    private func load() async {
+        loadGeneration &+= 1
+        let generation = loadGeneration
+        defer {
+            if loadGeneration == generation {
+                isLoading = false
+            }
+        }
+
+        guard bangumi.isAuthenticated, bangumi.isDatabaseReady else {
+            linkedSubjectID = nil
+            subject = nil
+            episodes = []
+            onCandidatesLoaded?([])
+            return
+        }
+        // 选中的季 → 剧集 → 条目自身的解析链收敛在 BangumiMatcher（详情页头部的
+        // 站点图标读的是同一条，见 `linkedSubjectID(for:selectedSeason:)`）。
+        linkedSubjectID = BangumiMatcher.linkedSubjectID(for: item, selectedSeason: selectedSeason)
+
+        // 首次打开未关联条目时，主动尝试一次静默自动匹配
+        if linkedSubjectID == nil && !attemptedAutoMatchIDs.contains(linkItemID) {
+            attemptedAutoMatchIDs.insert(linkItemID)
+            isMatching = true
+            defer { if loadGeneration == generation { isMatching = false } }
+            if let matched = try? await BangumiMatcher.autoMatch(for: item, season: selectedSeason) {
+                guard loadGeneration == generation else { return }
+                // autoMatch 内部已持久化（persistLink：主键 + 第 1 季回落双写），
+                // 这里只需把结果反映到本区块状态。
+                linkedSubjectID = matched.id
+            }
+        }
+
+        guard let subjectID = linkedSubjectID else {
+            subject = nil
+            episodes = []
+            loadError = nil
+            // 没关联就没有章节可当兜底来源：明确清空，别让上一次关联的章节继续撑着占位。
+            onCandidatesLoaded?([])
+            return
+        }
+        isLoading = true
+        loadError = nil
+
+        // 先渲染本地缓存，再补远端。
+        await readLocal(subjectID, generation: generation)
+        do {
+            // 条目可能压根没被收藏过（关联是可以指向任意条目的），章节也可能还没拉过，
+            // 这一步把两样都补齐；已经齐的不会发请求。
+            try await bangumi.context.ensureSubjectLoaded(subjectID)
+            guard loadGeneration == generation else { return }
+            await readLocal(subjectID, generation: generation)
+        } catch {
+            guard loadGeneration == generation else { return }
+            loadError = BangumiActionPerformer.loadFailureMessage(
+                "加载 Bangumi 条目失败 subject=\(subjectID)", error)
+        }
+    }
+
+    /// 从本地库读条目与**全量**章节。
+    /// 不能用进度窗口（`fetchProgressSubject`）：那个只返回本篇的一个滑动窗口，
+    /// 会把 SP 和窗口外的集吃掉。
+    private func readLocal(_ subjectID: Int, generation: UInt64) async {
+        let cached = try? await bangumi.context.subject(id: subjectID)
+        let cachedEpisodes = try? await bangumi.context.fetchEpisodes(subjectId: subjectID)
+        guard loadGeneration == generation else { return }
+        if let cached { subject = cached }
+        if let cachedEpisodes {
+            episodes = cachedEpisodes
+            // 顺带把本篇章节递出去当占位兜底来源。放在这里（而不是 load 的末尾）是因为
+            // 它有三条读路径：缓存、远端补齐后重读、播放结束的失效通知——都收在 readLocal。
+            onCandidatesLoaded?(EpisodePlaceholderSource.bangumiCandidates(from: cachedEpisodes))
+        }
+    }
+
+    private func autoMatch() async {
+        guard !isMatching else { return }
+        isMatching = true
+        loadError = nil
+        defer { isMatching = false }
+        do {
+            guard let matched = try await BangumiMatcher.autoMatch(for: item, season: selectedSeason) else {
+                loadError = "没找到匹配的 Bangumi 条目，试试手动选择"
+                return
+            }
+            linkedSubjectID = matched.id
+            loadToken += 1
+        } catch {
+            loadError = BangumiActionPerformer.loadFailureMessage(
+                "自动匹配失败 item=\(item.id)", error)
+        }
+    }
+
+    private func perform(_ action: BangumiEpisodeAction, on episode: BangumiEpisodeDTO) async {
+        guard let subjectID = linkedSubjectID else { return }
+        let generation = loadGeneration
+        await BangumiActionPerformer.performEpisodeAction(
+            action, on: episode, context: bangumi.context,
+            isBusy: updatingEpisodeID != nil,
+            setBusy: { updatingEpisodeID = $0 },
+            onSuccess: {
+                // 提交期间条目被换掉（代次翻转）则这次重读作废。
+                guard loadGeneration == generation else { return }
+                loadError = nil
+                await readLocal(subjectID, generation: generation)
+            },
+            onError: { message in
+                guard loadGeneration == generation else { return }
+                loadError = message
+            }
+        )
+    }
+}

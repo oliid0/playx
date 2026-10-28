@@ -3,12 +3,12 @@ import Foundation
 
 /// 播放链路日志入口（内核适配器 + App 播放层共用）。
 ///
-/// 基于 `DiagnosticsKit`：JSONL 落盘（`~/Library/Logs/PlayerX/diagnostics.jsonl`，
+/// 基于 `DiagnosticsKit`：JSONL 落盘（`~/Library/Logs/OcPlayer/diagnostics.jsonl`，
 /// 单文件 20 MB / 保留 10 份 / 总量 50 MB / 30 天）+ OSLog 镜像。所有播放相关模块（PlaybackKit / 各内核适配器 /
 /// App 层）都往同一个文件追加，时间线上无缝；token / Authorization 头等敏感字段
 /// 由 DiagnosticsKit 统一脱敏，不进任何 sink。
 public enum PlaybackLog {
-    private static let logger = DiagnosticLogger(subsystem: "com.oliid0.playerx", category: "Playback")
+    private static let logger = DiagnosticLogger(subsystem: "dev.jumusu.OcPlayer", category: "Playback")
 
     public static var fileURL: URL { logger.fileURL }
 

@@ -1,0 +1,988 @@
+import AppDesignKit
+import BangumiKit
+import CoreModel
+import DanmakuKit
+import DiagnosticsKit
+import Foundation
+import JellyfinKit
+import MoviePilotKit
+import Observation
+import SwiftUI
+
+/// 播放准备态：点击播放后、引擎真正 open 之前的阶段。单一真相——
+/// loading 覆盖层、重试/取消入口都读它，替代散落的标志位。
+enum PlaybackPreparation: Equatable {
+    /// 正在解析播放地址（剧集叶子 / PlaybackInfo / streamURL）
+    case loading(title: String)
+    /// 解析失败，loading 层显示错误 + 重试
+    case failed(title: String, error: String)
+}
+
+/// 应用的中枢状态机：登录 → 浏览 → 播放串联。
+///
+/// UI 只读这个类的属性、调它的方法；服务器细节被挡在 `MediaServer` 后面，
+/// 内核细节被挡在 `PlaybackController` 后面。
+///
+/// 实现按职责拆到 `AppModel+Session` / `+Browser` / `+Playback`；
+/// 存储属性集中在本文件，跨文件 extension 以模块内可见访问。
+@MainActor
+@Observable
+final class AppModel {
+
+    // MARK: - 登录态
+
+    enum Phase {
+        /// 刚启动，正在从磁盘恢复会话
+        case boot
+        /// 没有可用会话，进登录流程
+        case onboarding
+        case ready
+    }
+
+    var phase: Phase = .boot
+
+    let store: ServerStore
+    var server: (any MediaServer)?
+
+    /// 当前生效的服务器地址（地址决议器探活择优的结果）。
+    ///
+    /// 一台服务器可以有多个入口（局域网 / Tailscale / 反代域名），决议器选中的
+    /// 那条就是它；既是状态页展示的「现在走哪条」，也是界面重算图片 / 播放流地址
+    /// 的触发点（换地址后视图必须重渲染，否则还举着老地址的图）。
+    var serverEndpointURL: URL?
+
+    /// 网络路径监听（Wi-Fi ↔ 蜂窝 / Tailscale 起停 → 地址结论作废重探）。
+    let endpointMonitor = ServerEndpointMonitor()
+
+    /// 当前账号头像的位图；nil = 没有头像或还没加载出来。
+    ///
+    /// **两端的形态不同，因为两端的宿主约束不同**：
+    /// * iOS：已经烤成**标签栏要的样子**（裁圆、28pt@3x、`alwaysOriginal`）—— 标签栏
+    ///   会忽略 `.frame` / `.clipShape` / SwiftUI 的 `.renderingMode`，见
+    ///   `AppModel+Avatar.tabIcon(from:)`。
+    /// * macOS：原始解码位图（`tabIcon` 直通）。那边没有标签栏，消费方是顶栏药丸里
+    ///   自绘的 `SectionAvatarIcon`，`.frame` / `.clipShape` 都正常生效。
+    ///
+    /// **为什么把它存在模型里而不是让视图自己去拉**：两个宿主（Tab 项 / 工具栏药丸）
+    /// 都是宿主渲染的，异步图加载完不会回填，视图只能同步读一个已经就绪的值。
+    ///
+    /// 生命周期跟着会话走：`resetBrowseState()` 里清掉（换服务器 / 登出 / 401 之后
+    /// 不能还挂着上一个账号的脸）。详见 `AppModel+Avatar.swift`。
+    var userAvatarImage: PlatformImage?
+
+    /// 正在跑的头像装载任务（换会话时取消，避免旧会话的结果落到新会话上）。
+    var userAvatarTask: Task<Void, Never>?
+
+    /// 头像取图用的图片管道。默认 `.shared`（与界面里其它图同一份缓存）。
+    ///
+    /// 留成可注入项而不是直接写 `ImagePipeline.shared`，与 `RemoteImage.pipeline` /
+    /// `LoginWallCatalogLoader(pipeline:)` 同一条口径：用例要能塞一个挂
+    /// `MockURLProtocol` 的管道，让「头像真的落进了模型」这条断言走完整条加载链，
+    /// 而不是在测试里去真发一次 `stub.local` 的请求。
+    var avatarImagePipeline: ImagePipeline = .shared
+
+    /// Every authenticated session gets a new generation. Async responses keep
+    /// their generation and may only mutate state while it is still current.
+    var sessionGeneration = 0
+    var initialDataTask: Task<Void, Never>?
+
+    // MARK: - Onboarding 中间态
+
+    /// `startLogin` 成功后非 nil（已探明这是台 Jellyfin，等用户选登录方式）。
+    var loginSession: (any ServerLoginSession)?
+    var isProbingServer = false
+    var isAuthenticating = false
+    /// Quick Connect 轮询期间展示的配对码。
+    var quickConnectCode: String?
+    /// Quick Connect 不可用的原因（服务器没开、超时、请求失败）。
+    ///
+    /// 和 `onboardingError` 分开：QC 不可用**不是**登录失败，账号密码那条路还好好的。
+    /// 混在一起的话，服务器关掉 QC 时用户会同时看到「正在申请配对码…」在转圈
+    /// 和一条红色报错，而两句说的其实是同一件事。
+    var quickConnectError: String?
+    var onboardingError: String?
+
+    var quickConnectTask: Task<Void, Never>?
+    var loginAttemptGeneration = 0
+
+    // MARK: - 浏览
+
+    var libraries: [MediaLibrary] = []
+    /// 「媒体库」选择面板加载失败时展示；成功加载后清空。
+    var librariesError: String?
+
+    /// Bangumi 详情页「MoviePilot下载」待消费的搜索词。详情页只放词 + 切分区，
+    /// MoviePilot 首页出现后取走并清空（视图不重建就不会丢）。
+    var pendingMoviePilotQuery: String?
+
+    /// 媒体库网格分页缓存的键：**库 + 搜索词**（空串 = 浏览页）。
+    ///
+    /// 库内搜索是把结果**原地**写进该库分页缓存的，所以键上必须带搜索词。曾经只
+    /// 用 libraryID：浏览页与搜索页共用一格——库内搜「败犬女主」→ 点进详情 → 回
+    /// 首页 → 再点该库，缓存里还是那几条搜索结果，而 `LibraryView.searchText` 是
+    /// `@State`、视图重建后已空 → **搜索框空着、网格却只剩当初那几条**，且没有
+    /// 任何入口能切回浏览页（只能重新搜一次再清空）。带词分键后浏览页与当前搜索词
+    /// 各占一格，切走再回来各自还原。
+    struct LibraryPageKey: Hashable {
+        var libraryID: MediaLibrary.ID
+        var searchTerm: String = ""
+    }
+
+    /// 媒体库网格的分页缓存，按 `LibraryPageKey` 存。
+    ///
+    /// 原来 items / totalCount 是 `LibraryView` 的 `@State`：侧栏切走再切回来，
+    /// `.task(id:)` 重跑一次就从 startIndex 0 重新拉——深翻过十几页的大库回来时
+    /// 整份都丢了。详情页的 `episodesBySeason` 早就解决了同一个问题，这里补上。
+    /// 换会话（`activate` / `signOut`）时清空。
+    struct LibraryPage: Equatable {
+        var items: [MediaItem] = []
+        var totalCount: Int?
+        var nextStartIndex = 0
+        var lastPageWasFull = false
+    }
+
+    var libraryPages: [LibraryPageKey: LibraryPage] = [:]
+
+    /// 合集卡封面：合集条目 id → TMDB 合集的海报路径（`/xxx.jpg`）。
+    ///
+    /// ## 为什么网格需要一份独立缓存
+    ///
+    /// 合集在服务端**本来就没有图**（实测 `ImageTags: {}`），网格卡于是只剩占位图标；
+    /// 而详情页能出图是因为它手上有该条目的 TMDB overlay。网格没有 overlay（每张卡一条
+    /// 读路径不现实），所以把「解析出来的海报路径」按条目 id 记在这里，让详情页与网格
+    /// **共用同一次解析结果**。
+    ///
+    /// 解析入口是 `resolveCollectionArtworkIfNeeded(for:)`（卡片进入可视区时触发），
+    /// 值来源还有一条：详情页读到 overlay 后经 `noteCollectionArtwork` 同步过来——
+    /// 所以「先点开详情、再回网格」这一趟是**零请求**的。
+    var collectionArtwork: [MediaItem.ID: String] = [:]
+
+    /// 已经解析过（成功或确定失败）的合集 id：失败**不重试**，否则滚动一次就是一轮
+    /// 网络风暴；失败多为「TMDB 上没有这个合集」这种不会自己变好的情况。
+    ///
+    /// 与 `collectionArtworkInFlight` 一起只由 `AppModel+TMDB.swift` 的解析路径使用
+    /// （存储留在本文件、逻辑留在那个扩展里，所以这里是 internal 而不是 private）。
+    var collectionArtworkAttempted: Set<MediaItem.ID> = []
+    /// 正在解析的合集 id（同一个合集被多个卡片/多次 onAppear 触发时只跑一次）。
+    var collectionArtworkInFlight: Set<MediaItem.ID> = []
+
+    /// 换会话时清空合集封面缓存（见 `resetBrowseState`）。
+    /// 收在这里而不是让调用方直接改那两个私有集合：存储的可见性留在本文件。
+    func clearCollectionArtwork() {
+        collectionArtwork = [:]
+        collectionArtworkAttempted = []
+        libraryCoverArt = [:]
+        libraryCoverAttempted = []
+    }
+
+    /// 媒体库卡封面：库 id → 最多 4 张内容海报（服务端没给库封面时用它拼 2×2）。
+    /// 逻辑在 `AppModel+CollectionArtwork.swift`。
+    var libraryCoverArt: [MediaLibrary.ID: [URL]] = [:]
+    /// 已解析过（成功或确定没有可用海报）的库 id；失败不重试。
+    var libraryCoverAttempted: Set<MediaLibrary.ID> = []
+    /// 正在解析的库 id。
+    var libraryCoverInFlight: Set<MediaLibrary.ID> = []
+
+    /// 同时在飞的合集封面解析上限。滚动扫过几十个合集时不该并发打上百个请求——
+    /// 超限的直接跳过（下次滚回来还有机会，`attempted` 只在真正跑完时才记）。
+    static let collectionArtworkConcurrency = 2
+
+    /// 分页缓存条目总量上限：超大服务器深翻多个库时无上限增长会吃掉几百 MB
+    /// （每条 MediaItem 带长 overview）。超限就整份清空、只回填当前正在浏览的
+    /// 这一库——分页缓存只是「回库不重拉」的加速器，清空代价是下次进库重新翻页，
+    /// 不值得为它维护 LRU 结构。
+    static let libraryPagesItemLimit = 20_000
+
+    func cacheLibraryPage(_ page: LibraryPage, for libraryID: MediaLibrary.ID, searchTerm: String = "") {
+        let key = LibraryPageKey(libraryID: libraryID, searchTerm: searchTerm)
+        libraryPages[key] = page
+        // 搜索页同时可达的只有一个：搜索框一次只装一个词，切库还会把它清空
+        // （见 LibraryView 的 lastLibraryID）。旧搜索词的格子再也读不到，直接丢，
+        // 免得它们在字典里无界累积；浏览页（空词）是切走再回来的落脚点，全部保留。
+        if !searchTerm.isEmpty {
+            libraryPages = libraryPages.filter { $0.key.searchTerm.isEmpty || $0.key == key }
+        }
+        let totalItems = libraryPages.values.reduce(0) { $0 + $1.items.count }
+        if totalItems > Self.libraryPagesItemLimit {
+            libraryPages = [key: page]
+        }
+    }
+
+    /// 作废某库某搜索词的分页缓存。换排序时旧页在新顺序下是错序数据，直接清掉重取；
+    /// 分页缓存只是「回库不重拉」的加速器，清空的代价是下次进库从第一页翻。
+    func clearLibraryPage(for libraryID: MediaLibrary.ID, searchTerm: String = "") {
+        libraryPages[LibraryPageKey(libraryID: libraryID, searchTerm: searchTerm)] = nil
+    }
+
+    // MARK: - 详情页快照缓存（stale-while-revalidate）
+
+    /// 详情页跨进入的内容快照：再次进入同一详情先用快照即时渲染（不闪骨架屏），
+    /// 同时后台重拉并原位覆盖。快照都是小结构体，正常会话远到不了上限；
+    /// 超限整份清空（下次进入回到首拉行为，代价可忽略）。
+    struct DetailSnapshot {
+        var detail: MediaItem
+        var seasons: [MediaItem]
+        var similar: [MediaItem]
+        var selectedSeasonID: String?
+        var episodesBySeason: [String: [MediaItem]]
+        /// 合集成员（合集详情页的「合集内容」）。非合集条目恒为空。
+        /// 有默认值 → 既有构造点（磁盘快照 / 详情 VM）不必逐处补参数。
+        var collectionMembers: [MediaItem] = []
+        /// 快照写入时间（本会话内各次 `storeSnapshot` 都会刷新它）。TTL 短路
+        /// （`detailSnapshotTTL`）据此决定「这次进页要不要再问网络」。**磁盘快照
+        /// 不参与 TTL**（`loadFromDisk` 构造时置 `.distantPast`）：它是上一次会话
+        /// 写穿的，一律走 SWR 网络确认。
+        var fetchedAt: Date = Date()
+
+        /// TTL 内 = 网络刚刚确认过（进页零请求短路的判据）。判据只有这一份——
+        /// 此前同一句表达式散在预取与 VM 两处。
+        var isFresh: Bool {
+            Date().timeIntervalSince(fetchedAt) < AppModel.detailSnapshotTTL
+        }
+    }
+
+    static let detailSnapshotLimit = 40
+    /// 快照多新才算「不用再问网络」。Jellyfin 元数据变更频率低（刮削、已看状态），
+    /// 已看状态在播放返回时有本地同步（`applyPlayState` / `reloadAfterPlayback`
+    /// 都会重新 storeSnapshot、刷新时间戳），5 分钟窗口内唯一可能过期的是
+    /// 「在另一台设备上看完一集」这种并发改动，最终一致可接受。
+    /// nonisolated：`DetailSnapshot.isFresh` 在非隔离上下文也要读它。
+    nonisolated static let detailSnapshotTTL: TimeInterval = 5 * 60
+    var detailSnapshots: [MediaItem.ID: DetailSnapshot] = [:]
+    /// 快照的最近使用顺序（末尾最新）。淘汰时按它丢**最旧**的，而不是整份清空。
+    private var detailSnapshotRecency: [MediaItem.ID] = []
+    /// 点击预取的在途任务（按条目 id 去重；逻辑在 `AppModel+DetailPrefetch.swift`，
+    /// 存储属性按类注释的规矩集中在这里）。
+    var detailPrefetchTasks: [MediaItem.ID: Task<Void, Never>] = [:]
+
+    func storeDetailSnapshot(_ snapshot: DetailSnapshot, for id: MediaItem.ID) {
+        detailSnapshots[id] = snapshot
+        noteSnapshotUse(id)
+        // 超限只淘汰最旧的那些，**必须保留刚写入的这条**：整份 `removeAll()` 会把
+        // 为了提高"再次进入即时有内容"而刚存下的快照一起丢掉，于是第 41 次进入
+        // 详情页立刻退回冷骨架屏——SWR 的收益变成随机的。删到限额为止即可。
+        while detailSnapshots.count > Self.detailSnapshotLimit {
+            guard let oldest = detailSnapshotRecency.first else { break }
+            detailSnapshotRecency.removeFirst()
+            if oldest != id { detailSnapshots[oldest] = nil }
+        }
+    }
+
+    /// 读快照顺手刷新使用顺序：不刷新的话"最近看过的页"会被后续新页挤掉，
+    /// 与我们想要的 LRU 语义相反。
+    func detailSnapshot(for id: MediaItem.ID) -> DetailSnapshot? {
+        guard let snapshot = detailSnapshots[id] else { return nil }
+        noteSnapshotUse(id)
+        return snapshot
+    }
+
+    /// 顺序表的自愈：`detailSnapshots` 可能在别处被整体清掉（换会话），此时把
+    /// 悬空 id 一并剔除，避免淘汰时对着不存在的键空转。
+    private func noteSnapshotUse(_ id: MediaItem.ID) {
+        detailSnapshotRecency.removeAll { $0 == id || detailSnapshots[$0] == nil }
+        detailSnapshotRecency.append(id)
+    }
+
+    /// 会话边界用：快照与它的顺序表必须一起清，否则顺序表会留下悬空 id。
+    /// 在途预取一并取消——旧会话的预取不该把半截数据写进新会话的快照表。
+    func clearDetailSnapshots() {
+        for task in detailPrefetchTasks.values { task.cancel() }
+        detailPrefetchTasks = [:]
+        detailSnapshots = [:]
+        detailSnapshotRecency = []
+    }
+
+    struct HomeData: Equatable {
+        var resume: [MediaItem] = []
+        var nextUp: [MediaItem] = []
+        var latest: [MediaItem] = []
+        var isLoading = false
+        var error: String?
+        /// 上一次成功加载时哪几条 Rail 有内容（跨启动保留，见 `HomeRailPresence`）。
+        /// 骨架屏据此决定铺几条：写死三条的话，没有「继续观看」的服务器上
+        /// 骨架撤掉的瞬间会塌掉几百 pt——那正好是骨架屏本该消掉的跳动。
+        ///
+        /// 初值在 `AppModel.init` 里按注入的 `preferences` 重设（这里给的是
+        /// `.standard` 兜底，保证 `HomeData()` 单独构造时也可用）。
+        var railPresence = HomeRailPresence.restored()
+        /// 当前展示的内容来自磁盘缓存时的写入时间（nil = 内容来自本次会话的网络请求）。
+        /// 与 `home.error` 不同：error 表示「什么都没拿到」，这个表示「有内容但没刷新成功」。
+        var cachedFetchedAt: Date?
+        /// 这次刷新失败是否由「连不上」导致（决定提示说不说「离线」）。
+        var refreshFailureWasConnectivity = false
+    }
+
+    var home = HomeData()
+
+    /// 首页当前该渲染哪一态。
+    ///
+    /// 抽到模型上而不是留在 `HomeView` 的 `if` 链里，是因为**这条判定错过一次**：
+    /// 原来用 `home.latest.isEmpty` 单独一条 rail 当「有没有内容」的判据，而服务器
+    /// 完全可以没有「最近添加」（`railPresence` 就是为这种情况存在的）——那种服务器
+    /// 上 `latest` 恒为空，于是**哪怕缓存里已经有内容，加载期间也一直显示骨架屏**
+    /// （实测离线冷启动：磁盘已读出 3+6 条，界面仍只转骨架）。判定留在视图里就
+    /// 没法为它写回归用例。
+    enum HomePresentation: Equatable {
+        /// 首次加载、且手上没有任何可显示的内容。
+        case loading
+        /// 全局失败、且没有任何可显示的内容（有内容时永远优先显示内容）。
+        case error(String)
+        case content
+    }
+
+    /// 三条 rail 的并集是否至少有一条内容。
+    var hasAnyHomeContent: Bool {
+        !home.resume.isEmpty || !home.nextUp.isEmpty || !home.latest.isEmpty
+    }
+
+    var homePresentation: HomePresentation {
+        // **有内容就先显示内容**，无论是否还在加载、是否有某条 rail 失败：
+        // 这正是「先读磁盘」的目的——离线 / 慢网时用户立刻看到上次的样子，而不是
+        // 对着骨架屏等重试跑完（实测一台不可达服务器要重试 3 次 × 2 个地址，
+        // 73 秒才落地）。
+        if hasAnyHomeContent { return .content }
+        if home.isLoading { return .loading }
+        if let error = home.error { return .error(error) }
+        // 三条 rail 都成功但都是空的（空库 / 新服务器）：走内容分支，由它的
+        // 「暂无可展示内容」空态承接，而不是错误页。
+        return .content
+    }
+
+    /// 首页当前是否在展示「没刷新成功的缓存内容」。
+    ///
+    /// 判定只看**有没有内容**与**这次刷新有没有失败**，刻意**不看 `home.error`**：
+    /// `home.error` 在三条 rail 全挂时置位，而「断网冷启动」正是这个形态——磁盘上
+    /// 有内容、网络全挂、error 被置位。若在这里 guard `error == nil`，离线冷启动就会
+    /// 显示着缓存内容却**一个提示都没有**，用户完全不知道这是旧数据。
+    ///
+    /// 「该不该显示整页错误」是另一回事，由 `homePresentation` 决定：有内容时它
+    /// 总是 `.content`（此时本提示生效），没内容时才轮到错误页。
+    var homeStaleNotice: StaleContentNotice? {
+        // 首次加载中不提示（内容还没落地，提示会闪一下）。
+        guard !home.isLoading else { return nil }
+        // 有内容才有可标的对象。
+        guard !home.resume.isEmpty || !home.nextUp.isEmpty || !home.latest.isEmpty else { return nil }
+        // 这次刷新确实失败过（全部成功时下面两个标记都会被清掉）。
+        guard home.cachedFetchedAt != nil || home.refreshFailureWasConnectivity else { return nil }
+        return StaleContentNotice(
+            fetchedAt: home.cachedFetchedAt,
+            causedByConnectivity: home.refreshFailureWasConnectivity)
+    }
+    /// 同一会话内可能同时发生下拉刷新和设置切换；只有最新一次首页请求可以写回。
+    var homeLoadGeneration: UInt64 = 0
+
+    /// 会话内的**首次**首页加载是否已收官（成败皆算，见 `loadHome`）。
+    /// 启动动画的交棒门控用它区分「还没开始加载」与「加载完了但没内容」：
+    /// boot 期两者都是三条 rail 全空，只有它能把后者从骨架等待里摘出来。
+    /// 会话边界（`resetBrowseState`）复位。
+    var homeInitialLoadDone = false
+
+    /// 启动动画的「首页就绪」信号：首页不再处于骨架期。
+    /// 有内容（含磁盘缓存预热先行）或首次加载已收官（空库空态 / 整页错误态）都算——
+    /// 这些状态下交棒过去都不会露骨架。boot 期两者皆无 → false（还没开始等）。
+    var homeContentLoaded: Bool {
+        hasAnyHomeContent || homeInitialLoadDone
+    }
+
+    // MARK: - 弹幕设置（弹弹play 网关）
+
+    /// 弹幕域模型（协调器 + 网关设置），独立环境注入：播放器 / 设置页里只看弹幕的视图
+    /// 不再被 AppModel 的全量观察拖着重绘。AppSecret 永远不进客户端，只留在网关。
+    var danmakuModel: DanmakuModel
+
+    // MARK: - Bangumi（登录 / 进度 / 收藏）
+
+    let bangumi: BangumiCoordinator
+
+    // MARK: - MoviePilot（搜索 / 下载）
+
+    let moviepilot: MoviePilotCoordinator
+
+    // MARK: - 媒体元数据缓存（SQLite）
+
+    /// 元数据落盘 + 写穿缓存。测试下不建库（见 `bootstrap`），此时它的 `wrap`
+    /// 原样返回服务器，行为与引入缓存之前一致。
+    let metadata: MetadataCoordinator
+
+    /// TMDB 元数据补全（可选增强，用户配置 key 后生效）。
+    ///
+    /// 与 `metadata` 分开两个协调器，但**共用同一个 `Media.sqlite`**（TMDB 的表
+    /// 就在那个库里）：缓存层与补全层的生命周期、失败模式都不一样，混成一个类
+    /// 会让「没配 key」与「建库失败」两种降级纠缠在一起。
+    let tmdb: TMDbCoordinator
+
+    /// App 级偏好的落盘域（见 `init` 的说明）。
+    @ObservationIgnored let preferences: UserDefaults
+
+    // MARK: - 导航
+
+    enum Section: Hashable {
+        case home
+        case settings
+        case bangumi
+        case moviepilot
+        /// iOS 放大镜 Tab（`Tab(role: .search)`）；常规布局（macOS 顶栏）不会到达。
+        case search
+    }
+
+    enum Route: Hashable {
+        case detail(MediaItem)
+        /// 首页「媒体库」栏 → 单库网格页的 push 路由。
+        case library(MediaLibrary)
+        case bangumiProfile
+        case bangumiCollectionList(BangumiSubjectType)
+        case bangumiSubject(subjectID: Int, initialSubject: BangumiSlimSubjectDTO? = nil)
+        case bangumiCalendar
+        /// 设置 hub → 子页（见 `SettingsSubpage` 为何走 path 路由）。
+        case settingsSubpage(SettingsSubpage)
+    }
+
+    /// iOS 各 Tab 的独立导航栈。每 Tab 一个路径数组，互不串。
+    struct NavigationPaths {
+        var home: [Route] = []
+        var bangumi: [Route] = []
+        var moviepilot: [Route] = []
+        var settings: [Route] = []
+        var search: [Route] = []
+    }
+
+    var selectedSection: Section = .home {
+        didSet {
+            // 常规布局（Mac/iPad）切 Section 时清空共享栈；紧凑布局各 Tab 有独立栈，无需清。
+            if selectedSection != oldValue, !isCompact { path = [] }
+        }
+    }
+
+    /// Mac / iPad 的共享 push 栈。**外部只读**：写入口只有 `push` / `back` /
+    /// `handleStackPathChange` 三个。
+    ///
+    /// 这里踩过坑：`path` 与 `navPaths` 是两个真源（常规布局用前者、compact 各 Tab
+    /// 用后者），而 `push()` 会按 `isCompact` 分派到正确的那个。视图一旦绕过
+    /// `push()` 直接 `app.path.append(...)`，在 iOS 上就是**点了没反应**——`path`
+    /// 在 compact 布局下只被写、从不被读（Bangumi 的「每日放送 / 个人主页 / 收藏
+    /// 列表」三个入口就是这么坏的）。`private(set)` 把这类错误从"运行时静默失效"
+    /// 变成"编译期报错"。
+    private(set) var path: [Route] = []
+
+    /// iPhone 各 Tab 独立的导航路径——每个 Tab 一个栈，互不串。
+    /// 之前 iPhone 走 `.sheet` 弹详情是因为多 Tab 共享一个 `path` 会互相踩；
+    /// 现在分栈后详情页走 push，播放器覆盖层不再被 sheet 遮住。
+    /// 同样 **外部只读**，视图经 `navPath(for:)` 取 binding。
+    private(set) var navPaths = NavigationPaths()
+
+    /// 某个 Tab 的独立栈（compact 布局的 `NavigationStack` 绑定读取侧）。
+    func navPath(for section: Section) -> [Route] {
+        switch section {
+        case .home: navPaths.home
+        case .bangumi: navPaths.bangumi
+        case .moviepilot: navPaths.moviepilot
+        case .settings: navPaths.settings
+        case .search: navPaths.search
+        }
+    }
+
+    /// 某个 Tab 的独立栈（系统 push / pop 写回 binding 的入口）。
+    func setNavPath(_ newValue: [Route], for section: Section) {
+        switch section {
+        case .home: navPaths.home = newValue
+        case .bangumi: navPaths.bangumi = newValue
+        case .moviepilot: navPaths.moviepilot = newValue
+        case .settings: navPaths.settings = newValue
+        case .search: navPaths.search = newValue
+        }
+    }
+
+    /// 常规布局共享栈的写回入口：系统返回键 / 边缘滑动手势都会把**变短的** path
+    /// 写回 binding。这里统一拦成与 push 对称的两段式（淡出 → 弹栈 → 落点淡入），
+    /// 变长（程序化 push）直接落地。
+    ///
+    /// 收进模型而不是留在视图的 Binding setter 里：栈的写入口只要多于一个，
+    /// 就一定会漂（见 `path` 的注释）。
+    func handleStackPathChange(_ newValue: [Route]) {
+        guard newValue.count < path.count else {
+            path = newValue
+            return
+        }
+        beginRouteExit { [weak self] in self?.path = newValue }
+    }
+
+    /// 播放覆盖层：非 nil 时播放器盖住整个 App（双端同一套，见 RootView）。
+    var presentedPlayer: PlaybackRequest? {
+        didSet {
+            guard oldValue?.id != presentedPlayer?.id else { return }
+            #if os(iOS)
+            // ⚠️ 不能用「外部装配闭包」回调方向切换（issue #5 排查实录）：SwiftUI
+            // 会多次创建 App 值，App.init / body 闭包经 @State 访问到的 appModel 实例和
+            // SwiftUI 实际存储/注入的是**不同对象**（ObjectIdentifier 实测
+            // 0x8000 vs 0xb200），闭包装配静默丢失、横屏锁整个失效。
+            // 改为广播通知：AppDelegate 在自身 init（最早时机）监听，无装配时序问题。
+            NotificationCenter.default.post(
+                name: Self.playerPresentationDidChangeNotification,
+                object: nil,
+                userInfo: ["active": presentedPlayer != nil])
+            #endif
+        }
+    }
+
+    #if os(iOS)
+    /// presentedPlayer 开合广播（AppModel → IOSApplicationDelegate 切方向锁）。
+    static let playerPresentationDidChangeNotification =
+        Notification.Name("OcPlayer.playerPresentationDidChange")
+    #endif
+
+    /// 「打开本地视频文件」请求标志：首页工具栏菜单 / macOS 文件菜单（Cmd+O）
+    /// 置 true，RootView 的 fileImporter 以它为 isPresented，选择完成或取消自动复位。
+    var isLocalFileImporterPresented = false
+    /// 「打开直连链接」请求标志：同样由 RootView 承载 URLEntrySheet。
+    var isDirectLinkSheetPresented = false
+
+    /// 播放结束/退出后自增，驱动打开中的详情页拉取最新 playState。
+    var detailRefreshGeneration: UInt64 = 0
+
+    var isCompact = false
+
+    /// 两段式换页进行中：当前页淡出、落地（push 或 pop）未发生。期间新的
+    /// 换页请求被忽略（防连点）；AppShell 的 `RouteExitFader` 读它画淡出，
+    /// 落地后的回弹淡入就是落点页的入场。
+    var routeExiting = false
+
+    /// 换页落地代次。会话重置时自增，使在飞的「淡出 → 落地」闭包作废
+    /// （见 `beginRouteExit` 与 `invalidatePendingRouteExit`）。
+    private(set) var routeExitGeneration: UInt64 = 0
+
+    /// 清空全部导航栈（`path` 与 `navPaths` 是 `private(set)`，写入口集中在本文件）。
+    /// 会话边界（登出 / 换服 / 401）用。
+    func clearNavigationStacks() {
+        path = []
+        navPaths = NavigationPaths()
+    }
+
+    /// 作废在飞的「淡出 → 落地」闭包：换页意图属于旧会话，不能再落到新会话的栈上。
+    /// 顺带复位 `routeExiting`，否则新会话的第一下点击会被防连点守卫吞掉。
+    func invalidatePendingRouteExit() {
+        routeExitGeneration &+= 1
+        routeExiting = false
+    }
+
+    /// `accessibilityReduceMotion` 的副本（AppShell 注入）：开启时换页直切，
+    /// 不做淡出等待。
+    var reduceMotion = false
+
+    /// 整窗氛围底声明（常规布局 Mac/iPad）：有氛围图的页面经 `windowAmbience(_:)`
+    /// 出现时声明、离屏时撤回，AppShell 据此在导航栈之外垫同一张模糊图——
+    /// macOS 26 只有栈根宿主是全窗的，pushed 页自己够不到侧栏底下。
+    ///
+    /// **是栈不是单值**：页面嵌套时后声明者覆盖前者（详情页 → 呈现的资源搜索页），
+    /// 单值在覆盖者离屏时只能清成 nil，宿主的声明就丢了（「返回详情页背景丢失」
+    /// 的另一扇门）。栈顶即当前生效值；条目 nil ＝ 该页声明「无氛围」，照样占一层。
+    private var windowAmbienceStack: [WindowAmbienceEntry] = []
+
+    /// 当前生效的整窗氛围底（声明栈栈顶；空栈＝无人声明，整窗层回落到首页轮播）。
+    var windowAmbience: WindowAmbience? {
+        windowAmbienceStack.last?.value ?? nil
+    }
+
+    /// 页面出现时压入自己的整窗氛围声明（`WindowAmbienceSetter.onAppear`）。
+    /// 条目带 id，页面存续期间的声明变化原位更新、离屏时按 id 摘除——
+    /// 天然不会清掉别页刚压入的条目（含 onDisappear 晚于新页 onAppear 的乱序）。
+    func pushWindowAmbience(id: UUID, _ value: WindowAmbience?) {
+        windowAmbienceStack.append(WindowAmbienceEntry(id: id, value: value))
+    }
+
+    /// 页面存续期间声明晚到 / 变化（详情页数据加载后才有 backdrop 图）：原位换新。
+    /// 条目不在栈里（会话重置清过栈的残留页面）就忽略——重置连导航栈一起清了，
+    /// 这种页面马上会销毁，不能再把旧服务器的声明压回新会话。
+    func updateWindowAmbience(id: UUID, _ value: WindowAmbience?) {
+        guard let index = windowAmbienceStack.firstIndex(where: { $0.id == id }) else { return }
+        windowAmbienceStack[index].value = value
+    }
+
+    /// 页面离屏时摘掉自己的声明条目（`WindowAmbienceSetter.onDisappear`）。
+    func removeWindowAmbience(id: UUID) {
+        windowAmbienceStack.removeAll { $0.id == id }
+    }
+
+    /// 会话边界清空整个声明栈（`resetBrowseState`）：条目里的 URL 都带着
+    /// 旧服务器的 authHeader，不能带进新会话。
+    func resetWindowAmbienceStack() {
+        windowAmbienceStack.removeAll()
+    }
+
+    // MARK: - 氛围池（会话级）
+    //
+    // ⚠️ **这里曾经有个 `homeAmbience: WindowAmbience?` 属性，已删除（2026-10-21）**：
+    // 它只有声明与写入（`publishCurrentAmbience()` 里赋值 + 会话清理时置 nil），
+    // 生产代码里**零个读点**（审查实测：`git grep homeAmbience -- App Packages` 只命中
+    // 声明/写入/注释，读它的只有 AppTests）。真正的消费路径是
+    // `currentAmbienceTarget`（读 `ambienceIndex`）—— `PageAmbience.sessionPool`、
+    // `DetailView.homeAmbienceTarget`、`AmbientBackdropCarousel` 都走它。
+    // 留着一个被写但不被读的 `@Observable` 属性不只是死代码：它会让下一个读注释的人
+    // 以为「页面消费的是它」，从而做出错误的性能判断（本仓确实这么错过一次）。
+    //
+    // **所有权必须在这里，不能在首页那个视图里**：原先池子住在
+    // `AmbientBackdropCarousel` 的 `@State`、而该视图只挂在首页 Tab 内——冷启动
+    // 直奔别的 Tab（或进设置子页）时池子从未装载，那些页面整个会话都停在纯色底。
+    // 搬到模型上后由 AppShell 根节点单点驱动，双端一致、会话内只装载一次。
+
+    /// 全库随机取来的一批带 backdrop 条目（池子大小见 `AmbiencePool.poolSize`）。
+    ///
+    /// 写入口只有 `AppModel+Ambience` 里那几个方法（装载 / 换片 / 会话清理）——
+    /// 这里不用 `private(set)` 是因为那个作用域是**声明所在文件**，而池的行为
+    /// 在另一个文件里（与本类其它状态一样的内部可见口径）。
+    var ambiencePool: [MediaItem] = []
+    /// 当前展示的池内下标（模池长）。
+    var ambienceIndex = 0
+    /// 装载成功时的会话代次。**失败不记账**（保持旧值）——这是「冷启动抢跑之后
+    /// 这个会话永远是纯色底」那条回归的修法：触发键变化后 `.task` 会重跑一次。
+    var ambienceLoadedGeneration: Int?
+    /// 装载时用的服务器地址。协议决议（局域网 / Tailscale 择优）可能在同一会话内
+    /// 换址，池里的图片 URL 随之作废，也要重拉一次。
+    var ambienceLoadedEndpoint: String?
+    /// 当前池是否装载成功（供用例与调试断言）。
+    var ambiencePoolIsLoaded: Bool { !ambiencePool.isEmpty }
+
+    /// 池内当前条目；空池为 nil（页面据此回退纯色底）。
+    var currentAmbienceItem: MediaItem? {
+        guard !ambiencePool.isEmpty else { return nil }
+        return ambiencePool[ambienceIndex % ambiencePool.count]
+    }
+
+    /// 当前那张图的取图三元组（与首页轮播、各页自垫完全同参）。
+    var currentAmbienceTarget: (url: URL?, authHeader: String?) {
+        guard let item = currentAmbienceItem else { return (nil, nil) }
+        return item.imageTarget(server, kind: .backdrop, width: AmbiencePool.imageWidth)
+    }
+
+    /// 首页是否已有可作回退的条目（`loadAmbiencePool` 在随机查询失败时用它们兜底）。
+    var homeHasAmbienceFallback: Bool {
+        !(home.latest.isEmpty && home.resume.isEmpty && home.nextUp.isEmpty)
+    }
+
+    /// 装载触发键：会话代次 + 当前生效地址 + 「池子空着但已有回退源」这个补救机会。
+    var ambienceTrigger: BackdropCarouselTrigger {
+        BackdropCarouselTrigger(
+            sessionGeneration: sessionGeneration,
+            poolIsEmpty: ambiencePool.isEmpty,
+            hasHomeFallback: homeHasAmbienceFallback,
+            endpoint: serverEndpointURL?.absoluteString)
+    }
+
+    // MARK: - 自动化深链（Debug-only，见 AppModel+LaunchRoute）
+
+    /// 深链是否已落地（只落一次：视图重建 / 会话恢复都不该重放它）。
+    var didApplyLaunchRoute = false
+
+    /// 待展开的呈现式叶子页标记（管理服务器 / 开源许可证）。
+    ///
+    /// 这类页面不在 `path` 上（`navigationDestination(isPresented:)`），模型侧没法
+    /// 直接 push；由**宿主子页**在出现时消费这个标记、置回 nil。一次性语义：消费
+    /// 即清，避免用户返回后又被弹回去。Release 下没有任何写入点（`initialRoute`
+    /// 恒 nil），这个字段永远为 nil。
+    var pendingPresentedLeaf: LaunchRoute.SettingsLeaf?
+
+    /// 播放器控制引用（RootView 装配时注入）：进度上报 / 连播要读实时位置。
+    weak var playback: PlaybackController? {
+        didSet {
+            guard playback !== oldValue else { return }
+            let precedingStop = playbackReporting?.stop() ?? pendingPlaybackReportingHandoff
+            clearPlaybackSessionState()
+            pendingPlaybackReportingHandoff = precedingStop
+            if let playback {
+                playbackReporting = PlaybackReportingCoordinator(
+                    stateSource: playback,
+                    precedingStoppedReport: pendingPlaybackReportingHandoff
+                )
+                pendingPlaybackReportingHandoff = nil
+            } else {
+                playbackReporting = nil
+            }
+        }
+    }
+    var playbackReporting: PlaybackReportingCoordinator?
+    var pendingPlaybackReportingHandoff: Task<Void, Never>?
+
+    // MARK: - 播放会话附属状态
+
+    /// 当前正在解析播放地址的请求。旧请求不能在新请求之后返回并覆盖播放器。
+    var playbackOpenTask: Task<Void, Never>?
+    var playbackOpenGeneration: UInt64 = 0
+    /// loading 层延后撤除的观察任务（等内核出帧）。
+    var preparationDismissTask: Task<Void, Never>?
+    // dismissPlayer 的收尾刷新任务（等 Stopped 落库后刷首页/详情）：可取消。
+    var dismissFollowUpTask: Task<Void, Never>?
+    /// 播放准备态：nil = 不在准备（空闲，或已呈现给 PlayerScreen）。
+    var playbackPreparation: PlaybackPreparation?
+    /// 保留 Jellyfin 条目，重试请求期间 finishReporting 清掉 nowPlayingItem 后仍可安全重试。
+    var retryPlaybackItem: MediaItem?
+    struct ActivePlaybackIdentity: Equatable {
+        let sessionGeneration: Int
+        let itemID: MediaItem.ID
+        let requestID: PlaybackRequest.ID
+    }
+    var activePlaybackIdentity: ActivePlaybackIdentity?
+    /// 覆盖层正在播放的条目（HUD 标题 / 继续观看用）；退出 / 换片时随上报一起清。
+    var nowPlayingItem: MediaItem?
+    /// 连播解析出的「下一集」；HUD「Continue Watching」复用它，nil = 没有下一集。
+    var nextEpisode: MediaItem?
+    var nextEpisodeTask: Task<Void, Never>?
+    var externalSubtitleTask: Task<Void, Never>?
+
+    /// iOS 前后台往返：离开前台时正在播（回前台要接着播的意图）。
+    /// 内核侧的暂停/恢复在 `PlaybackController.beginSystemSuspension`，
+    /// 这里只记「该不该接回去」——要不要重建内核得 App 层来判（它才知道是哪条会话）。
+    var backgroundResumeIntent = false
+    /// 回前台后的观察窗任务：挂起把内核弄坏时，报错未必在 `play()` 当场落地，
+    /// 可能迟一步（见 `AppModel.watchPlaybackAfterSystemResume`）。
+    var backgroundRecoveryWatch: Task<Void, Never>?
+
+    // MARK: - 初始化
+
+    /// 域模型全部经 init 注入（默认值保持生产装配不变）；测试可换入隔离实例，
+    /// 不再被「init 里默认构造 + bangumi.setup() 副作用」绑死。
+    /// - Parameter preferences: App 级偏好的落盘域（首屏骨架条数等）。
+    ///   与 `ServerStore(defaults:)` / `MoviePilotStore(defaults:)` 同款注入点：
+    ///   测试必须能换成隔离 suite——`xcodebuild` 默认**并行多进程**跑用例，而
+    ///   这些用例共用同一个 bundle id 的 `UserDefaults.standard`，两个类同时写
+    ///   同一个键就会互相污染（实测：新增的集成用例与本文件里的
+    ///   `HomeRailLoadingTests` 抢 `home.railPresence`，后者当场挂）。
+    ///   默认值走 `PlayXStorage.defaultPreferences`：生产就是 `.standard`，
+    ///   自动化运行（`OCPLAYER_ISOLATED_STORAGE=1`）落到隔离域 —— 测试宿主
+    ///   （AppTests 就跑在 App 进程里）不该写开发者本机的真实偏好。
+    init(
+        store: ServerStore = ServerStore(defaults: PlayXStorage.defaultPreferences),
+        bangumi: BangumiCoordinator = BangumiCoordinator(),
+        moviepilot: MoviePilotCoordinator = MoviePilotCoordinator(),
+        danmakuModel: DanmakuModel = DanmakuModel(),
+        metadata: MetadataCoordinator = MetadataCoordinator(),
+        tmdb: TMDbCoordinator? = nil,
+        preferences: UserDefaults = PlayXStorage.defaultPreferences
+    ) {
+        self.store = store
+        self.bangumi = bangumi
+        self.moviepilot = moviepilot
+        self.danmakuModel = danmakuModel
+        self.metadata = metadata
+        // 默认用注入的那个 `preferences` 域构造：测试传独立 suite 时，
+        // TMDB 的设置项不该落到 `.standard`（否则会与其他测试进程互相污染）。
+        self.tmdb = tmdb ?? TMDbCoordinator(defaults: preferences)
+        self.preferences = preferences
+        // 首屏骨架的条数来自注入域（不是 `HomeData` 默认值里的 `.standard`）。
+        home.railPresence = HomeRailPresence.restored(from: preferences)
+        // TheIntroDB 需要**剧集级** TMDB ID（集条目 ProviderIds 里的 Tmdb 是集级
+        // 的,不能直接用）——按 seriesID 现场换一份。
+        danmakuModel.danmaku.seriesTmdbIDProvider = { [weak self] seriesID in
+            await self?.seriesTmdbID(for: seriesID)
+        }
+        if let section = LaunchOptions.initialSection {
+            if let delay = LaunchOptions.sectionSwitchSeconds {
+                // 先留首页让轮播跑起来（池子装载 + 首图预热），到点再切目标分区。
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(delay))
+                    selectedSection = section
+                }
+            } else {
+                selectedSection = section
+            }
+        }
+    }
+
+    /// 处理 Bangumi OAuth 回调（macOS 浏览器 / iOS ASWebAuthenticationSession 都汇到这里）。
+    /// 返回错误文案（nil = 成功）。
+    @discardableResult
+    func handleBangumiOAuthURL(_ url: URL) async -> String? {
+        await bangumi.handleOAuthCallback(url: url)
+    }
+
+    /// 由外壳在布局定型时告知（iPhone → compact），详情导航方式随之切换。
+    func setCompact(_ compact: Bool) {
+        isCompact = compact
+    }
+
+    func openDetail(_ item: MediaItem) {
+        // 点击瞬间预取（与 push 转场并行）：详情页秒开的数据来源。
+        prefetchDetail(for: item)
+        push(.detail(item))
+    }
+
+    /// 首页「媒体库」栏入口：push 到当前栈（`.library` 路由已在 `appRoutes()` 注册）。
+    func openLibrary(_ library: MediaLibrary) {
+        push(.library(library))
+    }
+
+    func openBangumiSubject(id: Int, initialSubject: BangumiSlimSubjectDTO? = nil) {
+        push(.bangumiSubject(subjectID: id, initialSubject: initialSubject))
+    }
+
+    /// Bangumi 个人主页。**必须走 push**（不能由视图直接改栈）：compact 布局下
+    /// 栈是 `navPaths.<tab>`，写 `path` 等于点了没反应。
+    func openBangumiProfile() {
+        push(.bangumiProfile)
+    }
+
+    /// Bangumi 每日放送日历。同上。
+    func openBangumiCalendar() {
+        push(.bangumiCalendar)
+    }
+
+    /// Bangumi 某个收藏类型的完整列表。同上。
+    func openBangumiCollectionList(_ subjectType: BangumiSubjectType) {
+        push(.bangumiCollectionList(subjectType))
+    }
+
+    /// 程序化呈现（`navigationDestination(isPresented:)` / view-destination 页面）
+    /// 与 push 共用同一套两段式。
+    func pushPresented(_ present: @escaping @MainActor () -> Void) {
+        beginRouteExit(land: present)
+    }
+
+    /// 设置 hub → 子页：普通 push（两段式 + path 驱动），载荷见 `SettingsSubpage`。
+    func openSettingsSubpage(_ subpage: SettingsSubpage) {
+        push(.settingsSubpage(subpage))
+    }
+
+    /// 关闭呈现式页面：`pushPresented` 的对称出口。
+    ///
+    /// 这类页面不在 `path` 上（`isPresented` 是另一套呈现机制，栈里看不见它），
+    /// 走 `back()` 会被 `guard !path.isEmpty` 挡掉——自绘返回键点下去毫无反应
+    /// （下载管理 / 资源搜索 / 管理服务器 / 开源许可证都踩过）。所以呈现式页面
+    /// 的返回键必须显式把自己的落地开关交进来（见
+    /// `appShellBackChrome(title:presented:)`），不能走 `back()`。
+    ///
+    /// 时序与 `back()` 一致：关闭本身是硬切（实测离场页 onDisappear 只比落地晚
+    /// ~20ms），恢复拍不额外等待。
+    func popPresented(_ dismiss: @escaping @MainActor () -> Void) {
+        beginRouteExit(land: dismiss)
+    }
+
+    /// 分区切换（顶栏药丸）：常规布局走与 push 相同的两段式——当前页淡出后
+    /// 再换分区；compact（iPhone Tab）系统自带切换动画，直切。
+    func switchSection(_ section: Section) {
+        if isCompact || reduceMotion || section == selectedSection {
+            selectedSection = section
+            return
+        }
+        beginRouteExit { [weak self] in
+            self?.selectedSection = section
+        }
+    }
+
+    private func push(_ route: Route) {
+        beginRouteExit { [weak self] in
+            guard let self else { return }
+            if isCompact {
+                compactPath.append(route)
+            } else {
+                // 落地禁动画：系统 push 滑动会与 routeExiting 复位的回弹淡入
+                // 叠加（页面边滑入边淡入，肉眼可见左移）；入场观感由两段式
+                // 唯一承担，与 pop 侧 `back()` 的禁动画落地对称。
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) { self.path.append(route) }
+            }
+        }
+    }
+
+    /// 返回上一层（自绘返回键）：与 push 对称的两段式——当前页淡出后再弹栈。
+    /// 系统返回键的 pop 是系统级滑出、不经 binding 拦不住，所以常规布局的
+    /// 返回键自绘（见 AppShellBackButton）；弹栈用禁动画 transaction 落地。
+    ///
+    /// **只管栈上的路由页**：呈现式页面（`navigationDestination(isPresented:)`）
+    /// 不在 `path` 里，`path` 为空时的返回是空操作——那种页面走 `popPresented`。
+    func back() {
+        guard !path.isEmpty else { return }
+        // 与 push 同一拍：弹栈落地同样禁动画，离场页随 path 变短**当帧移除**
+        // （实测 onDisappear 只比落地晚 ~10ms），恢复拍只留 0.05s 前置帧。
+        // 曾在此多等 Motion.exitSeconds：当年以为弹栈有系统过渡要遮、离场页
+        // 还在树里，实测无此事——白等 0.45s 只让落点页的淡入晚半拍，返回比
+        // 进入慢近一半（0.95s vs 1.4s）。
+        beginRouteExit { [weak self] in
+            guard let self else { return }
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) { _ = self.path.removeLast() }
+        }
+    }
+
+    /// 两段式换页（push / pop / 分区切换共用）：点击后当前页先淡出
+    /// （`Motion.exit`），淡出完成再执行 `land` 落地，落点/新页由淡出层回弹
+    /// 淡入（新页以隐藏态出生，routeExiting 复位即它的入场——全站唯一入场
+    /// 机制）。compact（iPhone）系统动画本来就在，reduceMotion 直切，都不等待。
+    /// pop 侧由自绘返回键调用。
+    ///
+    /// 两个方向的节奏**同拍**：淡出 0.45s → 落地 → 0.05s 前置帧 → 淡入 0.45s。
+    /// 落地（不论 push 建页还是 pop 撤页）都用禁动画 transaction，没有系统
+    /// 过渡参与，恢复拍不需要为谁多等。
+    func beginRouteExit(land: @escaping @MainActor () -> Void) {
+        if isCompact || reduceMotion {
+            land()
+            return
+        }
+        guard !routeExiting else { return }
+        routeExiting = true
+        // 会话代次快照：淡出期间若发生登出/换服/401（`resetBrowseState` 会自增），
+        // 这次换页的意图属于**旧会话**，落地必须作废——否则旧服务器的
+        // `.detail(item)` 会被 append 进新会话的空栈，表现为"刚登录就弹出一个
+        // 不存在于这台服务器的详情页"。`routeExiting` 由重置清掉，不会卡住。
+        let generation = routeExitGeneration
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(Motion.exitSeconds))
+            guard generation == routeExitGeneration else { return }
+            land()
+            // 恢复前留出前置拍：新页（push 落地新建的视图）必须先以隐藏态
+            // 提交一帧，routeExiting 复位的淡入才有 from-state。
+            try? await Task.sleep(for: .seconds(Motion.restoreDelay))
+            routeExiting = false
+        }
+    }
+
+    /// iOS 端当前选中 Tab 对应的导航路径数组。
+    private var compactPath: [Route] {
+        get { navPath(for: selectedSection) }
+        set { setNavPath(newValue, for: selectedSection) }
+    }
+
+    /// 首页的续播条目通常是 Episode；详情入口应落到所属电视剧，而不是单集。
+    /// 先复用首页已有的 Series 数据（最近添加 → 继续观看/接下来看里能带上的图），
+    /// 没有缓存时用父级 ID 构造轻量占位，DetailView 随后会按该 ID 拉取完整详情、季和分集。
+    func openSeriesDetail(for item: MediaItem) {
+        guard let seriesID = item.seriesID else {
+            openDetail(item)
+            return
+        }
+
+        let cachedSeries = home.latest.first {
+            $0.id == seriesID && $0.kind == .series
+        }
+        if let cachedSeries {
+            openDetail(cachedSeries)
+            return
+        }
+
+        // resume / nextUp 多半是 Episode：用条目上的 series 名 + 尽量带上已有图 tag，
+        // 减少详情页首帧海报空窗（完整字段仍由 DetailView 再拉）。
+        let related = (home.resume + home.nextUp).first { $0.seriesID == seriesID }
+        let series = MediaItem(
+            id: seriesID,
+            name: related?.seriesName ?? item.seriesName ?? item.name,
+            kind: .series,
+            primaryImageTag: related?.primaryImageTag ?? item.primaryImageTag,
+            thumbImageTag: related?.thumbImageTag ?? item.thumbImageTag,
+            backdropImageTag: related?.backdropImageTag ?? item.backdropImageTag
+        )
+        openDetail(series)
+    }
+
+    // MARK: - 派生
+
+    var currentUserLabel: String {
+        guard let server else { return "" }
+        let profile = server.profile
+        return profile.userName ?? profile.userID
+    }
+
+    var serverLabel: String {
+        guard let profile = server?.profile else { return "" }
+        let version = profile.serverVersion.map { " \($0)" } ?? ""
+        return "\(profile.serverName) · \(profile.kind.displayName)\(version)"
+    }
+}

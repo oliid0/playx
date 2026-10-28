@@ -1,0 +1,238 @@
+import CoreModel
+import Foundation
+
+/// 连接服务器时用户显式选择的网络协议。
+/// 存到 `baseURL` 里作为唯一事实源：两家的 API、图片、播放流全部从这里派生。
+public enum ServerScheme: String, Sendable {
+    case http
+    case https
+
+    /// 落进绝对 URL 的 scheme 文本。
+    public var schemeString: String { rawValue }
+
+    public init?(schemeString value: String) {
+        self.init(rawValue: value.lowercased())
+    }
+}
+
+/// 鉴权失效通知：已登录会话的请求收到 401 时发出，object = `ServerProfile.id`。
+/// 登录 / Quick Connect 接口自身的 401 是密码错误，**不**经过此通知。
+/// 接收方（App 根视图）按 profileID + 当前会话状态去重，引导用户重新登录。
+///
+/// 两家实现都发这条：Jellyfin 在 `send` 的出错包装里，Emby 在裸传输层里。
+public enum MediaServerAuthentication {
+    public static let authenticationRequired = Notification.Name(
+        "dev.jumusu.OcPlayer.server.authenticationRequired")
+}
+
+/// 列表接口（首页 rail / 库网格 / 合集成员）的 `fields` 口径，Jellyfin 与 Emby 两端共用。
+///
+/// 列表**默认不返回**这些扩展字段（实测 Jellyfin 12.1.0 不带 fields 时连
+/// `PrimaryImageAspectRatio` 都没有），此前列表条目只有标题和图 tag，点进详情页
+/// 首屏全靠二次请求。带上这几个字段后，列表条目本身就有简介 / 流派 / 评分，
+/// 详情页首屏可以直接渲染，`/Items/{id}` 只需要补演员表等重头字段。
+///
+/// **刻意不含 `People`**：演员表是列表 payload 的大头（每条十几人 × 24 条），
+/// 而演员区不是首屏关键——详情请求在点击瞬间由预取发出，晚一两百毫秒无感。
+/// `ProviderIds` 只是小字典且库级批量 TMDB 补全靠它，随列表一起带上。
+public enum MediaListFields {
+    /// 首页 rail / 库网格 / 合集成员统一口径。
+    public static let items =
+        "Overview,Genres,CommunityRating,OfficialRating,PrimaryImageAspectRatio,ProviderIds"
+}
+
+/// 媒体库单页结果。`totalRecordCount` 来自服务端；未知时为 nil。
+public struct MediaItemsPage: Sendable, Equatable {
+    public var items: [MediaItem]
+    public var startIndex: Int
+    public var totalRecordCount: Int?
+
+    public init(items: [MediaItem], startIndex: Int, totalRecordCount: Int?) {
+        self.items = items
+        self.startIndex = startIndex
+        self.totalRecordCount = totalRecordCount
+    }
+
+    /// 是否还能向后翻页（总数未知时以本页是否满页为准）。
+    public var hasMore: Bool {
+        if let totalRecordCount {
+            return startIndex + items.count < totalRecordCount
+        }
+        return !items.isEmpty
+    }
+}
+
+/// 播放进度上报。
+///
+/// 单独成一个协议而不是直接挂在 `MediaServer` 上：它只有 3 条方法，而消费方
+/// （播放上报协调器）只需要这 3 条 —— 依赖最窄的契约，测试替身就不必实现
+/// `MediaServer` 的另外 20 多条。生产侧两个实现都经 `MediaServer` 满足它。
+public protocol PlaybackReporting: Sendable {
+    func reportPlaybackStart(context: PlaybackSessionContext, positionSeconds: Double) async
+    func reportPlaybackProgress(
+        context: PlaybackSessionContext,
+        positionSeconds: Double,
+        isPaused: Bool
+    ) async
+    func reportPlaybackStopped(context: PlaybackSessionContext, positionSeconds: Double) async
+}
+
+/// 一台已登录媒体服务器的能力面：浏览、详情、图片、播放协商与进度上报。
+///
+/// Jellyfin 与 Emby 是同一血脉的两个产品，路由和值域都分叉，但**契约是同一条**。
+/// 两个实现刻意走不同的解码策略：
+///
+/// - `JellyfinServer` 用官方 `jellyfin-sdk-swift` 的强类型 DTO —— 它的值域就是
+///   Jellyfin 的值域，强解不会失败，也拿得到 SDK 的路由表与 Quick Connect。
+/// - `EmbyServer` 自己发裸 HTTP、解到本包自己的宽松 DTO —— Emby 的 `VideoRange`
+///   会报 "DolbyVision"、`MediaStreams[].Type` 会报 "Attachment"、`LockedFields`
+///   会报 "SortName"，这些都超出 Jellyfin SDK 的枚举值域，强解会整包炸。
+///   Emby 侧因此不接收类型，脏值在映射层落到 `.unknown` 而不是抛错。
+///
+/// 这不是为了整洁而分家：两侧需要的是**互不兼容的解码契约**。把它们塞进一个
+/// 强类型实现，代价是给 Jellyfin 的每个响应都套一层洗白，或者把两边都降成
+/// 无类型。
+///
+/// 注意协议里**不提供默认参数**：Swift 的协议要求不能带默认值，而用 extension
+/// 转发会和协议要求互相遮蔽（可能递归）。需要默认值的调用点显式传满。
+public protocol MediaServer: PlaybackReporting {
+    /// 该服务器的持久化档案（含 kind / baseURL / userID）。
+    var profile: ServerProfile { get }
+
+    /// 给内核（`open_with_headers`）和图片加载共用的认证头。
+    /// Jellyfin 用 `MediaBrowser` scheme，Emby 用 `Emby` scheme。
+    var authorizationHeader: String { get }
+
+    // MARK: - 浏览
+
+    /// 用户的媒体库列表（电影 / 剧集 / 音乐…）。
+    func userViews() async throws -> [MediaLibrary]
+    /// 首页「最近添加」：最近入库的电影 / 剧集（Jellyfin 侧按 `DateCreated` 倒序
+    /// 取，不用 `/Items/Latest`，原因见 `JellyfinServer.latestItems`）。
+    func latestItems(limit: Int) async throws -> [MediaItem]
+    /// 首页「继续观看」。
+    func resumeItems() async throws -> [MediaItem]
+    /// 「接下来看」：追剧下一集。
+    func nextUp() async throws -> [MediaItem]
+    /// 首页氛围背景取材：全库随机一批带 backdrop 的电影 / 剧集。
+    func randomBackdropItems(limit: Int) async throws -> [MediaItem]
+
+    /// 标记条目已看完，返回服务端最新的播放状态快照。
+    @discardableResult
+    func markPlayed(itemID: String) async throws -> MediaItem.PlayState
+    /// 取消已看标记，返回服务端最新的播放状态快照。
+    @discardableResult
+    func markUnplayed(itemID: String) async throws -> MediaItem.PlayState
+
+    // MARK: - 详情
+
+    /// 条目详情（含演员表 / 简介 / 流派）。
+    func item(_ id: String) async throws -> MediaItem
+    /// 条目的章节列表。
+    func chapters(itemID: String) async throws -> [JellyfinChapter]
+    /// 媒体库单页浏览。`searchTerm` 非空时为服务端标题搜索（Emby/Jellyfin 的
+    /// `/Items?searchTerm=`），结果仍受父库 / 类型 / 排序 / 观看状态约束。
+    func itemsPage(
+        parentID: String?,
+        kinds: [MediaItem.Kind]?,
+        recursive: Bool,
+        startIndex: Int,
+        limit: Int,
+        sort: MediaItemsSort?,
+        watchState: MediaItemsWatchState?,
+        searchTerm: String?
+    ) async throws -> MediaItemsPage
+    /// 媒体库网格浏览（拉全部分页）。
+    func items(
+        parentID: String?,
+        kinds: [MediaItem.Kind]?,
+        recursive: Bool,
+        limit: Int
+    ) async throws -> [MediaItem]
+    /// 剧集 → 季列表。
+    func seasons(seriesID: String) async throws -> [MediaItem]
+    /// 剧集 → 集列表（`seasonID` 为 nil 时返回全部）。
+    func episodes(seriesID: String, seasonID: String?) async throws -> [MediaItem]
+    /// 连播用：从 `startItemID` 起按服务端顺序取 `limit` 条（含它自己）。
+    func episodes(seriesID: String, startingAt startItemID: String, limit: Int) async throws -> [MediaItem]
+    /// 「类似推荐」。
+    func similar(itemID: String, limit: Int) async throws -> [MediaItem]
+
+    // MARK: - 当前用户
+
+    /// 当前登录用户头像的图 tag（服务端 `User.PrimaryImageTag`）；nil = 没设头像。
+    ///
+    /// 与条目图同一条规则：**没有 tag 就不要发请求**（那是一次必然 404 的白打）。
+    /// 拿它拼出的 URL 也自带缓存失效——用户换了头像，tag 变，URL 变，图片缓存自然
+    /// 不命中（与合集封面「无 tag 不发请求」同口径，见 CHANGELOG）。
+    ///
+    /// 头像在服务端是**可选**的：多数账号没有，调用方必须准备好回落图标。
+    func currentUserAvatarTag() async throws -> String?
+
+    /// 用户头像地址（不含 token，认证走请求头）。`tag` 来自 `currentUserAvatarTag()`
+    /// 或档案里缓存的 `ServerProfile.primaryImageTag`。
+    ///
+    /// **不做服务端缩放**：Jellyfin 12.x 的用户图端点只有 `userId` / `tag` / `format`
+    /// 三个参数，没有 `maxWidth`（与条目图不同）。显示尺寸交给调用方的
+    /// `maxPixelSize` 本地下采样——这样 Tab 图标与设置页共用同一条 URL、同一份缓存。
+    ///
+    /// 返回 nil = 档案地址畸形。地址形状：Jellyfin `/UserImage?userId=&tag=`、
+    /// Emby `/Users/{userId}/Images/Primary?tag=`。
+    func userImageURL(tag: String?) -> URL?
+
+    // MARK: - 媒体资源
+    /// 条目图片地址（不含 token，认证走请求头）。
+    func imageURL(itemID: String, type: ItemImageType, maxWidth: Int?, tag: String?) throws -> URL
+    /// 直连播放地址（认证走请求头，URL 里没有 token）。
+    func streamURL(itemID: String, mediaSourceID: String?, playSessionID: String?) throws -> String
+    /// 可跳过的片头 / 片尾片段。
+    func mediaSegments(itemID: String) async throws -> [JellyfinMediaSegment]
+    /// 条目的外挂字幕列表。
+    func externalSubtitles(itemID: String) async throws -> [ExternalSubtitle]
+    /// 下载外挂字幕到本地缓存，返回文件路径。
+    func downloadSubtitle(_ subtitle: ExternalSubtitle) async throws -> URL
+    /// 条目的文件级媒体信息；没有媒体源时 nil。
+    func mediaFileInfo(itemID: String) async throws -> MediaFileInfo?
+    /// 开播协商：拿可用的 MediaSource 列表与会话 id。
+    func playbackInfo(itemID: String) async throws -> PlaybackInfo
+}
+
+// MARK: - 合集（BoxSet）成员
+
+extension MediaServer {
+    /// 合集的**直接成员**（Jellyfin / Emby 的 Collection / BoxSet 里的条目）。
+    ///
+    /// 三条约束收在这里，因为两处调用点（详情页的「合集内容」、库网格的封面解析）
+    /// 需要的是**同一个**查询形态——各写一遍就是下一个漂移点：
+    ///
+    /// - **`recursive: false`**：合集成员存在服务端的 `LinkedChildren` 里，非递归只给
+    ///   直接成员；递归会走 `DescendantOfId` 一路往下（服务端单测
+    ///   `DescendantOfId_ReachesEpisodesOfALinkedSeries` 断言了这点），合集里放一部剧
+    ///   就会把它的季与集一起带出来。
+    /// - **不传 `kinds`**（即不发 `includeItemTypes`）：Jellyfin 的 `ItemsController`
+    ///   一旦发现 `parentId` 是合集且同时带了 `includeItemTypes`，会把 `parentId` **置空**
+    ///   改成从用户根重查——返回的是「所有合集」而不是这个合集的成员
+    ///   （[jellyfin#16454]；本机 12.1.0 实测带与不带该参数结果相同，正是这条重定根逻辑）。
+    /// - **排序显式给年份升序**：不传 sortBy 时服务端按合集自己的 `DisplayOrder`
+    ///   （默认 PremiereDate）排，而该字段不在 `MediaItemsSortField` 值域里；显式指定
+    ///   才可复现（副键 `SortName` 保证同年内稳定）。
+    /// - Parameter startIndex: 分页起点（合集成员可能多于一页，详情页「加载更多」用它）。
+    public func collectionMembers(
+        of itemID: String,
+        startIndex: Int = 0,
+        limit: Int = Self.collectionMembersDefaultLimit
+    ) async throws -> MediaItemsPage {
+        try await itemsPage(
+            parentID: itemID,
+            kinds: nil,
+            recursive: false,
+            startIndex: startIndex,
+            limit: limit,
+            sort: MediaItemsSort(field: .year, ascending: true),
+            watchState: nil,
+            searchTerm: nil)
+    }
+
+    /// 合集成员一页的默认条数。上限的意思：只为挑选/取图时不必拉全量。
+    public static var collectionMembersDefaultLimit: Int { 200 }
+}

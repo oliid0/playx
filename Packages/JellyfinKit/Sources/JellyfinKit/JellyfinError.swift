@@ -1,0 +1,157 @@
+import DiagnosticsKit
+import Foundation
+import Get
+
+/// Jellyfin 层错误：包一层并给出用户能看懂的话。
+/// UI 只需要 `localizedDescription`，具体技术细节留在 `underlying`。
+public struct JellyfinError: Error, LocalizedError {
+    public enum Kind: Sendable {
+        /// URL 填得没法解析。
+        case badServerURL
+        /// 服务器没响应 / 不是 Jellyfin（`/System/Info/Public` 失败）：
+        /// 名字解析不了、或被拒绝连接。**多半是地址 / 端口的问题**。
+        case serverUnreachable
+        /// 本机当前没有网络路径（`NSURLErrorNotConnectedToInternet`）。
+        ///
+        /// 与 `serverUnreachable` 分开的理由是两者的**处置方式完全相反**：
+        /// 这个去检查地址是白费力气（地址没错），而它是可重试的瞬态
+        /// （冷启动时网络常常还没就绪，实测网络就绪后同样的请求立刻成功）。
+        case noNetwork
+        /// 401：账号密码错 / token 过期。
+        case unauthorized
+        /// 403：权限不足 / 账号被禁用。
+        case forbidden
+        /// Quick Connect：服务器没开（管理员可在控制台关闭）。
+        case quickConnectDisabled
+        /// Quick Connect：轮询到上限还没授权。
+        case quickConnectTimeout
+        /// 其它 HTTP 错误。
+        case http(status: Int)
+        /// 网络层错误（断网、DNS…）。
+        case transport(String)
+        /// 解码失败等。
+        case other(String)
+    }
+
+    public let kind: Kind
+    public let underlying: (any Error)?
+
+    public init(_ kind: Kind, underlying: (any Error)? = nil) {
+        self.kind = kind
+        self.underlying = underlying
+    }
+
+    /// 把 SDK / URLSession 抛的任意错误归到上面几类。
+    /// 注意顺序：`APIError` / `JellyfinError` 是 enum，**先**判原类型，**最后**才桥接成 `NSError`。
+    /// 反过来（先 `as NSError`）会让 enum 被桥接掉，`as? APIError` 永远失败，
+    /// 401/404 等 HTTP 错误全部漏进 `.other`/transport，登录报错和 Quick Connect 提示都错乱。
+    public static func wrap(_ error: any Error) -> JellyfinError {
+        if let apiError = error as? APIError {
+            return wrapAPI(apiError)
+        }
+        if let jellyfinError = error as? JellyfinError {
+            return jellyfinError
+        }
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain {
+            return wrapTransport(ns)
+        }
+        return JellyfinError(.other(ns.localizedDescription), underlying: error)
+    }
+
+    /// 与 `wrap` 搭配的 throw 口：取消原样透传（不包壳），其余归一成 JellyfinError。
+    /// 包壳会把用户/任务取消变成一条 `.transport` 错误文案，UI 的
+    /// `catch let error as JellyfinError` 就会把取消弹成错误框。
+    public static func wrapPreservingCancellation(_ error: any Error) -> any Error {
+        isCancellation(error) ? error : JellyfinError.wrap(error)
+    }
+
+    /// 任务取消（`CancellationError`）与 `URLSession` 中断（`URLError.cancelled`）都算。
+    ///
+    /// 实现委托给 `DiagnosticsKit.CancellationClassifier` —— 判据要**一个真源**，
+    /// 各包各抄一份必然漂移（本仓已因只认 `CancellationError` 而把正常取消记成
+    /// warning 过一次）。
+    public static func isCancellation(_ error: any Error) -> Bool {
+        CancellationClassifier.isCancellation(error)
+    }
+
+    /// 连不上（DNS / 拒绝连接 / 断网）给出可操作的「检查地址」提示；
+    /// 超时、连接中断等其它传输错误带具体细节，方便区分「地址写错」和「网络抽风」。
+    /// ⚠️ `NSURLErrorNotConnectedToInternet` **单独归为 `.noNetwork`**，不并进
+    /// `.serverUnreachable`。此前四码同归一类，两个后果都是实机日志暴露的：
+    /// 1. 文案误导——本机根本没网时提示「确认地址没打错」，用户会去改一个没错的地址；
+    /// 2. 重试判定错——它落进"地址问题 → 不重试"那一档，而"启动瞬间网络还没就绪"
+    ///    恰恰是最典型的瞬态失败（实测冷启动时 Jellyfin 五个请求全 -1009，
+    ///    网络就绪后同样的请求 85–583 ms 全部成功）。
+    private static func wrapTransport(_ ns: NSError) -> JellyfinError {
+        switch ns.code {
+        case NSURLErrorCannotFindHost,
+             NSURLErrorCannotConnectToHost,
+             NSURLErrorDNSLookupFailed:
+            JellyfinError(.serverUnreachable, underlying: ns)
+        case NSURLErrorNotConnectedToInternet:
+            JellyfinError(.noNetwork, underlying: ns)
+        default:
+            JellyfinError(.transport(ns.localizedDescription), underlying: ns)
+        }
+    }
+
+    private static func wrapAPI(_ error: APIError) -> JellyfinError {
+        switch error {
+        case let .unacceptableStatusCode(status):
+            JellyfinError.status(status, underlying: error)
+        }
+    }
+
+    /// HTTP 状态码 → 错误种类。SDK 层（`wrapAPI`）与 Emby 的裸传输层共用同一张
+    /// 表，避免两处对 401/403 的解释跑偏。
+    static func status(_ code: Int, underlying: (any Error)? = nil) -> JellyfinError {
+        switch code {
+        case 401: JellyfinError(.unauthorized, underlying: underlying)
+        case 403: JellyfinError(.forbidden, underlying: underlying)
+        default: JellyfinError(.http(status: code), underlying: underlying)
+        }
+    }
+
+    public var errorDescription: String? {
+        switch kind {
+        case .badServerURL:
+            "服务器地址看起来不对，试试「http://192.168.1.10:8096」这样的。"
+        case .serverUnreachable:
+            "连不上服务器：确认地址没打错、这台机器能访问到它。"
+        case .noNetwork:
+            "这台机器当前没有网络连接：检查 Wi-Fi / 网线后重试。"
+        case .unauthorized:
+            "认证失败：密码不对，或登录已过期需要重新登录。"
+        case .forbidden:
+            "访问被拒绝：账号权限不足或已被管理员禁用。"
+        case .quickConnectDisabled:
+            "这台服务器没有开启 Quick Connect（管理员可在 控制台 → 登录 里打开），请用账号密码登录。"
+        case .quickConnectTimeout:
+            "等了很久都没确认：请重新发起 Quick Connect。"
+        case .http(let status):
+            "服务器返回了 HTTP \(status)。"
+        case .transport(let text):
+            "网络错误：\(text)"
+        case .other(let text):
+            text
+        }
+    }
+}
+
+extension JellyfinError {
+    /// 这条失败是不是「**地址本身**可能不通」那一类 —— 决定要不要换地址重试。
+    ///
+    /// 只认传输层：连不上、解析不了、连接中断。HTTP 状态码一律不算 —— 服务器
+    /// 已经答了话，说明这条地址是通的（换一条只会把同一个 5xx 再撞一遍）。
+    /// `.noNetwork` 也不算：本机压根没网时换哪条地址都一样，只会白白多一轮探活。
+    var isAddressFailure: Bool {
+        switch kind {
+        case .transport, .serverUnreachable:
+            return true
+        case .badServerURL, .noNetwork, .unauthorized, .forbidden,
+             .quickConnectDisabled, .quickConnectTimeout, .http, .other:
+            return false
+        }
+    }
+}

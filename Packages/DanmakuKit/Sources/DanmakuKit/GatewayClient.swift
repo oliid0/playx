@@ -1,0 +1,429 @@
+import DiagnosticsKit
+import Foundation
+
+/// 网关诊断日志。常规请求只记 path；匹配参数只记形态元数据，绝不记录
+/// hash、文件名、URL/query 或凭据（脱敏器对 `api_key` 类 key 另有兜底）。
+/// 实现委托 DiagnosticsKit.NetworkLog，成功/失败级别与 cache 字段保留本网关的原有口径。
+enum DanmakuNetworkLog {
+    static func matchRequested(_ request: MatchRequest) {
+        let hashPresent = request.fileHash?
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        NetworkLog.report(category: "Danmaku", level: .debug, "匹配参数", fields: [
+            "hashPresent": .boolean(hashPresent),
+            "mode": .string(request.matchMode?.rawValue ?? "unspecified"),
+            "size": request.fileSize.map { .integer($0) } ?? .null,
+            "duration": request.videoDuration.map { .integer(Int64($0)) } ?? .null,
+        ])
+    }
+
+    static func requestSucceeded(_ path: String, cache: String?, duration: TimeInterval) {
+        NetworkLog.report(
+            category: "Danmaku",
+            level: .info,
+            "请求成功 path=\(path) cache=\(cache ?? "nil") duration_ms=\(Int(duration * 1000))"
+        )
+    }
+
+    static func requestFailed(_ path: String, error: Error, duration: TimeInterval) {
+        NetworkLog.report(
+            category: "Danmaku",
+            level: .warning,
+            "请求失败 path=\(path) error=\(error) duration_ms=\(Int(duration * 1000))"
+        )
+    }
+
+    static func requestRetried(_ path: String, attempt: Int, totalAttempts: Int, error: Error) {
+        NetworkLog.report(
+            category: "Danmaku",
+            level: .debug,
+            "请求重试 path=\(path) 尝试=\(attempt)/\(totalAttempts) error=\(error)"
+        )
+    }
+}
+
+// MARK: - 错误
+
+/// 弹幕网关调用错误。
+public enum DandanplayError: Error, Equatable, Sendable {
+    /// 网关地址未配置或格式无效。
+    case notConfigured
+    /// HTTP 401：API key 无效或缺失。
+    case unauthorized
+    /// HTTP 403：网关拒绝了请求（API Key 无效 / 被限制 / WAF 拦截）。
+    case forbidden
+    /// HTTP 429：每日额度或限流超限。`retryAfter` 取 Retry-After 头（秒），
+    /// 服务端没给就是 nil——对齐 BangumiError.rateLimited 的携带方式。
+    case rateLimited(retryAfter: TimeInterval?)
+    /// 弹弹play 业务侧返回 `success=false`（匹配/搜索）。
+    case businessError(code: Int, message: String?)
+    /// 网关返回了非 JSON 或无法解码的结构。
+    case decodingFailed(String)
+    /// 网络错误（连接失败、超时等）。
+    case network(URLError)
+    /// 其他 HTTP 错误状态。
+    case httpStatus(Int)
+    /// 请求参数不满足网关接口约束。
+    case invalidRequest(String)
+
+    public static func == (lhs: DandanplayError, rhs: DandanplayError) -> Bool {
+        switch (lhs, rhs) {
+        case (.notConfigured, .notConfigured),
+             (.unauthorized, .unauthorized),
+             (.forbidden, .forbidden):
+            return true
+        case let (.rateLimited(l), .rateLimited(r)):
+            return l == r
+        case let (.businessError(lc, lm), .businessError(rc, rm)):
+            return lc == rc && lm == rm
+        case let (.decodingFailed(l), .decodingFailed(r)):
+            return l == r
+        case let (.network(l), .network(r)):
+            return l.errorCode == r.errorCode
+        case let (.httpStatus(l), .httpStatus(r)):
+            return l == r
+        case let (.invalidRequest(l), .invalidRequest(r)):
+            return l == r
+        default:
+            return false
+        }
+    }
+}
+
+public extension DandanplayError {
+    /// 面向用户的稳定文案。需要上下文措辞的调用方（如搜索页）自行覆盖个别 case。
+    var userMessage: String {
+        switch self {
+        case .notConfigured: "弹幕网关未配置"
+        case .unauthorized: "网关 API Key 无效"
+        case .forbidden: "网关拒绝了请求（API Key 无效或已被限制）"
+        case .rateLimited: "弹幕请求额度已用完"
+        case .businessError(_, let message): message ?? "弹幕服务返回错误"
+        case .decodingFailed: "弹幕服务返回了无法解析的数据"
+        case .network: "弹幕网络请求失败"
+        case .httpStatus: "弹幕服务暂时不可用"
+        case .invalidRequest(let message): message
+        }
+    }
+}
+
+extension DandanplayError {
+    /// 瞬态错误判定：请求层重试 + 编排层短路共用同一口径。
+    /// 500 与 TLS/连接类错误也在集内：生产网关（CF Worker）偶发未捕获异常被 CF
+    /// 包成 500，本机到网关的链路还有 TLS 握手被重置的抖动——实测同一请求秒级
+    /// 重试即成功。接口全是幂等只读，重试安全；取消（-999）不在集内，换源
+    /// 取消不会被当故障重跑。429 尊重服务端 Retry-After。
+    var isRetryable: Bool {
+        switch self {
+        case .network(let urlError):
+            switch NetworkErrorClassifier.kind(for: urlError.errorCode) {
+            case .timedOut, .noConnection, .cannotConnect, .secureConnectionFailed: true
+            default: false
+            }
+        case .httpStatus(let code):
+            code == 500 || code == 502 || code == 503 || code == 504
+        case .rateLimited:
+            true
+        default:
+            false
+        }
+    }
+
+    /// 网关级故障：编排层任一降级层命中即短路剩余层。
+    ///
+    /// **必须是白名单**。此前写成「只要不是 businessError 就算网关故障」，于是
+    /// `.invalidRequest`（本次请求参数不对）、`.decodingFailed`（本次响应形状不符）、
+    /// `.httpStatus(4xx)` 也一并短路 —— 而这三种恰恰是**换一层参数就能救回来**的情况：
+    /// 降级链是「哈希 → TMDB → 标题 → 纯化标题」，各层请求参数不同，一层参数写错
+    /// 不代表后面几层也没救。短路它们会让本可匹配上的剧集直接判失败。
+    var isGatewayFailure: Bool {
+        switch self {
+        case .businessError, .invalidRequest, .decodingFailed:
+            // 网关是健康的，问题出在这一次请求上 → 继续换参数降级。
+            return false
+        case .httpStatus(let code) where (400..<500).contains(code):
+            // 4xx 同理：参数 / 路径问题，别的层用不同参数仍可能成功。
+            return false
+        case .network, .rateLimited, .notConfigured, .unauthorized, .forbidden, .httpStatus:
+            // 连不上 / 被限流 / 未配置 / 凭据无效 / 5xx：换参数无用，短路省掉几次白撞。
+            return true
+        }
+    }
+}
+
+// MARK: - 网关结果
+
+/// 带缓存命中标记的响应包装。`cacheStatus` 读自 `X-Gateway-Cache` 头。
+public struct GatewayResult<T: Sendable>: Sendable {
+    public let payload: T
+    public let cacheStatus: String?
+}
+
+// MARK: - 配置
+
+/// 弹幕网关调用配置。
+public struct DandanplayConfiguration: Sendable, Equatable {
+    public let baseURL: URL
+    public let apiKey: String
+    /// 必须以 `OcPlay/` 开头（网关强制校验），例 `OcPlay/1.0.0 (macOS; arm64)`。
+    public let userAgent: String
+
+    public init(baseURL: URL, apiKey: String, userAgent: String) {
+        self.baseURL = baseURL
+        self.apiKey = apiKey
+        self.userAgent = userAgent
+    }
+}
+
+// MARK: - 客户端
+
+/// 弹弹play 只读网关客户端。封装 `match` / `search` / `comments` 四个业务接口；
+/// 认证走 `X-API-Key` 头，身份标识走 `User-Agent`，AppSecret 永远不进客户端。
+///
+/// `URLSession` 可注入（测试用 mock 协议）；`retryPolicy` 复用共享层
+/// DiagnosticsKit.RetryPolicy——瞬态错误（超时/断网、502/503/504、429）自动重试，
+/// 判据见 `DandanplayError.isRetryable`，与 Bangumi 同口径。
+public struct DanmakuGatewayClient: Sendable {
+    public let configuration: DandanplayConfiguration
+    private let session: URLSession
+    private let retryPolicy: RetryPolicy
+
+    public init(
+        configuration: DandanplayConfiguration,
+        session: URLSession? = nil,
+        retryPolicy: RetryPolicy = RetryPolicy()
+    ) {
+        self.configuration = configuration
+        self.session = session ?? DanmakuNetworking.makeSession()
+        self.retryPolicy = retryPolicy
+    }
+
+    // MARK: 接口
+
+    /// `POST /v1/match` — 用 MD5 及所选模式需要的文件名/大小/时长匹配剧集。
+    public func match(_ request: MatchRequest) async throws -> GatewayResult<MatchResponse> {
+        DanmakuNetworkLog.matchRequested(request)
+        return try await post("/v1/match", body: validatedMatchRequest(request))
+    }
+
+    /// `GET /v1/search/anime` — 按标题搜索作品。
+    public func searchAnime(keyword: String) async throws -> GatewayResult<SearchAnimeResponse> {
+        try await get("/v1/search/anime", query: ["keyword": keyword])
+    }
+
+    /// `GET /v1/search/episodes` — 按作品名 / TMDB ID 搜索分集（手动匹配用）。
+    public func searchEpisodes(
+        anime: String? = nil,
+        tmdbId: Int? = nil,
+        tmdbIdType: Int = 0,
+        episode: String? = nil
+    ) async throws -> GatewayResult<SearchEpisodesResponse> {
+        var query: [String: String] = [:]
+        if let anime, !anime.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            query["anime"] = anime
+        }
+        if let tmdbId {
+            guard tmdbId >= 1 else {
+                throw DandanplayError.invalidRequest("tmdbId must be positive")
+            }
+            query["tmdbId"] = String(tmdbId)
+        }
+        guard query["anime"] != nil || query["tmdbId"] != nil else {
+            throw DandanplayError.invalidRequest("anime or tmdbId is required")
+        }
+        guard tmdbIdType == 0 || tmdbIdType == 1 else {
+            throw DandanplayError.invalidRequest("tmdbIdType must be 0 or 1")
+        }
+        if tmdbId != nil { query["tmdbIdType"] = String(tmdbIdType) }
+        if let episode, !episode.isEmpty { query["episode"] = episode }
+        return try await get("/v1/search/episodes", query: query)
+    }
+
+    /// `GET /v1/comments/{episodeId}` — 取某集弹幕。
+    /// 默认 `withRelated=true`（合并第三方来源）、`chConvert=0`（不繁简转换），对齐网关默认。
+    public func comments(episodeId: Int64) async throws -> GatewayResult<CommentResponse> {
+        guard episodeId >= 0 else {
+            throw DandanplayError.invalidRequest("episodeId must be non-negative")
+        }
+        return try await get("/v1/comments/\(episodeId)", query: ["withRelated": "true", "chConvert": "0"])
+    }
+
+    // MARK: 内部
+
+    private func get<T: Decodable & Sendable>(
+        _ path: String,
+        query: [String: String] = [:]
+    ) async throws -> GatewayResult<T> {
+        let baseURL = try validatedBaseURL()
+        var components = URLComponents(url: baseURL.appendingPathComponent(path),
+                                       resolvingAgainstBaseURL: false)
+        if !query.isEmpty {
+            components?.queryItems = query
+                .sorted { $0.key < $1.key }
+                .map { URLQueryItem(name: $0.key, value: $0.value) }
+        }
+        guard let url = components?.url else { throw DandanplayError.notConfigured }
+        return try await send(url: url, method: "GET", body: nil)
+    }
+
+    private func post<T: Decodable & Sendable, B: Encodable & Sendable>(
+        _ path: String,
+        body: B
+    ) async throws -> GatewayResult<T> {
+        let url = try validatedBaseURL().appendingPathComponent(path)
+        let bodyData = try JSONEncoder().encode(body)
+        return try await send(url: url, method: "POST", body: bodyData)
+    }
+
+    private func validatedBaseURL() throws -> URL {
+        let url = configuration.baseURL
+        guard url.scheme?.lowercased() == "https",
+              !(url.host?.isEmpty ?? true),
+              url.user == nil,
+              url.password == nil,
+              url.query == nil,
+              url.fragment == nil,
+              url.path.isEmpty || url.path == "/"
+        else { throw DandanplayError.invalidRequest("baseURL must be an HTTPS origin") }
+        return url
+    }
+
+    private func validatedMatchRequest(_ request: MatchRequest) throws -> MatchRequest {
+        var request = request
+        request.fileName = request.fileName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if request.fileName?.isEmpty == true { request.fileName = nil }
+        request.fileHash = request.fileHash?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if request.fileHash?.isEmpty == true { request.fileHash = nil }
+
+        guard let hash = request.fileHash else {
+            throw DandanplayError.invalidRequest("fileHash 是生产匹配接口的必填参数")
+        }
+        let isASCIIHexMD5 = hash.utf8.count == 32 && hash.utf8.allSatisfy {
+            (48...57).contains($0) || (97...102).contains($0)
+        }
+        if !isASCIIHexMD5 {
+            throw DandanplayError.invalidRequest("fileHash 必须是 32 位十六进制 MD5")
+        }
+        if let size = request.fileSize, size < 0 {
+            throw DandanplayError.invalidRequest("fileSize 不能小于 0")
+        }
+        if let duration = request.videoDuration, duration <= 0 {
+            throw DandanplayError.invalidRequest("videoDuration 必须大于 0")
+        }
+        switch request.matchMode {
+        case .hashAndFileName where request.fileName == nil:
+            throw DandanplayError.invalidRequest("hashAndFileName 需要 fileHash 和 fileName")
+        case .fileNameOnly where request.fileName == nil:
+            throw DandanplayError.invalidRequest("fileNameOnly 需要 fileHash 和 fileName")
+        default:
+            break
+        }
+        return request
+    }
+
+    private func send<T: Decodable & Sendable>(
+        url: URL,
+        method: String,
+        body: Data?
+    ) async throws -> GatewayResult<T> {
+        var spec = HTTPRequestSpec(url: url, method: method)
+        spec.headers = [
+            "X-API-Key": configuration.apiKey,
+            "User-Agent": configuration.userAgent,
+            "Content-Type": "application/json",
+        ]
+        spec.body = body
+
+        let logPath = url.path
+        // 重试只对瞬态错误生效（DandanplayError.isRetryable）；CancellationError 由
+        // 共享层直接上抛不重试，URLError.cancelled 不在重试集里。业务错误与 4xx
+        // 一次性上抛，行为与接入重试前一致。
+        return try await retryPolicy.run {
+            try await self.performExchange(spec: spec, logPath: logPath)
+        } shouldRetry: { error in
+            (error as? DandanplayError)?.isRetryable == true
+        } retryAfterProvider: { error in
+            if case .rateLimited(let retryAfter) = error as? DandanplayError { return retryAfter }
+            return nil
+        } onRetry: { attempt, error in
+            DanmakuNetworkLog.requestRetried(
+                logPath, attempt: attempt + 1, totalAttempts: retryPolicy.attempts, error: error)
+        }
+    }
+
+    /// 单次尝试：传输与计时日志走共享执行器（DiagnosticsKit.HTTPClient）；这里只留
+    /// 网关自己的语义：业务基座判定、401/403/429 映射、缓存命中日志。
+    private func performExchange<T: Decodable & Sendable>(
+        spec: HTTPRequestSpec,
+        logPath: String
+    ) async throws -> GatewayResult<T> {
+        let start = Date()
+        let exchange: HTTPExchange
+        do {
+            exchange = try await HTTPClient(session: session, category: "Danmaku").exchange(spec)
+        } catch let transport as HTTPTransportError {
+            switch transport {
+            case .url(let urlError):
+                throw DandanplayError.network(urlError)
+            case .nonHTTP, .status:
+                throw DandanplayError.decodingFailed("非 HTTP 响应")
+            case .other(let description):
+                throw DandanplayError.decodingFailed(description)
+            }
+        }
+
+        let duration = Date().timeIntervalSince(start)
+        let cache = exchange.response.value(forHTTPHeaderField: "X-Gateway-Cache")
+        switch exchange.statusCode {
+        case 200..<300:
+            // 单遍解码：match/search 的 T 自带基座字段，解码后直接判 success，
+            // 不再先整包 decode(ResponseBase) 把数 MB 的 comments 解两遍。
+            // T 解码失败时回退基座判定——业务错误载荷（success=false）缺业务
+            // 字段，T 必然解失败，靠这一步保留 businessError 语义。
+            do {
+                let payload = try JSONDecoder().decode(T.self, from: exchange.data)
+                if let base = payload as? GatewayBaseChecking, !base.success {
+                    let error = DandanplayError.businessError(
+                        code: base.errorCode ?? -1, message: base.errorMessage)
+                    DanmakuNetworkLog.requestFailed(logPath, error: error, duration: duration)
+                    throw error
+                }
+                DanmakuNetworkLog.requestSucceeded(logPath, cache: cache, duration: duration)
+                return GatewayResult(payload: payload, cacheStatus: cache)
+            } catch let error as DandanplayError {
+                throw error
+            } catch {
+                if let base = try? JSONDecoder().decode(ResponseBase.self, from: exchange.data), !base.success {
+                    let businessError = DandanplayError.businessError(
+                        code: base.errorCode ?? -1, message: base.errorMessage)
+                    DanmakuNetworkLog.requestFailed(logPath, error: businessError, duration: duration)
+                    throw businessError
+                }
+                DanmakuNetworkLog.requestFailed(logPath, error: error, duration: duration)
+                throw DandanplayError.decodingFailed("\(error)")
+            }
+        case 401:
+            throw DandanplayError.unauthorized
+        case 403:
+            throw DandanplayError.forbidden
+        case 429:
+            throw DandanplayError.rateLimited(retryAfter: exchange.retryAfter)
+        default:
+            throw DandanplayError.httpStatus(exchange.statusCode)
+        }
+    }
+}
+
+/// match/search 响应共享的业务基座字段：单遍解码后据此判业务错误。
+/// comments（CommentResponse）不带基座，不遵守此协议、不参与判定。
+protocol GatewayBaseChecking {
+    var success: Bool { get }
+    var errorCode: Int? { get }
+    var errorMessage: String? { get }
+}
+
+/// match/search 响应共享的 ResponseBase 基座，用于在解码 payload 前先校验 `success`。
+private struct ResponseBase: Decodable {
+    let success: Bool
+    let errorCode: Int?
+    let errorMessage: String?
+}

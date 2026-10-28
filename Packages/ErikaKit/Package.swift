@@ -43,5 +43,7 @@ let package = Package(
         ),
 
         .target(name: "ErikaKit", dependencies: ["CErika", "DiagnosticsKit", "PlaybackKit"]),
+
+        .testTarget(name: "ErikaKitTests", dependencies: ["ErikaKit"]),
     ]
 )

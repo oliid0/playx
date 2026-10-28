@@ -1,0 +1,754 @@
+import DiagnosticsKit
+import Foundation
+
+/// v3 的 `ResponseAPIRouter` 会把大多数路由的返回**自动包进** `{success, message, data}`
+/// 信封（用户信息、媒体搜索、下载列表都中招）；少数端点又是裸返回（显式声明
+/// Response 的、raw 标记的、OAuth2 token）。与其逐端点猜，运行时探测统一剥壳：
+/// 顶层是对象且**同时带 `success` 和 `data`** 才剥一层，其余原样返回——裸数组、
+/// 裸对象都不满足条件，天然不受影响。
+/// MoviePilot 的响应信封：`{"success": true, "data": <真正的负载>}`。
+///
+/// ## 为什么要先做「浅判定」
+///
+/// 改前对**每一个**响应都先 `JSONSerialization.jsonObject` 全量解析，带信封时
+/// 再把 `data` 序列化回 `Data` 交给 `JSONDecoder` —— 一次响应**解析两遍**，
+/// 而且第一遍是 Foundation 的 `Any` 树（装箱、`NSNumber`/`NSString`），比直接
+/// `Decodable` 解码慢得多。
+///
+/// 现在先看**首个非空白字节**：
+/// - `[` → 不可能是信封（信封是对象），**直接原样返回**，零解析；
+/// - 其它（`{` 或异常）才走信封判定。
+///
+/// 这一条把「裸数组响应」这条最常见的路径变成 O(1)。
+enum MPEnvelope {
+    static func unwrap(_ data: Data) -> Data {
+        // 首个非空白字节：用 `firstIndex(where:)` 而不是建字符串（避免一次拷贝）。
+        let firstSignificant = data.first { byte in
+            byte != 0x20 && byte != 0x0A && byte != 0x0D && byte != 0x09
+        }
+        // 裸数组不可能是信封：省掉整棵 JSON 树的构造。
+        if firstSignificant == UInt8(ascii: "[") { return data }
+
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object.keys.contains("success"),
+              let inner = object["data"]
+        else { return data }
+        // ⚠️ `JSONSerialization.data(withJSONObject:)` 只接受**容器**（数组/字典）；
+        // 顶层的 `String` / `NSNumber` / `NSNull` 会抛 **NSInvalidArgumentException**，
+        // 而那是 ObjC 异常、`try?` **接不住** —— App 里直接崩（实测 exit 134）。
+        //
+        // 这不是理论问题：`{"success":true,"data":"..."}` / `data:null` 这两种形态在
+        // 真实响应里存在（新 API 返回裸字符串 / 无内容时）。改前它们在**信封路径**上
+        // 必崩 —— 本批顺带修掉的**两个既有崩溃**。
+        //
+        // ⚠️ **守卫必须 O(1)**：早先我写的是 `JSONSerialization.isValidJSONObject(inner)`，
+        // 而它是**深遍历** —— 实测 7.6 KB 的 120 对象数组要 **72.35 µs**，
+        // 比整个 `data(withJSONObject:)`（84.59 µs）只少一点。于是信封主路径被拖慢
+        // 19%–58%（审查实测 5.4/7.6/15.5 KB 与 1.1 MB 四档），而代码注释自己说
+        // 「大多数路由都会自动包信封」——**净负收益**。
+        // `is NSArray` / `is NSDictionary` 是纯类型判断：实测 **0.03 µs（2410×）**。
+        guard inner is NSArray || inner is NSDictionary else { return data }
+        return (try? JSONSerialization.data(withJSONObject: inner)) ?? data
+    }
+
+    /// 一次解析搞定「剥信封 + 转成 `[String: JSONValue]` 数组」（`P2-22`）。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// `MPMediaInfo` / `MPDownloadTask` / `MPSite` 都不是 `Codable` —— 它们要的是
+    /// 原始的 `[String: JSONValue]`（下载时整个对象原样回传服务端）。原路径是：
+    ///
+    /// 1. `unwrap(data)` → `JSONSerialization.jsonObject`（**全量解析成 Any 树**）
+    /// 2. → `JSONSerialization.data(withJSONObject:)`（**再序列化回 Data**）
+    /// 3. → `JSONDecoder().decode([[String: JSONValue]].self, ...)`（**第二遍全量解析**，
+    ///    而且是 `try?` 瀑布：每个值依次 `try?` Bool / Double / String / Array / Object）
+    ///
+    /// **一份数据解析三遍**。`JSONValue` 的瀑布解码单独测就有
+    /// **44.62 ms / 243 KB**（300 个对象），是等效扁平 `Codable` 的 **19.4×**。
+    ///
+    /// 现在只解析**一遍**：`JSONSerialization` 拿 `Any` 树，剥信封后直接
+    /// `JSONValue(any:)` 转换。实测 **28.47 ms → 7.92 ms（3.6×，省 20.6 ms）**
+    /// （同一个 243 KB 信封响应）。
+    ///
+    /// ## 为什么值得（不是微秒级）
+    ///
+    /// `downloadingTasks()` 在下载页是 **5 秒轮询**的（`DownloadsPollingPolicy`），
+    /// 所以这 20 ms 是**每 5 秒一次的持续开销**，不是一次性。
+    ///
+    /// - Parameter data: 原始响应体（可带 `{success, data}` 信封）。
+    /// - Throws: JSON 损坏，或剥壳后不是对象数组。
+    static func unwrapObjects(_ data: Data) throws -> [[String: JSONValue]] {
+        let parsed: Any
+        do {
+            parsed = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        } catch {
+            throw MoviePilotError.generic("响应不是合法 JSON")
+        }
+        // 与 `unwrap` 同语义：顶层是对象且**同时**带 `success` 与 `data` 才剥一层。
+        let payload: Any
+        if let object = parsed as? [String: Any],
+           object.keys.contains("success"),
+           let inner = object["data"] {
+            payload = inner
+        } else {
+            payload = parsed
+        }
+        // 这里不像 `unwrap` 那样需要防 `data(withJSONObject:)` 的 ObjC 异常 ——
+        // 新路径**不回序列化**，所以 `data` 是字符串/数字/null 时只是转换失败。
+        guard let array = payload as? [Any] else {
+            throw MoviePilotError.generic("响应不是对象数组")
+        }
+        // ## ⚠️ 不能用 `compactMap`（会**静默丢弃**非对象元素）
+        //
+        // 旧路径是 `JSONDecoder.decode([[String: JSONValue]].self, ...)`：数组里混进
+        // 任何非对象元素（`[{"a":1}, "oops", 5]`）都会**抛 `DecodingError`**。
+        //
+        // 第一版这里写的是 `compactMap { $0 as? [String: Any] }` —— 实测同样输入会
+        // **静默返回 1 个元素、丢掉 2 个**。那等于把「服务端返回了畸形数据」变成
+        // 「一切正常，只是少了几个条目」，问题被埋掉。
+        //
+        // 所以这里逐个严格校验：任一项不是对象就抛错，与旧路径一致。
+        var result: [[String: JSONValue]] = []
+        result.reserveCapacity(array.count)
+        for element in array {
+            guard let object = element as? [String: Any] else {
+                throw MoviePilotError.generic("响应数组里存在非对象元素")
+            }
+            result.append(object.mapValues(JSONValue.init(any:)))
+        }
+        return result
+    }
+}
+
+/// MoviePilot 网络层诊断日志。只记请求路径与错误摘要，token / 密码绝不进日志。
+/// 实现委托 DiagnosticsKit.NetworkLog（按 category 共享 logger），保留公开 API 形状。
+public enum MoviePilotNetworkLog {
+    public static let logger = NetworkLog.logger(category: "MoviePilot")
+
+    static func requestStarted(_ path: String) {
+        NetworkLog.requestStarted(category: "MoviePilot", path: path)
+    }
+
+    static func requestSucceeded(_ path: String, duration: TimeInterval, level: DiagnosticLevel = .debug) {
+        NetworkLog.requestSucceeded(category: "MoviePilot", path: path, duration: duration, level: level)
+    }
+
+    static func logPath(for url: URL?) -> String {
+        NetworkLog.logPath(for: url)
+    }
+}
+
+/// MoviePilot 底层 HTTP 客户端：登录换 token、401 静默重登、带鉴权的请求。
+///
+/// MoviePilot 是密码登录换 JWT（8 天有效期，**没有刷新端点**），所以凭证生命周期
+/// 比 Bangumi 简单得多：带鉴权的请求撞 401 时用存下的密码重登一次并重放请求，
+/// 重登也失败（密码改了）才清 token、广播通知，要求用户重新登录。
+/// generation 代际照抄 Bangumi 的思路：登录 / 登出推进代际，在途请求醒来发现
+/// 代际不匹配就自我作废，避免陈旧凭证覆盖新凭证。
+public actor MoviePilotAPIClient {
+    /// 请求体编码器（**复用**）。
+    ///
+    /// 实测每次现建 `JSONEncoder` 多花 **2.08 µs**（5.68 vs 3.60 µs，小的 Codable 体）；
+    /// 而 Bangumi 那条路径还在**重试闭包内部**，一次失败就重复构造。
+    /// `JSONEncoder` 是类（引用类型），复用没有线程安全问题 —— 它不持有可变状态。
+    nonisolated private static let encoder = JSONEncoder()
+
+    public static let shared = MoviePilotAPIClient()
+
+    /// token 失效且静默重登失败时发（object 是 NSNumber 包着的 generation，
+    /// 供 UI 判断是否仍是当前凭证）。
+    public static let authenticationRequiredNotification = Notification.Name(
+        "MoviePilotAPIClientAuthenticationRequired")
+
+    private let store: MoviePilotStore
+    private let session: URLSession
+    /// SSE 流式搜索专用：`timeoutIntervalForResource` 不能按请求覆盖，而站点
+    /// 聚合搜索整场可以跑几分钟，普通会话 30s 就会把流掐断。
+    private let streamSession: URLSession
+
+    private var authGeneration: UInt64 = 0
+    /// 单飞的静默重登：并发请求同时撞 401 时只登一次，其余等同一个 Task。
+    private var reloginTask: Task<String, Error>?
+    private var reloginGeneration: UInt64 = 0
+    /// 静默重登熔断标记：上次静默重登成功/被拒时的 authGeneration。等于当前
+    /// 代际说明这个密码已经换不来有效凭证（或刚换来仍被 401），重试循环里
+    /// 不再连发带密码的 login。凭据/会话变化时重置。
+    private var reloginExhaustedGeneration: UInt64?
+
+    public init(
+        store: MoviePilotStore = .shared,
+        sessionConfiguration: URLSessionConfiguration = .default
+    ) {
+        self.store = store
+        // 复制后再改：直接改写入参 configuration 会污染调用方手里的对象
+        //（共享 .default 的属性是进程级单例，改动影响全局）。
+        let configuration = (sessionConfiguration.copy() as? URLSessionConfiguration)
+            ?? URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 15
+        configuration.timeoutIntervalForResource = 30
+        configuration.httpAdditionalHeaders = [
+            "User-Agent": "OcPlayer/0.1 (MoviePilotKit)",
+        ]
+        self.session = URLSession(configuration: configuration)
+
+        // 流式会话：请求间空闲 30s 超时（心跳 15s 兜着），整场 5 分钟上限。
+        // cookie 存储跟随原配置（默认共享，登录种的 resource cookie 全局可见）。
+        let streamConfiguration = (sessionConfiguration.copy() as? URLSessionConfiguration)
+            ?? URLSessionConfiguration.default
+        streamConfiguration.timeoutIntervalForRequest = 30
+        streamConfiguration.timeoutIntervalForResource = 300
+        self.streamSession = URLSession(configuration: streamConfiguration)
+    }
+
+    // MARK: - 登录态
+
+    public func isAuthenticated() -> Bool {
+        store.hasToken
+    }
+
+    public func currentGeneration() -> UInt64 {
+        authGeneration
+    }
+
+    public func isCurrentGeneration(_ generation: UInt64) -> Bool {
+        generation == authGeneration
+    }
+
+    /// 登录：读 store 里的地址与账号密码，换 token、返回当前用户。
+    /// 成功会推进代际，作废旧 token 与在途请求。
+    @discardableResult
+    public func login() async throws -> MPUser {
+        guard !store.username.isEmpty, !store.password.isEmpty else {
+            throw MoviePilotError.notConfigured
+        }
+        cancelRelogin()
+        bumpGeneration()
+        // 手动登录会重置凭据，解除静默重登的熔断。
+        reloginExhaustedGeneration = nil
+        let token = try await postLogin(username: store.username, password: store.password)
+        // 拿新 token 直接取用户信息（不经重登路径——token 就是刚换的）。
+        let request = MPRequest(path: "/api/v1/user/current")
+        let user: MPUser
+        do {
+            let data = MPEnvelope.unwrap(try await sendOnce(request, token: token))
+            user = try Self.decoder.decode(MPUser.self, from: data)
+        } catch {
+            store.accessToken = nil
+            bumpGeneration()
+            // 别映射成 badRequest——那是「请求参数有误」，会把解析问题误导成参数问题。
+            throw MoviePilotError.generic("登录成功但用户信息解析失败：\(error)")
+        }
+        store.accessToken = token
+        bumpGeneration()
+        reloginExhaustedGeneration = nil
+        return user
+    }
+
+    /// 当前用户（带鉴权；token 过期走静默重登）。
+    @discardableResult
+    public func currentUser() async throws -> MPUser {
+        let data = MPEnvelope.unwrap(
+            try await requestData(MPRequest(path: "/api/v1/user/current")))
+        return try Self.decoder.decode(MPUser.self, from: data)
+    }
+
+    /// 退出登录：清 token 与密码，作废在途请求。
+    @discardableResult
+    public func signOut() -> UInt64 {
+        cancelRelogin()
+        store.clearSession()
+        bumpGeneration()
+        reloginExhaustedGeneration = nil
+        return authGeneration
+    }
+
+    /// 收到 401 通知侧的配合接口：只在代际仍匹配时清 token。
+    public func clearSession(ifCurrent expectedGeneration: UInt64) -> UInt64? {
+        guard expectedGeneration == authGeneration else { return nil }
+        store.accessToken = nil
+        bumpGeneration()
+        reloginExhaustedGeneration = nil
+        return authGeneration
+    }
+
+    // MARK: - 通用请求（阶段二搜索/下载复用）
+
+    public struct MPRequest: Sendable {
+        public var path: String
+        public var method: String
+        public var query: [URLQueryItem]
+        /// JSON body（DTO 直接传，编码为 application/json）。
+        public var jsonBody: (any Sendable & Encodable)?
+        /// form-urlencoded body（登录接口用）。
+        public var formBody: [String: String]?
+        public var authorized: Bool
+        public var timeout: TimeInterval?
+        /// 显式覆盖幂等性；nil = 按 `method` 推断。
+        public var idempotentOverride: Bool?
+
+        public init(
+            path: String,
+            method: String = "GET",
+            query: [URLQueryItem] = [],
+            jsonBody: (any Sendable & Encodable)? = nil,
+            formBody: [String: String]? = nil,
+            authorized: Bool = true,
+            timeout: TimeInterval? = nil,
+            idempotent: Bool? = nil
+        ) {
+            self.path = path
+            self.method = method
+            self.query = query
+            self.jsonBody = jsonBody
+            self.formBody = formBody
+            self.authorized = authorized
+            self.timeout = timeout
+            self.idempotentOverride = idempotent
+        }
+
+        /// 该请求是否幂等 —— 决定瞬态错误（超时 / 502 / 503 / 504）能否安全重放。
+        ///
+        /// 按 HTTP 语义判定：`GET` / `HEAD` / `PUT` / `DELETE` 幂等；`POST` / `PATCH`
+        /// 不幂等。本包的写接口正好落在两侧：`PUT /api/v1/subscribe/` 传的是**全量**
+        /// 订阅对象（重放 = 同一结果），`DELETE` 按 id / hash 删（重放 = 已删），而
+        /// `POST /api/v1/download/`、`POST /api/v1/subscribe/` 是**创建**语义。
+        ///
+        /// 需要例外时在调用点传 `idempotent:`（例如「POST 但带幂等键」）。
+        public var isIdempotent: Bool {
+            idempotentOverride ?? Self.isIdempotentMethod(method)
+        }
+
+        static func isIdempotentMethod(_ method: String) -> Bool {
+            switch method.uppercased() {
+            case "GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE":
+                return true
+            default:
+                return false
+            }
+        }
+    }
+
+    /// 发请求并解码 JSON。带鉴权的请求 401 时静默重登 + 重放一次。
+    public func request<T: Decodable>(_ request: MPRequest) async throws -> T {
+        let data = try await requestData(request)
+        return try Self.decoder.decode(T.self, from: data)
+    }
+
+    private let maxRetries = 2
+
+    /// 发请求返回原始 data（非 JSON 响应用）。
+    public func requestData(_ request: MPRequest) async throws -> Data {
+        if request.authorized {
+            guard let token = store.accessToken, !token.isEmpty else {
+                throw MoviePilotError.requireLogin
+            }
+            return try await send(request, token: token)
+        } else {
+            return try await send(request, token: nil)
+        }
+    }
+
+    // MARK: - 内部
+
+    private static let decoder: JSONDecoder = {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return decoder
+    }()
+
+    private func bumpGeneration() {
+        authGeneration &+= 1
+    }
+
+    private func cancelRelogin() {
+        reloginGeneration &+= 1
+        reloginTask?.cancel()
+        reloginTask = nil
+    }
+
+    /// 登录接口本体（不带 Bearer 头：拿旧 token 撞新登录没有意义）。
+    private func postLogin(username: String, password: String) async throws -> String {
+        let request = MPRequest(
+            path: "/api/v1/login/access-token",
+            method: "POST",
+            formBody: ["username": username, "password": password],
+            authorized: false,
+            // 登录虽然是 POST，但重放是**安全**的：它不创建业务对象，只是签发 token，
+            // 多签一个的副作用仅是服务端多一条会话记录，客户端用最后一个。
+            // 弱网下重登失败会让整个 MoviePilot 集成不可用，所以这里保留退避重试。
+            idempotent: true
+        )
+        let data = try await send(request, token: nil)
+        do {
+            let response = try JSONDecoder().decode(MPTokenResponse.self, from: data)
+            guard !response.accessToken.isEmpty else {
+                throw MoviePilotError.generic("服务器返回了空 token")
+            }
+            return response.accessToken
+        } catch let error as MoviePilotError {
+            throw error
+        } catch {
+            throw MoviePilotError.badRequest("登录响应解析失败：\(error)")
+        }
+    }
+
+    /// 发送请求（支持 401 静默重登与 502/503/504/超时等 isRetryable 错误指数退避重试）。
+    private func send(_ request: MPRequest, token: String?) async throws -> Data {
+        var currentToken = token
+        var lastError: Error?
+
+        // 幂等性决定「瞬态错误能否重放」。非幂等的创建类请求（POST）一旦重试，就可能
+        // 在服务端落下**重复的下载任务 / 订阅**：请求其实已经到达并生效，只是响应
+        // 超时或网关回了 502，客户端并不知道。这类请求只发一次，失败就把错误交给用户。
+        //
+        // 401 的重登重放**不受此限**：鉴权失败意味着请求没有被执行，重放是安全的，
+        // 所以下面 requireLogin 分支的重放照旧。
+        let retries = request.isIdempotent ? maxRetries : 0
+
+        for attempt in 0...retries {
+            if attempt > 0 {
+                // 指数退避乘 0.5~1.5 抖动：避免多端同拍重试放大服务端压力。
+                let delay = UInt64((pow(2.0, Double(attempt - 1)) * Double.random(in: 0.5...1.5)) * 1_000_000_000)
+                try await Task.sleep(nanoseconds: delay)
+                MoviePilotNetworkLog.logger.warning("重试 \(request.method) \(request.path) (尝试 \(attempt + 1)/\(retries + 1))")
+            }
+
+            do {
+                return try await sendOnce(request, token: currentToken)
+            } catch MoviePilotError.requireLogin where request.authorized {
+                // 旧 token 已被拒。重登失败（含可重试网络错）直接抛，不要带着作废 token
+                // 再进一轮外层重试：postLogin 内部已经跑过自己的退避重试，外层 continue
+                // 只会每轮白撞一次 401、再触发一轮带密码的 login。
+                currentToken = try await silentRelogin()
+
+                do {
+                    return try await sendOnce(request, token: currentToken)
+                } catch let error as MoviePilotError where error.isRetryable && attempt < retries {
+                    // 换到新 token 后重放失败仍值得重试（502/504/超时是服务端瞬态）。
+                    lastError = error
+                    continue
+                } catch {
+                    throw error
+                }
+            } catch let error as MoviePilotError where error.isRetryable && attempt < retries {
+                lastError = error
+                continue
+            } catch {
+                throw error
+            }
+        }
+
+        if let lastError {
+            throw lastError
+        }
+        throw MoviePilotError.generic("请求失败")
+    }
+
+    /// 单次发送。4xx/5xx 一律映射成 `MoviePilotError` 抛出（401 → requireLogin）。
+    /// 传输 + 计时日志走共享执行器（DiagnosticsKit.HTTPClient），URL 拼装留在
+    /// `makeURLRequest`（MoviePilot 的 path 规范化是定制逻辑）。
+    private func sendOnce(_ request: MPRequest, token: String?) async throws -> Data {
+        let urlRequest = try makeURLRequest(request, token: token)
+
+        let exchange: HTTPExchange
+        do {
+            exchange = try await HTTPClient(session: session, category: "MoviePilot")
+                .exchange(urlRequest: urlRequest)
+        } catch let transport as HTTPTransportError {
+            switch transport {
+            case .url(let urlError):
+                throw MoviePilotError(networkError: urlError as NSError)
+            case .nonHTTP:
+                throw MoviePilotError.generic("服务器响应异常")
+            case .other(let description):
+                throw MoviePilotError(request: description)
+            case .status(let code):
+                // exchange 不为状态码抛 .status（仅日志记号）；防御兜底。
+                throw MoviePilotError(code: code, response: "")
+            }
+        }
+
+        guard exchange.statusCode < 400 else {
+            throw MoviePilotError(
+                code: exchange.statusCode,
+                response: MoviePilotErrorBody.message(from: exchange.data) ?? exchange.bodyText
+            )
+        }
+        return exchange.data
+    }
+
+    /// URL + URLRequest 组装（普通请求与 SSE 流共用）。
+    private func makeURLRequest(_ request: MPRequest, token: String?) throws -> URLRequest {
+        guard let baseURL = store.baseURL else {
+            throw MoviePilotError.notConfigured
+        }
+        var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
+            ?? URLComponents()
+        // 规范化拼接：baseURL 尾斜杠 / path 首字符差异都会拼出 //；path 逐段
+        // 百分号编码（媒体键带 `tmdb:` 这类冒号，URLQueryItem 只管 query 段）。
+        // path 自身的尾斜杠是端点语义（/download/ vs /download 不同路由），必须保留。
+        let prefix = components.path.hasSuffix("/")
+            ? String(components.path.dropLast()) : components.path
+        let trailingSlash = request.path.hasSuffix("/") ? "/" : ""
+        let encodedPath = request.path
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map { String($0).addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }
+            .joined(separator: "/")
+        components.path = prefix + "/" + encodedPath + trailingSlash
+        if !request.query.isEmpty {
+            components.queryItems = request.query
+        }
+        guard let url = components.url else {
+            throw MoviePilotError.generic("请求地址拼装失败：\(request.path)")
+        }
+
+        var urlRequest = URLRequest(url: url)
+        urlRequest.httpMethod = request.method
+        if let timeout = request.timeout {
+            urlRequest.timeoutInterval = timeout
+        }
+        if let token {
+            urlRequest.addValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+        if let formBody = request.formBody {
+            var bodyComponents = URLComponents()
+            bodyComponents.queryItems = formBody.map { URLQueryItem(name: $0.key, value: $0.value) }
+            urlRequest.httpBody = bodyComponents.percentEncodedQuery?.data(using: .utf8)
+            urlRequest.addValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        } else if let jsonBody = request.jsonBody {
+            urlRequest.httpBody = try Self.encoder.encode(jsonBody)
+            urlRequest.addValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
+        return urlRequest
+    }
+
+    // MARK: - 静默重登
+
+    /// 401 后用存的密码重登。成功返回新 token（已落库并推进代际——这一步在
+    /// 单飞 Task 里做，恰好一次）；密码错误 → 清 token、广播通知、抛 requireLogin；
+    /// 网络故障 → 原样抛网络错误，不动 token（可能只是暂时连不上，下次再试）。
+    private func silentRelogin() async throws -> String {
+        if let existing = reloginTask {
+            return try await existing.value
+        }
+        // 熔断：当前代际的 token 就是上一次静默重登刚发的（或刚被密码错误拒绝），
+        // 再登一次大概率还是同样结果，直接抛 requireLogin 让上层走登录 UI，
+        // 不在重试循环里每个 attempt 连发一次带密码的 login。
+        // 与密码错误分支同款补清 token + 广播：否则 UI 停在「已登录」反复报错。
+        // 幂等守卫（token 已清）只广播一次；清空后 requestData 的 token 守卫
+        // 让后续请求直接短路，不再走 401→熔断的线上往返。
+        if reloginExhaustedGeneration == authGeneration {
+            if store.accessToken != nil {
+                let generation = authGeneration
+                store.accessToken = nil
+                await notifyAuthenticationRequired(ifCurrent: generation)
+            }
+            throw MoviePilotError.requireLogin
+        }
+        guard !store.username.isEmpty, !store.password.isEmpty else {
+            // 没存密码就没法静默重登（比如退出登录后残留请求）。
+            store.accessToken = nil
+            throw MoviePilotError.requireLogin
+        }
+
+        let generation = authGeneration
+        reloginGeneration &+= 1
+        let myRelogin = reloginGeneration
+
+        let task = Task<String, Error> {
+            let token = try await self.performRelogin()
+            guard generation == self.authGeneration else {
+                throw MoviePilotError(ignore: "静默重登结果已过期")
+            }
+            self.store.accessToken = token
+            self.bumpGeneration()
+            // 刚发的 token 若仍被 401，本轮代际内不再重试重登（见入口熔断）。
+            self.reloginExhaustedGeneration = self.authGeneration
+            return token
+        }
+        reloginTask = task
+
+        // 15 秒超时看门狗：登录卡住时取消（与 Bangumi 侧刷新同款），不让上层请求无限等。
+        let watchdog = Task {
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            task.cancel()
+        }
+        defer {
+            watchdog.cancel()
+            if reloginGeneration == myRelogin {
+                reloginTask = nil
+            }
+        }
+
+        do {
+            return try await task.value
+        } catch let error as MoviePilotError {
+            switch error {
+            case .requireLogin, .badRequest:
+                // 密码已改 / 账号被停：token 作废，通知 UI 重新登录；本轮熔断。
+                if generation == authGeneration {
+                    store.accessToken = nil
+                    reloginExhaustedGeneration = authGeneration
+                    await notifyAuthenticationRequired(ifCurrent: generation)
+                }
+                throw MoviePilotError.requireLogin
+            default:
+                throw error
+            }
+        }
+    }
+
+    private func performRelogin() async throws -> String {
+        try await postLogin(username: store.username, password: store.password)
+    }
+
+    private func notifyAuthenticationRequired(ifCurrent generation: UInt64) async {
+        guard generation == authGeneration else { return }
+        await MainActor.run {
+            NotificationCenter.default.post(
+                name: Self.authenticationRequiredNotification,
+                object: NSNumber(value: generation)
+            )
+        }
+    }
+
+    // MARK: - SSE 流式搜索
+
+    /// 按标题流式搜站点资源（MP 网页端同款路径）。每个事件回调一次
+    /// 「当前累计结果 + 进度」，结束时返回最终列表；边搜边出，不用等全场跑完。
+    ///
+    /// 鉴权靠登录时种的 `MoviePilot` resource cookie（默认 cookie 存储自动携带），
+    /// cookie 过期（30 分钟无 JWT 请求）时 401 → 静默重登刷新 cookie → 重试一次。
+    @discardableResult
+    public func searchTorrentsByTitleStream(
+        keyword: String,
+        sites: [Int] = [],
+        onUpdate: (@Sendable ([MPTorrent], MPSearchProgress) -> Void)? = nil
+    ) async throws -> [MPTorrent] {
+        do {
+            return try await runStreamSearch(keyword: keyword, sites: sites, onUpdate: onUpdate)
+        } catch MoviePilotError.requireLogin {
+            // cookie 过期：静默重登会顺带种新 cookie，重放一次。
+            _ = try await silentRelogin()
+            return try await runStreamSearch(keyword: keyword, sites: sites, onUpdate: onUpdate)
+        }
+    }
+
+    private func runStreamSearch(
+        keyword: String,
+        sites: [Int],
+        onUpdate: (@Sendable ([MPTorrent], MPSearchProgress) -> Void)?
+    ) async throws -> [MPTorrent] {
+        var query = [
+            URLQueryItem(name: "keyword", value: keyword),
+        ]
+        // 服务端格式：逗号分隔的站点 id（_parse_site_list）；不传 = 全部站点。
+        if !sites.isEmpty {
+            query.append(URLQueryItem(
+                name: "sites", value: sites.map(String.init).joined(separator: ",")))
+        }
+        let request = MPRequest(
+            path: "/api/v1/search/title/stream",
+            query: query,
+            authorized: false
+        )
+        let urlRequest = try makeURLRequest(request, token: nil)
+        MoviePilotNetworkLog.requestStarted(MoviePilotNetworkLog.logPath(for: urlRequest.url))
+        let searchStart = Date()
+
+        let (bytes, response): (URLSession.AsyncBytes, URLResponse)
+        do {
+            (bytes, response) = try await streamSession.bytes(for: urlRequest)
+        } catch let error as NSError where error.domain == NSURLErrorDomain {
+            throw MoviePilotError(networkError: error)
+        }
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw MoviePilotError.generic("服务器响应异常")
+        }
+        guard httpResponse.statusCode < 400 else {
+            // 流式接口的鉴权靠登录种下的 resource cookie：JWT 过期时 401/403 都
+            // 会出现（服务端对过期签名抛 403，见 MoviePilotError 的分类注释），
+            // 统一按 requireLogin 抛，由上层走静默重登重试；其余状态走通用分支。
+            if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                throw MoviePilotError.requireLogin
+            }
+            throw MoviePilotError(code: httpResponse.statusCode, response: "SSE 搜索失败")
+        }
+
+        // SSE：一行一个 `data: {json}`（MP 的事件 JSON 不换行），空行分隔事件。
+        var torrents: [MPTorrent] = []
+        var seen: Set<String> = []
+        for try await line in bytes.lines {
+            guard line.hasPrefix("data:") else { continue }
+            let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
+            guard !payload.isEmpty,
+                  let data = payload.data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+
+            let progress = MPSearchProgress(
+                text: object["text"] as? String,
+                finished: object["finished"] as? Int ?? 0,
+                total: object["total"] as? Int ?? 0,
+                totalItems: object["total_items"] as? Int ?? 0
+            )
+            // 事件里的每条资源装在 context 下：torrent_info 是数据本体，
+            // meta_info 是识别结果（筛选要用），一并收进 MPTorrent。
+            let contexts = (object["items"] as? [[String: Any]] ?? [])
+
+            // 任何携带 items 的事件（append / replace / done）都要入列：
+            // done 也可能捎带最后一批资源。
+            func collect(reset: Bool) {
+                if reset {
+                    torrents = []
+                    seen = []
+                }
+                for context in contexts {
+                    guard let torrentRaw = context["torrent_info"] as? [String: Any] else { continue }
+                    let meta = (context["meta_info"] as? [String: Any])?
+                        .mapValues(JSONValue.init(any:))
+                    let torrent = MPTorrent(
+                        raw: torrentRaw.mapValues(JSONValue.init(any:)),
+                        meta: meta
+                    )
+                    if seen.insert(torrent.id).inserted {
+                        torrents.append(torrent)
+                    }
+                }
+            }
+
+            switch object["type"] as? String {
+            case "append":
+                collect(reset: false)
+            case "replace":
+                collect(reset: true)
+            case "error":
+                throw MoviePilotError.generic(progress.text ?? "站点搜索失败")
+            case "done", "finish", "finished":
+                collect(reset: false)
+                onUpdate?(torrents, progress)
+                MoviePilotNetworkLog.requestSucceeded(
+                    "/api/v1/search/title/stream",
+                    duration: Date().timeIntervalSince(searchStart),
+                    level: .info
+                )
+                return torrents
+            default:
+                // heartbeat / 纯进度事件。
+                break
+            }
+            onUpdate?(torrents, progress)
+        }
+        // 服务端关流没发 done（超时截断等）：按已收到的返回。
+        return torrents
+    }
+}
+
+/// 流式搜索的进度快照（服务端事件的进度字段）。
+public struct MPSearchProgress: Sendable, Equatable {
+    /// 人类可读进度文案，如「正在搜索xxx，已完成 3 / 31 个请求 …」。
+    public let text: String?
+    public let finished: Int
+    public let total: Int
+    public let totalItems: Int
+}

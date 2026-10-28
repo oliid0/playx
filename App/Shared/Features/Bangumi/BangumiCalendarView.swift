@@ -1,0 +1,659 @@
+import AppDesignKit
+import BangumiKit
+import SwiftUI
+
+/// Bangumi 每日放送（番剧时间表）页面。
+///
+/// 功能：
+/// - 按星期一至星期日展示本季度正在放送的番剧时间表。
+/// - 顶部星期切换器：自动识别并定位到「今天」，支持周一至周日及「全部」切换。
+/// - 头部信息概览：当前年份与季度（如 2026年夏季番剧）、本周放送总数。
+/// - 搜索与过滤：支持在每日放送中实时按日文名 / 中文名 / 简介（summary）搜索番剧。
+/// - 条目卡片：海报封面、主标题、原名、放送时间、评分/排名、在看人数、本地收藏状态标识。
+/// - 交互跳转：点击卡片直达番剧详情页（BangumiSubjectDetailView）。
+/// - 数据加载：骨架屏加载、下拉刷新、异常重试、原站日历跳转。
+struct BangumiCalendarView: View {
+    @Environment(BangumiCoordinator.self) private var bangumi
+    @Environment(AppModel.self) private var app
+    @Environment(\.contentLeading) private var contentLeading
+    @Environment(\.openURL) private var openURL
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    @State private var days: [BangumiCalendarDayDTO] = []
+    @State private var selectedWeekdayID: Int = todayBangumiWeekdayID
+    @State private var showAllDays = false
+    @State private var searchKeyword = ""
+
+    /// 搜索过滤**结果**（`P2-11`）。
+    ///
+    /// 原先 `filteredDays` 是 computed property：**每次 body 都全表扫一遍**做
+    /// `lowercased().contains`（100–300 条 × name/nameCN/summary 三处），而
+    /// `displayDays` 又调它一次 —— 每敲一个字符至少两趟全表。
+    ///
+    /// 现在改成 `@State`，由 `.task(id:)` 在关键词变化时算一次。
+    ///
+    /// - Note: `nil` 表示「还没算过」，此时按未过滤处理（首帧不该闪空列表）。
+    @State private var filteredDaysCache: (keyword: String, days: [BangumiCalendarDayDTO])?
+
+    /// 可搜索文本的**预计算小写缓存**（按 `days` 内容失效）。
+    ///
+    /// 原实现的 `lowercased()` 在**每次过滤**里对每条条目重做一遍 —— 而它只取决于
+    /// `days`，与关键词无关。缓存后每次过滤只比较已小写的字符串。
+    @State private var searchableIndex: [Int: String] = [:]
+    @State private var isLoading = false
+    @State private var isRefreshing = false
+    @State private var loadError: String?
+    @State private var localInterests: [Int: BangumiCollectionType] = [:]
+    @State private var loadGeneration: UInt64 = 0
+
+    /// 全部天数选项的标识值
+    private static let allDaysSelectionID = 0
+
+    /// 当前星期对应的 Bangumi Weekday ID（1=周一 ... 7=周日）
+    private static var todayBangumiWeekdayID: Int {
+        let weekday = Calendar.current.component(.weekday, from: Date())
+        return weekday == 1 ? 7 : (weekday - 1)
+    }
+
+    /// 当前季度标签（如：2026年夏季番剧）
+    private static var currentSeasonLabel: String {
+        let calendar = Calendar.current
+        let year = calendar.component(.year, from: Date())
+        let month = calendar.component(.month, from: Date())
+        let season: String
+        switch month {
+        case 1...3: season = "冬季"
+        case 4...6: season = "春季"
+        case 7...9: season = "夏季"
+        default: season = "秋季"
+        }
+        return "\(year)年\(season)番剧"
+    }
+
+    /// 放送中的总条目数
+    private var totalItemsCount: Int {
+        days.reduce(0) { $0 + $1.items.count }
+    }
+
+    /// 搜索过滤后的天数数据（`P2-11`：读 `filteredDaysCache`，不再每 body 全表扫）。
+    ///
+    /// ⚠️ **缓存带关键词**：`.task(id: searchKeyword)` 是异步的，改关键词后至少有一帧
+    /// 还在读旧 cache。第一版只存 `[DTO]`，于是那一帧会**显示上一个关键词的结果**
+    /// （清空搜索时更明显：闪一下上一次的过滤结果）。
+    ///
+    /// 现在缓存里记着它是用哪个关键词算的；读到不匹配就**当场算一份**（同步，O(n)
+    /// 但只在这一帧发生一次），既不会闪旧数据，也不会长期退化成每 body 全表扫。
+    private var filteredDays: [BangumiCalendarDayDTO] {
+        let trimmed = normalizedKeyword
+        guard !trimmed.isEmpty else { return days }
+        if let cached = filteredDaysCache, cached.keyword == trimmed {
+            return cached.days
+        }
+        return Self.filter(days: days, keyword: trimmed, index: searchableIndex)
+    }
+
+    /// 去掉首尾空白后的小写关键词（过滤与缓存键都用它，避免两处规则不一致）。
+    private var normalizedKeyword: String {
+        searchKeyword.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// 计算一遍过滤结果并写进缓存。由 `.task(id:)` 在关键词 / 数据变化时调用。
+    private func recomputeFilteredDays() {
+        let trimmed = normalizedKeyword
+        guard !trimmed.isEmpty else {
+            filteredDaysCache = nil      // 无关键词 = 不过滤（省掉一份拷贝）
+            return
+        }
+        filteredDaysCache = (
+            trimmed,
+            Self.filter(days: days, keyword: trimmed, index: searchableIndex)
+        )
+    }
+
+    /// 过滤的**唯一实现**：`filteredDays` 的即时路径与 `recomputeFilteredDays` 共用，
+    /// 避免两处规则漂移。
+    ///
+    /// - Parameter index: 预计算的小写文本索引（键是 `item.id`）。缺项时当场算一份，
+    ///   这样即使索引还没建好（`days` 刚换、`.task` 尚未跑），结果也是对的。
+    nonisolated private static func filter(
+        days: [BangumiCalendarDayDTO],
+        keyword: String,
+        index: [Int: String]
+    ) -> [BangumiCalendarDayDTO] {
+        days.compactMap { day in
+            let matched = day.items.filter { item in
+                let haystack = index[item.id] ?? searchableText(of: item)
+                return haystack.contains(keyword)
+            }
+            guard !matched.isEmpty else { return nil }
+            return BangumiCalendarDayDTO(weekday: day.weekday, items: matched)
+        }
+    }
+
+    /// 重建可搜索文本索引（name / nameCN / summary 小写后拼成一个串）。
+    private func rebuildSearchableIndex() {
+        var index: [Int: String] = [:]
+        for day in days {
+            for item in day.items {
+                index[item.id] = Self.searchableText(of: item)
+            }
+        }
+        searchableIndex = index
+    }
+
+    /// 测试用：暴露纯逻辑（`filter` / `searchableText`）而不必构造整个视图。
+    ///
+    /// 这两个函数是 `private static`；`P2-11` 的三层缓存全靠它们，
+    /// 而它们本身没有副作用、也不需要视图树 —— 直接暴露给 `@testable` 用。
+    nonisolated static func searchableTextForTesting(_ item: BangumiCalendarItemDTO) -> String {
+        searchableText(of: item)
+    }
+
+    nonisolated static func filterForTesting(
+        days: [BangumiCalendarDayDTO],
+        keyword: String,
+        index: [Int: String]
+    ) -> [BangumiCalendarDayDTO] {
+        filter(days: days, keyword: keyword, index: index)
+    }
+
+    /// 三条可搜索字段拼成一个小写串。
+    ///
+    /// 拼成一个串而不是存三个字段：`contains` 只关心「有没有」，拼起来结果等价，
+    /// 却省掉两次独立的 `contains` 调用与三次属性读取。
+    nonisolated private static func searchableText(of item: BangumiCalendarItemDTO) -> String {
+        var text = item.name.lowercased()
+        text += "\u{1F}" + item.nameCN.lowercased()
+        if let summary = item.summary {
+            text += "\u{1F}" + summary.lowercased()
+        }
+        return text
+    }
+
+    /// 当前选中展示的分组
+    private var displayDays: [BangumiCalendarDayDTO] {
+        if showAllDays || !searchKeyword.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return filteredDays
+        }
+        return filteredDays.filter { $0.weekday.id == selectedWeekdayID }
+    }
+
+    var body: some View {
+        Group {
+            if isLoading && days.isEmpty {
+                skeletonView
+            } else if let loadError, days.isEmpty {
+                // 失败 / 空态是本页的根级内容（此时没有列表兜底）：必须走
+                // `PageFillingState` 铺满，否则整条尺寸链塌掉、氛围背景与顶栏
+                // 一起失去内容（见该类型注释）。
+                PageFillingState {
+                    EmptyState(failure: loadError) {
+                        Task { await loadCalendar() }
+                    }
+                }
+            } else if days.isEmpty {
+                PageFillingState {
+                    EmptyState(
+                        empty: "暂无放送数据",
+                        systemImage: "calendar.badge.exclamationmark",
+                        message: "未能获取到本季度的每日放送时间表。",
+                        actionTitle: "刷新"
+                    ) {
+                        Task { await loadCalendar(force: true) }
+                    }
+                }
+            } else {
+                contentView
+            }
+        }
+        .searchable(text: $searchKeyword, prompt: "在每日放送中搜索番剧")
+        // `P2-11`：关键词变化时才重算过滤结果（原先挂在 body 里，每个按键至少两趟全表）。
+        //
+        // 两条 `.task(id:)` 分工：数据变了重建小写索引，关键词变了重算过滤。
+        //
+        // ⚠️ **`id:` 必须用 `days` 本身，不能用 `days.count`**。
+        //
+        // 第一版用了 `days.count`，理由是「DTO 没实现 Hashable 等价性」——**那理由是错的**，
+        // `BangumiCalendarDayDTO` 明确是 `Hashable`。而 `getCalendar` 的契约就是
+        // 「按周一至周日 **7 天**分组」，所以 `days.count` **恒等于 7**：
+        // 刷新日历后数据整体换了一批、`count` 还是 7，`.task` **不会重跑** →
+        // `searchableIndex` 一直是旧的那份 → 搜索要么命中 0 条，要么**用旧名字命中新条目**，
+        // 而且搜索态下一直显示旧结果，直到用户改关键词。
+        //
+        // 审查实测（SwiftUI 探针）：内容 `[1,2,3]` → `[9,2,3]` 时 `runs` 仍为 1；
+        // 只有 count 变化才重跑。
+        .task(id: days) {
+            rebuildSearchableIndex()
+            recomputeFilteredDays()
+        }
+        .task(id: searchKeyword) {
+            if searchableIndex.isEmpty, !days.isEmpty { rebuildSearchableIndex() }
+            recomputeFilteredDays()
+        }
+        .navigationTitle("每日放送")
+        #if os(macOS)
+        .navigationSubtitle(subtitleText)
+        #endif
+        .toolbar { toolbar }
+        .task { await loadCalendar() }
+        .onReceive(NotificationCenter.default.publisher(for: BangumiProgressInvalidation.notificationName)) { _ in
+            Task { await reloadLocalInterests() }
+        }
+    }
+
+    // MARK: - 主内容
+
+    private var contentView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                if searchKeyword.isEmpty {
+                    weekdaySelector
+                        .padding(.horizontal, contentLeading)
+                        .padding(.top, 8)
+                }
+
+                if displayDays.isEmpty {
+                    EmptyState(
+                        empty: "未找到相关番剧",
+                        systemImage: "magnifyingglass",
+                        message: searchKeyword.isEmpty ? "该星期暂无番剧放送。" : "未找到与「\(searchKeyword)」相关的放送番剧。"
+                    )
+                    .frame(maxWidth: .infinity, minHeight: 280)
+                } else {
+                    LazyVStack(alignment: .leading, spacing: 20) {
+                        ForEach(displayDays) { day in
+                            daySection(day: day)
+                                .transition(reduceMotion ? .identity : .section)
+                        }
+                    }
+                    .padding(.horizontal, contentLeading)
+                    .padding(.top, searchKeyword.isEmpty ? 4 : 12)
+                    .padding(.bottom, 48)
+                }
+            }
+        }
+        .motion(Motion.standard, value: selectedWeekdayID)
+        .motion(Motion.standard, value: showAllDays)
+        .refreshable { await loadCalendar(force: true) }
+    }
+
+    private var subtitleText: String {
+        if totalItemsCount > 0 {
+            return "\(Self.currentSeasonLabel) · 本周共 \(totalItemsCount) 部放送中"
+        }
+        return Self.currentSeasonLabel
+    }
+
+    // MARK: - 星期选择器
+
+    private var weekdaySelector: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                // 今天快捷标签
+                let todayID = Self.todayBangumiWeekdayID
+                let todayCount = days.first(where: { $0.weekday.id == todayID })?.items.count ?? 0
+                weekdayChip(
+                    title: "今天",
+                    badgeText: "\(todayCount)",
+                    isSelected: !showAllDays && selectedWeekdayID == todayID,
+                    isToday: true
+                ) {
+                    showAllDays = false
+                    selectedWeekdayID = todayID
+                }
+
+                Divider()
+                    .frame(height: 18)
+                    .padding(.horizontal, 2)
+
+                // 周一 ~ 周日
+                ForEach(days) { day in
+                    let isSelected = !showAllDays && selectedWeekdayID == day.weekday.id
+                    let isToday = day.weekday.id == todayID
+                    weekdayChip(
+                        title: day.weekday.shortCN,
+                        badgeText: "\(day.items.count)",
+                        isSelected: isSelected,
+                        isToday: isToday
+                    ) {
+                        showAllDays = false
+                        selectedWeekdayID = day.weekday.id
+                    }
+                }
+
+                Divider()
+                    .frame(height: 18)
+                    .padding(.horizontal, 2)
+
+                // 全部
+                weekdayChip(
+                    title: "全部",
+                    badgeText: "\(totalItemsCount)",
+                    isSelected: showAllDays,
+                    isToday: false
+                ) {
+                    showAllDays = true
+                }
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
+    private func weekdayChip(
+        title: String,
+        badgeText: String,
+        isSelected: Bool,
+        isToday: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                if isToday && !isSelected {
+                    Circle()
+                        .fill(AppAccent.solid)
+                        .frame(width: 6, height: 6)
+                }
+
+                Text(title)
+                    .font(.caption.weight(isSelected ? .bold : .medium))
+
+                Text(badgeText)
+                    .font(.system(size: 10, weight: isSelected ? .bold : .regular).monospacedDigit())
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(
+                        // 选中时底是实底（`.primary`），徽章底必须用**反色**才看得见。
+                        isSelected ? AppAccent.onSolid.opacity(0.25) : Color.primary.opacity(0.08),
+                        in: Capsule()
+                    )
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .background(
+                isSelected ? AnyShapeStyle(AppAccent.solid) : AnyShapeStyle(.fill.tertiary),
+                in: Capsule()
+            )
+            .foregroundStyle(isSelected ? AppAccent.onSolid : Color.primary)
+        }
+        .buttonStyle(.plain)
+        .motion(Motion.fast, value: isSelected)
+    }
+
+    // MARK: - 单日分组区块
+
+    @ViewBuilder
+    private func daySection(day: BangumiCalendarDayDTO) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if showAllDays || !searchKeyword.isEmpty {
+                HStack(spacing: 8) {
+                    Text(day.weekday.cn)
+                        .font(.title3.weight(.bold))
+                        .foregroundStyle(.primary)
+
+                    if day.weekday.id == Self.todayBangumiWeekdayID {
+                        PillChip("今天", role: .accent, font: .caption2.weight(.bold))
+                    }
+
+                    Text("(\(day.items.count) 部)")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+
+                    Spacer()
+                }
+                .padding(.top, 4)
+            }
+
+            LazyVGrid(columns: gridColumns, spacing: 10) {
+                ForEach(day.items) { item in
+                    Button {
+                        app.openBangumiSubject(id: item.id, initialSubject: item.toSlimSubject())
+                    } label: {
+                        CalendarItemCard(
+                            item: item,
+                            localInterest: localInterests[item.id]
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private var gridColumns: [GridItem] {
+        #if os(macOS)
+        [GridItem(.adaptive(minimum: 320, maximum: 480), spacing: 10)]
+        #else
+        [GridItem(.adaptive(minimum: 280, maximum: 440), spacing: 10)]
+        #endif
+    }
+
+    // MARK: - 骨架屏
+
+    private var skeletonView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                // 顶部胶囊骨架
+                HStack(spacing: 8) {
+                    ForEach(0..<8, id: \.self) { _ in
+                        SkeletonBlock(cornerRadius: 16)
+                            .frame(width: 68, height: 32)
+                    }
+                }
+                .padding(.horizontal, contentLeading)
+                .padding(.top, 12)
+
+                // 卡片骨架
+                LazyVGrid(columns: gridColumns, spacing: 10) {
+                    ForEach(0..<10, id: \.self) { _ in
+                        HStack(spacing: 12) {
+                            SkeletonBlock(cornerRadius: 6)
+                                .frame(width: 68, height: 96)
+                            VStack(alignment: .leading, spacing: 8) {
+                                SkeletonBlock(cornerRadius: 4).frame(width: 160, height: 16)
+                                SkeletonBlock(cornerRadius: 4).frame(width: 110, height: 12)
+                                SkeletonBlock(cornerRadius: 4).frame(width: 80, height: 12)
+                            }
+                            Spacer()
+                        }
+                        .padding(10)
+                        // 2026-10-22：与下载页同一套液态玻璃
+                        .liquidGlassCard()
+                    }
+                }
+                .padding(.horizontal, contentLeading)
+                .padding(.top, 8)
+            }
+        }
+        .skeletonShimmer()
+    }
+
+    // MARK: - 工具栏
+
+    @ToolbarContentBuilder
+    private var toolbar: some ToolbarContent {
+        ToolbarItemGroup(placement: .primaryAction) {
+            Button {
+                if let url = URL(string: "https://bgm.tv/calendar") {
+                    openURL(url)
+                }
+            } label: {
+                Image(systemName: "safari")
+            }
+            .help("在浏览器中打开 Bangumi 原站每日放送")
+            .accessibilityLabel("在浏览器中打开")
+
+            Button {
+                Task { await loadCalendar(force: true) }
+            } label: {
+                if isRefreshing {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "arrow.clockwise")
+                }
+            }
+            .help("刷新每日放送时间表")
+            .accessibilityLabel("刷新时间表")
+            .disabled(isRefreshing)
+        }
+    }
+
+    // MARK: - 数据加载
+
+    private func loadCalendar(force: Bool = false) async {
+        if force {
+            isRefreshing = true
+        } else {
+            isLoading = true
+        }
+        loadGeneration &+= 1
+        let gen = loadGeneration
+        loadError = nil
+        defer {
+            if loadGeneration == gen {
+                isLoading = false
+                isRefreshing = false
+            }
+        }
+
+        do {
+            let fetchedDays = try await BangumiCalendarService.getCalendar(force: force)
+            guard loadGeneration == gen else { return }
+            days = fetchedDays
+            await reloadLocalInterests()
+        } catch {
+            guard loadGeneration == gen else { return }
+            loadError = BangumiActionPerformer.loadFailureMessage("加载每日放送失败", error)
+        }
+    }
+
+    private func reloadLocalInterests() async {
+        guard bangumi.isAuthenticated, bangumi.isDatabaseReady else { return }
+        let ids = Array(Set(days.flatMap { $0.items.map(\.id) }))
+        guard !ids.isEmpty else {
+            localInterests = [:]
+            return
+        }
+        // 一条 IN 查询取回全部（原来逐条 await 上百次 DB 往返，刷新/翻页卡顿）。
+        let stored = (try? await bangumi.context.subjects(ids: ids)) ?? [:]
+        var interests: [Int: BangumiCollectionType] = [:]
+        for (id, subject) in stored {
+            if let interest = subject.interest, interest.type != .none {
+                interests[id] = interest.type
+            }
+        }
+        localInterests = interests
+    }
+}
+
+// MARK: - 每日放送条目卡片
+
+private struct CalendarItemCard: View {
+    let item: BangumiCalendarItemDTO
+    let localInterest: BangumiCollectionType?
+
+    @State private var isHovered = false
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            // 封面海报
+            MediaArtwork(
+                url: item.coverURL,
+                shape: .poster,
+                width: 68,
+                cornerRadius: 6,
+                bordered: true,
+                // bgm.tv 的封面惯例就是 2:3：给兜底比例，加载前那一帧也严丝合缝。
+                nominalRatio: 2.0 / 3.0
+            )
+
+            // 信息列
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .top, spacing: 6) {
+                    Text(item.displayName)
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+
+                    Spacer(minLength: 0)
+
+                    if let interest = localInterest, interest != .none {
+                        interestBadge(interest)
+                    }
+                }
+
+                if let original = item.originalName {
+                    Text(original)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 2)
+
+                // 评分与排名
+                HStack(spacing: 8) {
+                    if let rating = item.rating, rating.score > 0 {
+                        HStack(spacing: 3) {
+                            Image(systemName: "star.fill")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.orange)
+                            Text(String(format: "%.1f", rating.score))
+                                .font(.caption.weight(.bold).monospacedDigit())
+                                .foregroundStyle(.primary)
+                        }
+
+                        if rating.total > 0 {
+                            Text("(\(rating.total)人)")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+
+                    if let rank = item.rank, rank > 0 {
+                        PillChip(
+                            "#\(rank)",
+                            role: .custom(.orange),
+                            outline: .stamp(cornerRadius: 3),
+                            font: .system(size: 9, weight: .bold)
+                        )
+                    }
+                }
+
+                // 放送日期与在看人数
+                HStack(spacing: 8) {
+                    if let airDate = item.airDate, !airDate.isEmpty {
+                        Text(airDate)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if item.doingCount > 0 {
+                        HStack(spacing: 3) {
+                            Image(systemName: "eyes")
+                                .font(.system(size: 9))
+                            Text("\(item.doingCount) 人在看")
+                                .font(.caption2.monospacedDigit())
+                        }
+                        .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .hoverRowHighlight(active: isHovered)
+        #if os(macOS)
+        .onHover { hovering in
+            isHovered = hovering
+        }
+        #endif
+    }
+
+    private func interestBadge(_ interest: BangumiCollectionType) -> some View {
+        PillChip(
+            interest.description(.anime),
+            role: .custom(BangumiStatusColor.collection(interest)),
+            font: .system(size: 10, weight: .semibold)
+        )
+    }
+}

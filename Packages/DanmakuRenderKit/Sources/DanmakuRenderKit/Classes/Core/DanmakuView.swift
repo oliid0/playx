@@ -1,0 +1,824 @@
+//
+//  DanmakuView.swift
+//  DanmakuKit
+//
+//  Created by Q YiZhong on 2020/8/16.
+//
+
+// Use shared platform typealiases (PlatformView) from PlatformTypes.swift
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
+
+public enum DanmakuStatus {
+    case play
+    case pause
+    case stop
+}
+
+public class DanmakuView: PlatformView {
+
+    /// If this property is false, the danmaku will not be reused.
+    public var enableCellReusable = false
+    
+    /// Each danmaku is in one track and the number of tracks in the view depends on the height of the track.
+    public var trackHeight: CGFloat = 20 {
+        didSet {
+            guard oldValue != trackHeight else { return }
+            recalculateTracks()
+        }
+    }
+    
+    /// Padding of top area, the actual offset of the top danmaku will refer to this property.
+    public var paddingTop: CGFloat = 0 {
+        didSet {
+            guard oldValue != paddingTop else { return }
+            recalculateTracks()
+        }
+    }
+    
+    /// Padding of bottom area, the actual offset of the bottom danmaku will refer to this property.
+    public var paddingBottom: CGFloat = 0 {
+        didSet {
+            guard oldValue != paddingBottom else { return }
+            recalculateTracks()
+        }
+    }
+    
+    /// State of play,  The danmaku can only be sent in play status.
+    public private(set) var status: DanmakuStatus = .stop
+
+    /// `update(_:)` 的延时恢复任务代次：连续 update 时旧的恢复任务作废，
+    /// 防止叠加多个 play（本地修补，见 PROVENANCE.md）。
+    private var updateResumeGeneration = 0
+    
+    /// The display area of the danmaku is set between 0 and 1. Setting this property will affect the number of danmaku tracks.
+    public var displayArea: CGFloat = 1.0 {
+        willSet {
+            assert(0 <= newValue && newValue <= 1, "Danmaku display area must be between [0, 1].")
+        }
+        didSet {
+            guard oldValue != displayArea else { return }
+            recalculateTracks()
+        }
+    }
+    
+    /// If this property is true, the danmaku supports overlapping launches. Default is false.
+    public var isOverlap: Bool = false {
+        didSet {
+            for i in 0..<floatingTracks.count {
+                floatingTracks[i].isOverlap = isOverlap
+            }
+            for i in 0..<topTracks.count {
+                topTracks[i].isOverlap = isOverlap
+            }
+            for i in 0..<bottomTracks.count {
+                bottomTracks[i].isOverlap = isOverlap
+            }
+        }
+    }
+    
+    /// All floating danmaku are removed immediately after set false, and it won't be launched again. Default is true.
+    public var enableFloatingDanmaku: Bool = true {
+        didSet {
+            if !enableFloatingDanmaku {
+                floatingTracks.forEach {
+                    $0.stop()
+                }
+            }
+        }
+    }
+    
+    /// All top danmaku are removed immediately after set false, and it won't be launched again. Default is true.
+    public var enableTopDanmaku: Bool = true {
+        didSet {
+            if !enableTopDanmaku {
+                topTracks.forEach {
+                    $0.stop()
+                }
+            }
+        }
+    }
+    
+    /// All bottom danmaku are removed immediately after set false, and it won't be launched again. Default is true.
+    public var enableBottomDanmaku: Bool = true {
+        didSet {
+            if !enableBottomDanmaku {
+                bottomTracks.forEach {
+                    $0.stop()
+                }
+            }
+        }
+    }
+    
+    public var playingSpeed: Float = 1.0 {
+        willSet {
+            assert(newValue > 0, "Danmaku playing speed must be over 0.")
+        }
+        didSet {
+            // Apply iOS behavior on all platforms: pause -> update -> short delay -> play
+            // This ensures existing on-screen danmaku recompute durations with the new speed.
+            update {
+                for i in 0..<floatingTracks.count {
+                    var track = floatingTracks[i]
+                    track.playingSpeed = playingSpeed
+                }
+                for i in 0..<topTracks.count {
+                    var track = topTracks[i]
+                    track.playingSpeed = playingSpeed
+                }
+                for i in 0..<bottomTracks.count {
+                    var track = bottomTracks[i]
+                    track.playingSpeed = playingSpeed
+                }
+            }
+        }
+    }
+    
+    private var danmakuPool: [String: [DanmakuCell]] = [:]
+
+    /// 诊断用：当前复用池里的 cell 总数。播放途中若持续增长，说明 cell 回收后
+    /// 没被复用（或回收本身就漏了），是内存爬升的直接证据。
+    public var pooledCellCount: Int {
+        danmakuPool.reduce(0) { $0 + $1.value.count }
+    }
+    
+    private var floatingTracks: [DanmakuTrack] = []
+    
+    private var topTracks: [DanmakuTrack] = []
+    
+    private var bottomTracks: [DanmakuTrack] = []
+    
+    private var toggledCell: DanmakuCell?
+
+#if os(macOS)
+    private var hoveredCell: DanmakuCell?
+#endif
+    
+    private var viewHeight: CGFloat {
+        return bounds.height * displayArea
+    }
+    
+    public override init(frame: CGRect) {
+        super.init(frame: frame)
+        recalculateTracks()
+        lastTrackLayoutSize = bounds.size
+        // 统一用父级视图的GestureRegnizer管理子视图点击事件
+#if os(macOS)
+        let containerClick = NSClickGestureRecognizer(target: self, action: #selector(containerDidClick(_:)))
+        containerClick.delaysPrimaryMouseButtonEvents = false
+        self.addGestureRecognizer(containerClick)
+#else
+        let bgTap = UITapGestureRecognizer(target: self, action: #selector(danmakuDidTap(_:)))
+        bgTap.delaysTouchesBegan = false
+        bgTap.delaysTouchesEnded = false
+        self.addGestureRecognizer(bgTap)
+#endif
+    }
+    
+    required init?(coder: NSCoder) {
+        // 只支持代码构造：解码路径绕过轨道初始化/手势安装，显式拒绝。
+        nil
+    }
+#if os(macOS)
+    // Use a top-left origin like iOS so tracks are laid out from the top.
+    public override var isFlipped: Bool { true }
+
+    public override func layout() {
+        super.layout()
+        recalculateTracksIfResized()
+    }
+#else
+    public override func layoutSubviews() {
+        super.layoutSubviews()
+        recalculateTracksIfResized()
+    }
+#endif
+
+    /// 上次轨道重算时的画布尺寸。layout 在子视图增删（每条弹幕 shoot/回收）时
+    /// 都会走一遍，轨道几何只跟 bounds.size 有关——尺寸没变就不全量重排。
+    /// SwiftUI 适配器的 frame KVO 与 layout 是同一变化的两条通道，守卫顺带把
+    /// 重复触发收敛成一次。
+    private var lastTrackLayoutSize: CGSize = .zero
+
+    func recalculateTracksIfResized() {
+        guard bounds.size != lastTrackLayoutSize else { return }
+        lastTrackLayoutSize = bounds.size
+        recalculateTracks()
+    }
+    
+    deinit {
+        stop()
+    }
+    
+#if os(macOS)
+    public override func hitTest(_ point: NSPoint) -> NSView? {
+        guard enableHoverTracking, !isHidden, alphaValue > 0 else { return nil }
+        guard self.bounds.contains(point) else { return nil }
+        for sub in subviews.reversed() {
+            var local = self.convert(point, to: sub)
+            if let presentation = sub.layer?.presentation() {
+                local = self.layer?.convert(point, to: presentation) ?? local
+            }
+            if let found = sub.hitTest(local) { return found }
+        }
+        return nil
+    }
+    
+    public var enableHoverTracking: Bool = false {
+        didSet {
+            setupHoverTracking()
+        }
+    }
+
+    public override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if enableHoverTracking {
+            window?.acceptsMouseMovedEvents = true
+            setupHoverTracking()
+        }
+    }
+    
+    public override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if enableHoverTracking {
+            setupHoverTracking()
+        } else {
+            trackingAreas.forEach { removeTrackingArea($0) }
+        }
+    }
+    
+    private func setupHoverTracking() {
+        trackingAreas.forEach { removeTrackingArea($0) }
+        guard enableHoverTracking else { return }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+    }
+    
+    public override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        let point = convert(event.locationInWindow, from: nil)
+        if let cell = locateDanmakuCell(at: point) {
+            switchCurrentHovered(cell)
+        } else {
+            stopCurrentHovered()
+        }
+    }
+    
+    public override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        stopCurrentHovered()
+    }
+    
+    private func switchCurrentHovered(_ cell: DanmakuCell) {
+        guard cell !== hoveredCell else { return }
+        stopCurrentHovered()
+        hoveredCell = cell
+    }
+
+    private func stopCurrentHovered() {
+        hoveredCell = nil
+    }
+    
+#else
+    public override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        guard self.point(inside: point, with: event) else { return nil }
+        for i in (0..<subviews.count).reversed() {
+            let subView = subviews[i]
+            var newPoint: CGPoint
+            if subView.layer.animationKeys() != nil, let presentationLayer = subView.layer.presentation() {
+                newPoint = layer.convert(point, to: presentationLayer)
+            } else {
+                newPoint = convert(point, to: subView)
+            }
+            if let findView = subView.hitTest(newPoint, with: event) { return findView }
+        }
+        return self
+    }
+#endif
+    
+    private func switchCurrentToggled(_ cell: DanmakuCell) {
+        guard cell !== toggledCell else { return }
+        stopCurrentToggled()
+        toggledCell = cell
+    }
+
+    private func stopCurrentToggled() {
+        toggledCell = nil
+    }
+}
+
+public extension DanmakuView {
+    
+    public func shoot(danmaku: DanmakuCellModel) {
+        guard status == .play else { return }
+        switch danmaku.type {
+        case .floating:
+            guard enableFloatingDanmaku else { return }
+            guard !floatingTracks.isEmpty else { return }
+        case .top:
+            guard enableTopDanmaku else { return }
+            guard !topTracks.isEmpty else { return }
+        case .bottom:
+            guard enableBottomDanmaku else { return }
+            guard !bottomTracks.isEmpty else { return }
+        }
+        
+        guard let cell = obtainCell(with: danmaku) else { return }
+        
+        let shootTrack: DanmakuTrack
+        if isOverlap {
+            shootTrack = findLeastNumberDanmakuTrack(for: danmaku)
+        } else {
+            guard let t = findSuitableTrack(for: danmaku) else {
+                if enableCellReusable {
+                    appendCellToPool(cell)
+                }
+                return
+            }
+            shootTrack = t
+        }
+
+        if cell.superview == nil {
+            addSubview(cell)
+        }
+        cell.redraw()
+        shootTrack.shoot(danmaku: cell)
+    }
+    
+    public func canShoot(danmaku: DanmakuCellModel) -> Bool {
+        guard status == .play else { return false }
+        switch danmaku.type {
+        case .floating:
+            guard enableFloatingDanmaku else { return false }
+            return (floatingTracks.first { (t) -> Bool in
+                return t.canShoot(danmaku: danmaku)
+            }) != nil
+        case .top:
+            guard enableTopDanmaku else { return false }
+            return (topTracks.first { (t) -> Bool in
+                return t.canShoot(danmaku: danmaku)
+            }) != nil
+        case .bottom:
+            guard enableBottomDanmaku else { return false }
+            return (bottomTracks.first { (t) -> Bool in
+                return t.canShoot(danmaku: danmaku)
+            }) != nil
+        }
+    }
+    
+    /// You can call this method when you need to change the size of the danmakuView.
+    public func recalculateTracks() {
+        recalculateFloatingTracks()
+        recalculateTopTracks()
+        recalculateBottomTracks()
+    }
+    
+    
+    public func play() {
+        guard status != .play else { return }
+        floatingTracks.forEach {
+            $0.play()
+        }
+        topTracks.forEach {
+            $0.play()
+        }
+        bottomTracks.forEach {
+            $0.play()
+        }
+        status = .play
+    }
+    
+    public func pause() {
+        guard status != .pause else { return }
+        floatingTracks.forEach {
+            $0.pause()
+        }
+        topTracks.forEach {
+            $0.pause()
+        }
+        bottomTracks.forEach {
+            $0.pause()
+        }
+        status = .pause
+    }
+    
+    public func stop() {
+        guard status != .stop else { return }
+        floatingTracks.forEach {
+            $0.stop()
+        }
+        topTracks.forEach {
+            $0.stop()
+        }
+        bottomTracks.forEach {
+            $0.stop()
+        }
+        status = .stop
+    }
+    
+    @discardableResult
+    public func play(_ danmaku: DanmakuCellModel) -> Bool {
+        var track = floatingTracks.first { (t) -> Bool in
+            return t.play(danmaku)
+        }
+        if track == nil {
+            track = topTracks.first(where: { (t) -> Bool in
+                return t.play(danmaku)
+            })
+        }
+        if track == nil {
+            track = bottomTracks.first(where: { (t) -> Bool in
+                return t.play(danmaku)
+            })
+        }
+        return track != nil
+    }
+    
+    @discardableResult
+    public func pause(_ danmaku: DanmakuCellModel) -> Bool {
+        var track = floatingTracks.first { (t) -> Bool in
+            return t.pause(danmaku)
+        }
+        if track == nil {
+            track = topTracks.first(where: { (t) -> Bool in
+                return t.pause(danmaku)
+            })
+        }
+        if track == nil {
+            track = bottomTracks.first(where: { (t) -> Bool in
+                return t.pause(danmaku)
+            })
+        }
+        return track != nil
+    }
+    
+    /// Display a danmaku synchronously according to the progress. If the status is stop, it will not work.
+    /// - Parameters:
+    ///   - danmaku: danmakuCellModel
+    ///   - progress: progress of danmaku display
+    public func sync(danmaku: DanmakuCellModel, at progress: Float) {
+        guard status != .stop else { return }
+        assert(progress <= 1.0, "Cannot sync danmaku at progress \(progress).")
+        switch danmaku.type {
+        case .floating:
+            guard enableFloatingDanmaku else { return }
+            guard !floatingTracks.isEmpty else { return }
+        case .top:
+            guard enableTopDanmaku else { return }
+            guard !topTracks.isEmpty else { return }
+        case .bottom:
+            guard enableBottomDanmaku else { return }
+            guard !bottomTracks.isEmpty else { return }
+        }
+        guard let cell = obtainCell(with: danmaku) else { return }
+        
+        let syncTrack: DanmakuTrack
+        if isOverlap {
+            syncTrack = findLeastNumberDanmakuTrack(for: danmaku)
+        } else {
+            guard let t = findSuitableSyncTrack(for: danmaku, at: progress) else {
+                return
+            }
+            syncTrack = t
+        }
+
+        if cell.superview == nil {
+            addSubview(cell)
+        }
+        cell.redraw()
+        if status == .play {
+            syncTrack.syncAndPlay(cell, at: progress)
+        } else {
+            syncTrack.sync(cell, at: progress)
+        }
+    }
+    
+    /// Clean all the currently displayed danmaku.
+    public func clean() {
+        floatingTracks.forEach { $0.clean() }
+        bottomTracks.forEach { $0.clean() }
+        topTracks.forEach { $0.clean() }
+#if os(macOS)
+        hoveredCell = nil
+#endif
+        toggledCell = nil
+    }
+
+    /// Clear the reusable cell pool (local patch, see PROVENANCE.md).
+    ///
+    /// Upstream `clean()` only clears the on-screen tracks; cells that finished
+    /// playing live on in `danmakuPool` with their full rendered model/measurements.
+    /// The player calls this when playback is torn down so a finished episode's
+    /// cell tree doesn't linger inside the app-lifetime overlay controller.
+    public func clearPool() {
+        danmakuPool.values.forEach { $0.forEach { $0.removeFromSuperview() } }
+        danmakuPool.removeAll()
+#if os(macOS)
+        hoveredCell = nil
+#endif
+        toggledCell = nil
+    }
+    
+    /// When you change some properties of the danmakuView or cellModel that might affect the danmaku, you must make changes in the closure of this method.
+    /// E.g.This method will be used when you change the displayTime property in the cellModel.
+    /// - Parameter closure: update closure
+    /// - Note: 本地修补——只在 update 前本就处于播放态时才延时恢复。原先无条件
+    ///   pause→play，视频暂停时改弹幕速度会把弹幕“救活”继续滚动；连续 update
+    ///   也会叠加多个 play 定时器反复重排。
+    func update(_ closure: () -> Void) {
+        let wasPlaying = status == .play
+        pause()
+        closure()
+        updateResumeGeneration += 1
+        guard wasPlaying else { return }
+        let generation = updateResumeGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
+            guard let self, self.updateResumeGeneration == generation else { return }
+            self.play()
+        }
+    }
+    
+}
+
+// 本地修补：原为 `private extension`，放宽到 internal 以便包内测试 target 覆盖
+// 轨道选择/复用池等纯逻辑（行为零改动，见 PROVENANCE.md）。
+extension DanmakuView {
+    
+    func recalculateFloatingTracks() {
+        let trackCount = max(0, Int(floorf(Float((viewHeight - paddingTop - paddingBottom) / trackHeight))))
+        let offsetY = max(0, (viewHeight - CGFloat(trackCount) * trackHeight) / 2.0)
+        let diffFloatingTrackCount = trackCount - floatingTracks.count
+        if diffFloatingTrackCount > 0 {
+            for _ in 0..<diffFloatingTrackCount {
+                floatingTracks.append(DanmakuFloatingTrack(view: self))
+            }
+        } else if diffFloatingTrackCount < 0 {
+            for i in max(0, floatingTracks.count + diffFloatingTrackCount)..<floatingTracks.count {
+                floatingTracks[i].stop()
+            }
+            floatingTracks.removeLast(Int(abs(diffFloatingTrackCount)))
+        }
+        for i in 0..<floatingTracks.count {
+            var track = floatingTracks[i]
+            track.stopClosure = { [weak self] (cell) in
+                guard let strongSelf = self else { return }
+                strongSelf.cellPlayingStop(cell)
+            }
+            track.index = UInt(i)
+            track.playingSpeed = playingSpeed
+            track.positionY = CGFloat(i) * trackHeight + trackHeight / 2.0 + paddingTop + offsetY
+        }
+    }
+    
+    func recalculateTopTracks() {
+        let trackCount = max(0, Int(floorf(Float((viewHeight - paddingTop - paddingBottom) / trackHeight))))
+        let offsetY = max(0, (viewHeight - CGFloat(trackCount) * trackHeight) / 2.0)
+        let diffFloatingTrackCount = trackCount - topTracks.count
+        if diffFloatingTrackCount > 0 {
+            for _ in 0..<diffFloatingTrackCount {
+                topTracks.append(DanmakuVerticalTrack(view: self))
+            }
+        } else if diffFloatingTrackCount < 0 {
+            for i in max(0, topTracks.count + diffFloatingTrackCount)..<topTracks.count {
+                topTracks[i].stop()
+            }
+            topTracks.removeLast(Int(abs(diffFloatingTrackCount)))
+        }
+        for i in 0..<topTracks.count {
+            var track = topTracks[i]
+            track.stopClosure = { [weak self] (cell) in
+                guard let strongSelf = self else { return }
+                strongSelf.cellPlayingStop(cell)
+            }
+            track.index = UInt(i)
+            track.playingSpeed = playingSpeed
+            track.positionY = CGFloat(i) * trackHeight + trackHeight / 2.0 + paddingTop + offsetY
+        }
+    }
+    
+    func recalculateBottomTracks() {
+        let trackCount = max(0, Int(floorf(Float((viewHeight - paddingTop - paddingBottom) / trackHeight))))
+        let offsetY = max(0, (viewHeight - CGFloat(trackCount) * trackHeight) / 2.0)
+        let diffFloatingTrackCount = trackCount - bottomTracks.count
+        if diffFloatingTrackCount > 0 {
+            for _ in 0..<diffFloatingTrackCount {
+                bottomTracks.insert(DanmakuVerticalTrack(view: self), at: 0)
+            }
+        } else if diffFloatingTrackCount < 0 {
+            for i in 0..<min(bottomTracks.count, abs(diffFloatingTrackCount)) {
+                bottomTracks[i].stop()
+            }
+            bottomTracks.removeFirst(Int(abs(diffFloatingTrackCount)))
+        }
+        for i in (0..<bottomTracks.count).reversed() {
+            var track = bottomTracks[i]
+            track.stopClosure = { [weak self] (cell) in
+                guard let strongSelf = self else { return }
+                strongSelf.cellPlayingStop(cell)
+            }
+            let index = bottomTracks.count - i - 1
+            track.index = UInt(index)
+            track.playingSpeed = playingSpeed
+#if os(macOS)
+            track.positionY = bounds.height - CGFloat(index) * trackHeight - trackHeight / 2.0 - paddingBottom - offsetY
+#else
+            track.positionY = bounds.height - CGFloat(index) * trackHeight - trackHeight / 2.0 - paddingTop - offsetY
+#endif
+        }
+    }
+    
+    func findLeastNumberDanmakuTrack(for danmaku: DanmakuCellModel) -> DanmakuTrack {
+        func findLeastNumberDanmaku(from tracks: [DanmakuTrack]) -> DanmakuTrack {
+            //Find a track with the minimum danmaku number
+            var index = 0
+            var value = Int.max
+            for i in 0..<tracks.count {
+                let track = tracks[i]
+                if track.danmakuCount < value {
+                    value = track.danmakuCount
+                    index = i
+                }
+            }
+            return tracks[index]
+        }
+        switch danmaku.type {
+        case .floating:
+            return findLeastNumberDanmaku(from: floatingTracks)
+        case .top:
+            return findLeastNumberDanmaku(from: topTracks)
+        case .bottom:
+            return findLeastNumberDanmaku(from: bottomTracks)
+        }
+    }
+    
+    func findSuitableTrack(for danmaku: DanmakuCellModel) -> DanmakuTrack? {
+        switch danmaku.type {
+        case .floating:
+            guard let track = floatingTracks.first(where: { (t) -> Bool in
+                return t.canShoot(danmaku: danmaku)
+            }) else {
+                return nil
+            }
+            return track
+        case .top:
+            guard let track = topTracks.first(where: { (t) -> Bool in
+                return t.canShoot(danmaku: danmaku)
+            }) else {
+                return nil
+            }
+            return track
+        case .bottom:
+            guard let track = bottomTracks.last(where: { (t) -> Bool in
+                return t.canShoot(danmaku: danmaku)
+            }) else {
+                return nil
+            }
+            return track
+        }
+    }
+    
+    func findSuitableSyncTrack(for danmaku: DanmakuCellModel, at progress: Float) -> DanmakuTrack? {
+        switch danmaku.type {
+        case .floating:
+            guard let track = floatingTracks.first(where: { (t) -> Bool in
+                return t.canSync(danmaku, at: progress)
+            }) else {
+                return nil
+            }
+            return track
+        case .top:
+            guard let track = topTracks.first(where: { (t) -> Bool in
+                return t.canSync(danmaku, at: progress)
+            }) else {
+                return nil
+            }
+            return track
+        case .bottom:
+            guard let track = bottomTracks.last(where: { (t) -> Bool in
+                return t.canSync(danmaku, at: progress)
+            }) else {
+                return nil
+            }
+            return track
+        }
+    }
+    
+    func obtainCell(with danmaku: DanmakuCellModel) -> DanmakuCell? {
+        var cell: DanmakuCell?
+        if enableCellReusable {
+            cell = cellFromPool(danmaku)
+        }
+        
+        let frame = CGRect(x: bounds.width, y: 0, width: danmaku.size.width, height: danmaku.size.height)
+        if cell == nil {
+            guard let cls = NSClassFromString(NSStringFromClass(danmaku.cellClass)) as? DanmakuCell.Type else {
+                assert(false, "Launched Danmaku must inherit from DanmakuCell!")
+                return nil
+            }
+            cell = cls.init(frame: frame)
+            cell?.model = danmaku
+        } else {
+            cell?.frame = frame
+            cell?.model = danmaku
+        }
+        return cell
+    }
+    
+    func cellFromPool(_ danmaku: DanmakuCellModel) -> DanmakuCell? {
+        var cells = danmakuPool[NSStringFromClass(danmaku.cellClass)]
+        if cells == nil {
+            cells = []
+        }
+        let cell = (cells?.count ?? 0) > 0 ? cells?.removeFirst() : nil
+        danmakuPool[NSStringFromClass(danmaku.cellClass)] = cells
+        return cell
+    }
+    
+#if os(macOS)
+    @objc
+    private func containerDidClick(_ gesture: NSClickGestureRecognizer) {
+        let p = gesture.location(in: self)
+        if let cell = locateDanmakuCell(at: p) {
+            switchCurrentToggled(cell)
+        } else {
+            // Click on empty space → clear toggled cell
+            stopCurrentToggled()
+        }
+    }
+#endif
+    
+    private func locateDanmakuCell(at p: PlatformPoint) -> DanmakuCell? {
+        for sub in subviews.reversed() {
+            guard let cell = sub as? DanmakuCell else { continue }
+            let rf = cell.realFrame
+            let rect = CGRect(x: rf.midX - cell.bounds.width / 2.0,
+                              y: rf.midY - cell.bounds.height / 2.0,
+                              width: cell.bounds.width,
+                              height: cell.bounds.height)
+            if rect.contains(p) {
+                return cell
+            }
+        }
+        return nil
+    }
+    
+    func appendCellToPool(_ cell: DanmakuCell) {
+        guard let cs = cell.model?.cellClass else {
+            cell.removeFromSuperview()
+            return
+        }
+        // 入池前丢掉上次渲染的位图：layer 的 contents 在池里闲着也白占一份
+        // cell 尺寸的内存（弹幕池一开就是上百个 cell）；复用时反正会整帧重画。
+        #if os(macOS)
+        cell.layer?.contents = nil
+        #else
+        cell.layer.contents = nil
+        #endif
+        var array = danmakuPool[NSStringFromClass(cs)]
+        if array == nil {
+            array = []
+        }
+        array?.append(cell)
+        danmakuPool[NSStringFromClass(cs)] = array
+    }
+    
+    func cellPlayingStop(_ cell: DanmakuCell) {
+#if os(macOS)
+        // Clean up hovered state if this cell was being hovered
+        if cell.model?.identifier == hoveredCell?.model?.identifier {
+            stopCurrentHovered()
+        }
+#endif
+        // Clean up toggled state (cross-platform)
+        if cell.model?.identifier == toggledCell?.model?.identifier {
+            stopCurrentToggled()
+        }
+        // Match DanmuKitMac behavior: always remove from superview when a danmaku ends,
+        // then optionally append to pool for reuse to avoid lingering views.
+        cell.removeFromSuperview()
+        if enableCellReusable {
+            self.appendCellToPool(cell)
+        }
+    }
+    
+#if canImport(UIKit)
+    @objc
+    func danmakuDidTap(_ tap: UITapGestureRecognizer) {
+        let p = tap.location(in: self)
+        if let cell = locateDanmakuCell(at: p) {
+            switchCurrentToggled(cell)
+        } else {
+            stopCurrentToggled()
+        }
+    }
+#endif
+    
+}

@@ -1,0 +1,379 @@
+import Foundation
+
+/// 动画文件名解析出的结构化元数据。
+public struct ParsedAnimeInfo: Sendable, Equatable {
+    /// 原始文件名或标题
+    public let rawName: String
+    /// 提纯后的动画主标题（剥除发布组、规格、集数、副标签等）
+    public let title: String
+    /// 提取出的集数（例如 1, 12, 24）
+    public let episodeNumber: Int?
+    /// 提取出的季数（例如 1, 2, 3），若无法识别则为 nil
+    public let seasonNumber: Int?
+    /// 是否标识为最终季/完结篇
+    public let isFinal: Bool
+
+    public init(
+        rawName: String,
+        title: String,
+        episodeNumber: Int? = nil,
+        seasonNumber: Int? = nil,
+        isFinal: Bool = false
+    ) {
+        self.rawName = rawName
+        self.title = title
+        self.episodeNumber = episodeNumber
+        self.seasonNumber = seasonNumber
+        self.isFinal = isFinal
+    }
+}
+
+/// 动画文件名与标题提取工具。
+/// 能够从各类 BT/PT 发布组、WEB-DL、内嵌字幕及各种命名习惯中提取纯净的动画名、季数与集数。
+public enum DanmakuFilenameParser {
+
+    // MARK: 静态编译的正则缓存
+    //
+    // 打分器对每个候选都调一次 parse()/extractEpisodeNumber()，「全集搜索」可返回
+    // 数百分集——现场编译正则就是主线程秒级卡顿。全部 pattern 编译一次挂静态
+    // （模式是常量，编译失败属程序错误，preconditionFailure 暴露而不是静默跳过）。
+
+    /// 模块内共享的常量正则编译助手（DanmakuCandidateScorer 也用）。
+    static func compiled(_ pattern: String, options: NSRegularExpression.Options = []) -> NSRegularExpression {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: options) else {
+            preconditionFailure("DanmakuFilenameParser 内置正则编译失败: \(pattern)")
+        }
+        return regex
+    }
+
+    private static let isFinalRegex = compiled(
+        "(?:the\\s+)?final\\s+season|最终季|完结篇", options: [.caseInsensitive])
+
+    private static let seasonRegexes: [NSRegularExpression] = [
+        "(?i)(?:^|[\\s_\\-.\\[(])S(\\d{1,2})(?:[Ee]|\\b|[\\s_\\-.\\])])",
+        "(?i)(?<!final\\s)season\\s*(\\d{1,2})",
+        "第\\s*(\\d{1,2})\\s*[季期部]",
+        "(?i)(\\d{1,2})(?:st|nd|rd|th)\\s*season",
+    ].map { compiled($0) }
+
+    private static let chineseSeasonRegex = compiled("第\\s*([一二两三四五六七八九十]+)\\s*[季期部]")
+
+    private static let episodeRegexes: [NSRegularExpression] = [
+        "(?i)(?:s\\d{1,2})?[Ee](?:p)?\\s*(\\d{1,4})(?:v\\d+)?(?:\\b|[^a-zA-Z0-9])",
+        "第\\s*(\\d{1,4})\\s*[话話集回期]",
+        "(?:^|[\\s_\\-.\\[【(])(\\d{1,4})(?:v\\d+)?(?=[\\s_\\-.\\]】)]|$)",
+    ].map { compiled($0) }
+
+    private static let chineseEpisodeRegex = compiled("第\\s*([一二两三四五六七八九十]+)\\s*[话話集回期]")
+
+    private static let tagRegexes: [NSRegularExpression] = [
+        "\\[[^\\]]*\\]",
+        "【[^】]*】",
+        "\\([^\\)]*\\)",
+        "（[^）]*）",
+        "★[^★]*★",
+    ].map { compiled($0) }
+
+    private static let techNoiseRegexes: [NSRegularExpression] = [
+        "(?i)\\b(?:1080p|720p|2160p|4k|uhd|fhd|hd)\\b",
+        "(?i)\\b(?:hevc|avc|x264|x265|h264|h265|10bit|8bit|ma10p)\\b",
+        "(?i)\\b(?:aac|flac|mp3|dts|ac3|eac3|ddp?)\\b",
+        "(?i)\\b(?:web-?dl|web-?rip|baha|cr|bilibili|abema|bdrip|dvdrip)\\b",
+        "(?i)\\b(?:chs|cht|gb|big5|jp|sc|tc|eng|ita)\\b",
+        "(?i)\\b(?:s\\d{1,2}e\\d{1,4}|ep?\\d{1,4})\\b",
+        "第\\s*\\d{1,4}\\s*[话話集回期]",
+        "(?i)season\\s*\\d+",
+        "第\\s*\\d+\\s*[季期部]",
+        "(?i)(?:the\\s+)?final\\s+season|最终季|完结篇",
+    ].map { compiled($0) }
+
+    /// 全角字符转半角。
+    public static func normalizeFullWidth(_ str: String) -> String {
+        var result = ""
+        for scalar in str.unicodeScalars {
+            if scalar.value >= 0xFF01 && scalar.value <= 0xFF5E {
+                if let converted = UnicodeScalar(scalar.value - 0xFEE0) {
+                    result.append(Character(converted))
+                    continue
+                }
+            } else if scalar.value == 0x3000 {
+                result.append(" ")
+                continue
+            }
+            result.append(Character(scalar))
+        }
+        return result
+    }
+
+    /// 中文数字转换为阿拉伯数字（0-99）。
+    public static func parseChineseNumber(_ str: String) -> Int? {
+        let trimmed = str.trimmingCharacters(in: .whitespaces)
+        if let direct = Int(trimmed) { return direct }
+        let map: [Character: Int] = [
+            "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+            "六": 6, "七": 7, "八": 8, "九": 9, "十": 10
+        ]
+        if trimmed.count == 1, let val = map[trimmed.first!] {
+            return val
+        }
+        if trimmed == "十" { return 10 }
+        if trimmed.hasPrefix("十") && trimmed.count == 2 {
+            if let second = map[trimmed[trimmed.index(trimmed.startIndex, offsetBy: 1)]] {
+                return 10 + second
+            }
+        }
+        if trimmed.hasSuffix("十") && trimmed.count == 2 {
+            if let first = map[trimmed.first!] {
+                return first * 10
+            }
+        }
+        if trimmed.count == 3 && trimmed.contains("十") {
+            let chars = Array(trimmed)
+            if let first = map[chars[0]], chars[1] == "十", let third = map[chars[2]] {
+                return first * 10 + third
+            }
+        }
+        return nil
+    }
+
+    /// 送给弹弹play 的匹配文件名。
+    ///
+    /// 原始文件名若已含番剧名（任意语言）就原样用——它自带检索线索。否则按
+    /// 「番剧名 + 第N季 + 集数」合成规范名，**不再拼回原始文件名**：实测
+    /// `葬送的芙莉莲 第1季 E05 01.mkv` 会让弹弹play 的模糊匹配锁到「第1话」
+    /// （尾部裸数字干扰），而 `葬送的芙莉莲 第1季 第05话` 正确落到「第5话」。
+    /// 官方契约要求 fileName 不含扩展名，这里统一剥掉。
+    ///
+    /// `seriesTitle` 为空时无从合成，退回原始文件名。
+    public static func canonicalMatchName(
+        seriesTitle: String?,
+        season: Int?,
+        episode: DanmakuEpisodeToken?,
+        rawFileName: String
+    ) -> String {
+        let normalized = normalizeFullWidth(rawFileName)
+            .replacingOccurrences(of: "\\", with: "/")
+        let lastComponent = normalized.split(separator: "/").last.map(String.init) ?? normalized
+        let withoutExtension = (lastComponent as NSString).deletingPathExtension
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = withoutExtension.isEmpty ? lastComponent : withoutExtension
+
+        let series = seriesTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !series.isEmpty else { return fallback }
+
+        let comparableSeries = comparableTitle(series)
+        if !comparableSeries.isEmpty,
+           comparableTitle(fallback).contains(comparableSeries) {
+            return fallback
+        }
+
+        var name = series
+        if let season, season > 1 {
+            name += " 第\(season)季"
+        }
+        switch episode {
+        case .number(let value):
+            name += " 第\(String(format: "%02d", value))话"
+        case .special(let kind, let index):
+            name += " \(kind.keyword)\(index)"
+        case nil:
+            break
+        }
+        return name
+    }
+
+    /// 标题比较用的归一形态：全角转半角、小写、只留字母与数字。
+    /// 打分器与规范名判重共用（`Re：从零…` 与 `Re 从零…` 视为同一标题）。
+    public static func comparableTitle(_ title: String) -> String {
+        let normalized = normalizeFullWidth(title).lowercased()
+        var cleaned = ""
+        for ch in normalized where ch.isLetter || ch.isNumber {
+            cleaned.append(ch)
+        }
+        return cleaned
+    }
+
+    /// 解析文件名。
+    public static func parse(_ raw: String) -> ParsedAnimeInfo {
+        let normalized = normalizeFullWidth(raw)
+            .replacingOccurrences(of: "\\", with: "/")
+        let filenameWithExt = normalized.split(separator: "/").last.map(String.init) ?? normalized
+        let filename = (filenameWithExt as NSString).deletingPathExtension
+
+        let working = filename
+
+        // 1. 识别最终季
+        let isFinal = isFinalRegex.firstMatch(
+            in: working, range: NSRange(working.startIndex..., in: working)) != nil
+
+        // 2. 识别季度（如果是最终季，不应把紧随其后的集数当成 Season 编号）
+        var detectedSeason: Int? = nil
+        if !isFinal {
+            for regex in seasonRegexes {
+                if let match = regex.firstMatch(in: working, range: NSRange(working.startIndex..., in: working)),
+                   let range = Range(match.range(at: 1), in: working),
+                   let num = Int(working[range]) {
+                    detectedSeason = num
+                    break
+                }
+            }
+            if detectedSeason == nil {
+                // 中文季数：如 "第二季" / "第2季"
+                if let match = chineseSeasonRegex.firstMatch(in: working, range: NSRange(working.startIndex..., in: working)),
+                   let range = Range(match.range(at: 1), in: working),
+                   let num = parseChineseNumber(String(working[range])) {
+                    detectedSeason = num
+                }
+            }
+        }
+
+        // 3. 识别集数
+        var detectedEpisode: Int? = nil
+        for regex in episodeRegexes {
+            let matches = regex.matches(in: working, range: NSRange(working.startIndex..., in: working))
+            for match in matches {
+                if let range = Range(match.range(at: 1), in: working),
+                   let num = Int(working[range]) {
+                    if num == 1080 || num == 720 || num == 2160 || (num >= 1970 && num <= 2050) {
+                        continue
+                    }
+                    if let s = detectedSeason, num == s {
+                        continue
+                    }
+                    detectedEpisode = num
+                    break
+                }
+            }
+            if detectedEpisode != nil { break }
+        }
+        if detectedEpisode == nil {
+            // 中文集数：如 "第十二话"
+            if let match = chineseEpisodeRegex.firstMatch(in: working, range: NSRange(working.startIndex..., in: working)),
+               let range = Range(match.range(at: 1), in: working),
+               let num = parseChineseNumber(String(working[range])) {
+                detectedEpisode = num
+            }
+        }
+
+        // 4. 清理标题（剥除发布组标签、压制规格、集数、后缀）
+        var cleanTitle = working
+
+        // 准确提取并剥离各组括号内容：[...]、【...】、(...)、（...）、★...★
+        // 逐正则扫（每趟在当前串上重新匹配，删除后其余正则的范围不失效）。
+        let bracketCharacterSet = CharacterSet(charactersIn: "[]【】()（）★ ")
+        // 社区命名惯例：行首第一个方括号是发布组位（VCB-Studio 等枚举外组名也成立）。
+        // 但仅当全名还有别的括号组时才按位置剥——单括号组的首槽往往是标题本身，
+        // 剥了会把标题剥没（"[标题] 02"）。
+        let totalTagCount = tagRegexes.reduce(0) { count, regex in
+            count + regex.numberOfMatches(
+                in: cleanTitle, range: NSRange(cleanTitle.startIndex..., in: cleanTitle))
+        }
+        for regex in tagRegexes {
+            let matches = regex.matches(in: cleanTitle, range: NSRange(cleanTitle.startIndex..., in: cleanTitle))
+            for m in matches.reversed() {
+                if let r = Range(m.range, in: cleanTitle) {
+                    let fullTag = String(cleanTitle[r])
+                    let inner = fullTag.trimmingCharacters(in: bracketCharacterSet)
+                    let isEpisodeTag = detectedEpisode != nil
+                        && (inner == "\(detectedEpisode!)" || inner == String(format: "%02d", detectedEpisode!))
+                    // 4 位年份（如 [2023]）：集数检测跳过年份，标题清理同样剥掉。
+                    let isYearTag = inner.count == 4 && inner.allSatisfy(\.isNumber)
+                        && (1900...2100).contains(Int(inner) ?? 0)
+                    let isLeadingReleaseGroupSlot = m.range.location == 0 && totalTagCount > 1
+                    if isNoiseTag(inner) || isEpisodeTag || isYearTag || isLeadingReleaseGroupSlot {
+                        cleanTitle.removeSubrange(r)
+                    }
+                }
+            }
+        }
+
+        // 剥离分辨率和常见技术关键词
+        for regex in techNoiseRegexes {
+            let range = NSRange(cleanTitle.startIndex..., in: cleanTitle)
+            cleanTitle = regex.stringByReplacingMatches(in: cleanTitle, options: [], range: range, withTemplate: " ")
+        }
+
+        // 如果包含 " - "，通常格式为 "动画名 - 集数"
+        let dashSegments = cleanTitle.components(separatedBy: " - ")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if dashSegments.count >= 2 {
+            cleanTitle = dashSegments[0]
+        } else if dashSegments.count == 1, detectedEpisode != nil {
+            // 无 dash 的简单命名（"[标题] 02"）：集数已在括号阶段识别，剥掉标题
+            // 尾部裸露的集数尾巴，避免 "Frieren] 02" 这类残留。
+            let epPatterns = ["\\s*\\]?", String(format: "%02d", detectedEpisode!), "\\s*$"]
+            let tailRegex = compiled(epPatterns.joined())
+            cleanTitle = tailRegex.stringByReplacingMatches(
+                in: cleanTitle,
+                range: NSRange(cleanTitle.startIndex..., in: cleanTitle),
+                withTemplate: "")
+        }
+
+        // 针对 "Title.S01E05" 这种点号分隔命名，若集数在末尾或被剥除后以点号结尾，清理点号
+        cleanTitle = cleanTitle.replacingOccurrences(of: ".", with: " ")
+        cleanTitle = cleanTitle.replacingOccurrences(of: "_", with: " ")
+
+        // 移除多余空白和符号
+        cleanTitle = cleanTitle
+            .trimmingCharacters(in: CharacterSet(charactersIn: " -_./[]()【】 "))
+        cleanTitle = cleanTitle.components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+
+        if cleanTitle.isEmpty {
+            cleanTitle = filename
+        }
+
+        return ParsedAnimeInfo(
+            rawName: raw,
+            title: cleanTitle,
+            episodeNumber: detectedEpisode,
+            seasonNumber: detectedSeason,
+            isFinal: isFinal
+        )
+    }
+
+    /// 判断括号内的字符串是否为噪声标签（发布组、规格、哈希等）
+    private static func isNoiseTag(_ tag: String) -> Bool {
+        let lower = tag.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if lower.isEmpty { return true }
+
+        // CRC32 校验码（如 9C874A2B）
+        if lower.count == 8 && lower.allSatisfy({ $0.isHexDigit }) {
+            return true
+        }
+
+        // 纯数字集数（如 "01", "12"）
+        if let num = Int(lower), num >= 0 && num <= 2000 && num != 1080 && num != 720 {
+            return true
+        }
+
+        // 4 位年份（如 2023）：与集数检测跳过年份的口径一致（1970-2050 不是集数）。
+        if lower.count == 4, lower.allSatisfy(\.isHexDigit),
+           let num = Int(lower), (1900...2100).contains(num) {
+            return true
+        }
+
+        // 常见发布组
+        let releaseGroups = [
+            "nc-raws", "lilith-raws", "ani", "b-global", "sweetsub", "lolihouse", "dmg",
+            "beansub", "mikan", "dbd-raws", "喵萌奶茶屋", "幻樱字幕组", "极影字幕社", "诸神字幕组",
+            "悠哈璃羽字幕社", "风车字幕组", "恶魔奶爸字幕组"
+        ]
+        for rg in releaseGroups {
+            if lower.contains(rg) { return true }
+        }
+
+        let noiseKeywords = [
+            "1080p", "720p", "2160p", "4k", "hevc", "avc", "x264", "x265", "h264", "h265",
+            "aac", "flac", "ac3", "dts", "10bit", "8bit", "ma10p", "web-dl", "webrip", "baha",
+            "cr", "bilibili", "chs", "cht", "gb", "big5", "简日双语", "繁日双语", "简繁", "双语",
+            "新番", "招募", "字幕", "bdrip", "dvdrip", "mp4", "mkv", "sc", "tc"
+        ]
+        for kw in noiseKeywords {
+            if lower.contains(kw) { return true }
+        }
+        return false
+    }
+}

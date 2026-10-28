@@ -1,0 +1,1159 @@
+import AppDesignKit
+import PlaybackKit
+import Observation
+import SwiftUI
+import UniformTypeIdentifiers
+
+#if os(macOS)
+import AppKit
+import Combine
+#elseif os(iOS)
+import UIKit
+#endif
+
+/// 层级尺寸夹紧：让一层向父层报告的尺寸恒等于**父层给的提案**，
+/// 内容再大也不外传（内容照常绘制，只是不参与父层定尺寸）。
+///
+/// 用在「按别处实测值算内边距」的层（如浮动跳过按钮层：底距吃面板实测高度）：
+/// 那种层的理想高度可能超过屏幕，而它是播放器根 `ZStack` 的子视图，
+/// `ZStack` 尺寸 = max(子视图) → 溢出会把视频 surface 的 frame 一起撑大
+/// （内核 resize + CoreAnimation 把旧 drawable 拉伸 = 画面被撑大）。
+/// `GeometryReader` 是贪婪容器：按提案尺寸报告自己，是这层最省事的夹紧件。
+struct PlayerLayoutClamp<Content: View>: View {
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        GeometryReader { proxy in
+            content
+                .frame(width: proxy.size.width, height: proxy.size.height)
+        }
+    }
+}
+
+/// 全 App 覆盖式播放器（Infuse 风格悬浮控件）：
+/// - 画面铺满整个窗口 / 屏幕，控件浮在上面
+/// - macOS：鼠标动一下就唤出，播放 / 暂停中 3 秒自动隐藏；iOS：点画面切换显示
+/// - 缓冲 / 出错时控件常驻；顶部「×」或 ESC 关闭
+///
+/// 音轨 / 字幕菜单是 M2 范围（内核 `select_*_track` 已核实可用），这里先留位。
+struct PlayerScreen: View {
+    @Environment(PlaybackController.self) private var controller
+    @Environment(AppModel.self) private var app
+    @Environment(DanmakuModel.self) private var danmakuModel
+    @Environment(\.accessibilityVoiceOverEnabled) private var isVoiceOverEnabled
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+
+    /// 覆盖层出现时要打开的源；nil = 空画面（引擎失败等极端情况）。
+    let request: PlaybackRequest?
+
+    /// RootView 在 ignoresSafeArea 之外读到的系统安全区（灵动岛/圆角禁区）。
+    /// 注入 `\.playerChromeInsets` 供 HUD 各锚点让位（见 PlayerChromeMetrics）；
+    /// macOS 恒 .zero。
+    var chromeInsets: EdgeInsets = EdgeInsets()
+
+    @State private var hudVisibility = PlayerHUDVisibilityCoordinator()
+    @State private var showInfoPanel = false
+    @State private var isImportingSubtitle = false
+    @State private var isSelectingDanmaku = false
+    // 右下角功能面板当前展开的 Tab（nil = 收起）。跳过按钮层据此让位：
+    // 面板打开时跳过钮由 HUD 簇浮动到面板上方，这里的独立实例隐藏。
+    @State private var expandedActionTab: PlayerHUDActionTab?
+    // 展开面板卡片的可见总高（面板内实测回传，含子菜单头部、超上限截断），面板打开时跳过钮抬到其上方。
+    @State private var panelContentHeight: CGFloat = .zero
+    @State private var screenshotToast: String?
+    @State private var screenshotToastToken: UUID?
+    // shareURL 的缓存值（含 FileManager.stat），request 变化时重算一次。
+    @State private var cachedShareURL: URL?
+    /// 关闭流程进行中（点 × / ESC 到 dismiss 完成）：窗口带着画面缩回原位、
+    /// 停播被推迟到缩完。抑制无引擎占位图，避免「画中画样式图标 + 标题」
+    /// 在停播到退出播放器的窗口期裸露闪现。
+    @State private var isClosing = false
+    /// 只存布局档位，不存逐像素宽度，窗口缩放时不会让整套 HUD 每像素重建。
+    @State private var isNarrow = false
+    /// iOS 横滑 seek 时只显示底部时间轴，其余 HUD 暂时隐藏。
+    @State private var panFeedback = PlayerPanFeedback()
+    #if os(macOS)
+    @State private var isFullscreen = false
+    /// 键盘监听器引用（安装后持有，退出播放器时移除）。用 NSEvent local monitor 而不是
+    /// `.onKeyPress`：后者要求视图先拿到键盘焦点，覆盖层播放器根本抢不到焦点，按键会静默丢失。
+    @State private var keyMonitor: Any?
+    #endif
+    #if os(iOS)
+    /// 画面手势层尺寸（左右半屏分界、纵滑量程都按它折算）。
+    @State private var panAreaSize: CGSize = .zero
+    @State private var systemVolume = SystemVolumeState()
+    @State private var shouldRestoreHUDAfterSeek = false
+    /// 一次触摸的起点（nil = 手指不在屏上）。单击/双击/长按全靠它计时判定。
+    @State private var touchStart: TouchStart?
+    /// 本触摸最近一次位移；长按定时器到点时判断「手指是否还停在原地」用。
+    /// 当前触摸的累计位移。
+    ///
+    /// ## 为什么是 `@State` **持有**一个不做观察的引用容器
+    ///
+    /// 它**只在长按判定的 Task 里读一次**（判 `movementSlop`），却**每个触摸事件
+    /// 都要写**。原来直接是 `@State private var touchTranslation: CGSize`，而
+    /// `@State` 的失效粒度是**整个视图**：一写就标脏 `PlayerScreen`，于是每次
+    /// `onChanged` 都让根 body 重算一遍 —— HUD 挂载时那一整棵 Glass 树（11 面玻璃）
+    /// 跟着每个触摸事件重跑。
+    ///
+    /// ## ⚠️ 必须是 `@State`（而不是 `let`）
+    ///
+    /// `PlayerScreen` 是 **struct（值类型）**，每次 body 重算都会重新构造它。
+    /// 写成 `let touchTranslationStore = TouchTranslationStore()` 的话，**每次重算
+    /// 都新建一个空容器**，触摸位移直接丢光 —— 长按判定会永远读到 `.zero`。
+    ///
+    /// `@State` 的职责正是「跨 body 重算保住这个引用」。而
+    /// `TouchTranslationStore` **不是 `@Observable`**，所以写它的属性**不会**触发
+    /// 任何视图失效 —— 两者结合才是我们要的：**持久 + 不触发重算**。
+    ///
+    /// 同文件 `panFeedback`（`@State private var panFeedback = PlayerPanFeedback()`）
+    /// 是同一模式，区别只在于那个容器是 `@Observable`（供子视图观察）。
+    @State private var touchTranslationStore = TouchTranslationStore()
+    /// 上一次轻点时刻（双击判定窗口）。
+    @State private var lastTapDate: Date?
+    /// 单击延迟任务：等双击窗口过期才切 HUD，第二击来了就取消。
+    @State private var singleTapTask: Task<Void, Never>?
+    /// 长按判定任务：到点仍停在原地才进 2x。
+    @State private var holdTask: Task<Void, Never>?
+    /// seek 提交去抖任务：吃掉换指瞬间 SwiftUI 强发 onEnded 的假提交。
+    @State private var pendingPanCommit: Task<Void, Never>?
+
+    struct TouchStart {
+        let date: Date
+        let location: CGPoint
+    }
+
+    /// 触摸判定阈值。移动判定统一用 slop；时间用秒（Date 差值）或 Duration（Task.sleep）。
+    private enum TouchLimits {
+        static let holdDuration: Duration = .milliseconds(350)
+        static let tapMaxDuration: TimeInterval = 0.3
+        static let movementSlop: CGFloat = 12
+        static let panThreshold: CGFloat = 14
+        static let doubleTapInterval: TimeInterval = 0.35
+        // 单击动作必须等在双击窗口**之后**才执行：原先 320 < 350，第二击落在
+        // 320-350ms 区间时单击已先把 HUD 切了，双击暂停永远丢。
+        static let singleTapDelay: Duration = .milliseconds(360)
+        /// seek 提交去抖：DragGesture 单触点，第二根手指落下会强制结束当前拖动
+        /// （onEnded 照发），紧接着换指的新 onChanged 用它把这个假提交取消掉。
+        static let panCommitDebounce: Duration = .milliseconds(80)
+    }
+    #endif
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            PlayerVideoSurface(
+                engine: controller.engine,
+                title: request?.title ?? "没有正在播放的内容",
+                setupError: controller.setupError,
+                showsPlaceholder: !isClosing
+            )
+            #if os(macOS)
+            PlayerMouseTrackingView { location in
+                hudVisibility.pointerMoved(to: location, canAutoHide: canAutoHideControls)
+            } onExited: {
+                hudVisibility.pointerExited()
+                hudVisibility.hideOnPointerExit()
+            }
+            #endif
+            // 弹幕一律走 App 层 overlay（内核弹幕当前版本被禁用）。垫在视频之上、手势层之下。
+            if controller.usesOverlayDanmakuRenderer {
+                DanmakuOverlayHost(controller: controller.danmakuOverlay)
+            }
+            playerGestureLayer
+
+            // 缓冲指示：判据是迟滞后的 UI 缓冲态（单帧饿数据不闪转圈，真值见 state.isBuffering）。
+            // **自带玻璃底、不挂 HUD**：HUD 收起时不必为了白转圈压暗整幅画面；
+            // 独立底板维持亮场面上的可读性（见 PlayerHUDGates）。
+            // 常挂载 + `.opacity` 淡入淡出：HUD 收起期间没有容器动画托底，`if` 挂载会是硬闪。
+            PlayerHUDPanel(in: Circle()) {
+                ProgressView()
+                    .controlSize(.large)
+                    .tint(PlayerHUDPalette.primary)
+                    .padding(16)
+            }
+            .opacity(showsBufferingIndicator ? 1 : 0)
+            .motion(Motion.standard, value: showsBufferingIndicator)
+            .allowsHitTesting(false)
+            .accessibilityHidden(!showsBufferingIndicator)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("缓冲中")
+
+            if controller.state.state == .error || controller.setupError != nil {
+                PlayerPlaybackErrorBadge()
+            }
+
+            // 两阶段显隐：`isMounted` 控制 `if` 卸载（隐藏时动画跑完才真正卸载，
+            // 卸载期间 HUD 不再随播放 tick 重排）；`isVisible` 控制 `.opacity`
+            // 驱动淡入淡出——macOS 上 `.transition` 的 removal 不被动画化，
+            // 所以淡出必须用 `.opacity` 属性动画（协调器 setVisible 里两拍错开）。
+            if hudVisibility.isMounted {
+                PlayerHUDOverlay(
+                    isNarrow: isNarrow,
+                    playbackID: request?.id.uuidString ?? "",
+                    title: mainTitle,
+                    kicker: titleKicker,
+                    panFeedback: panFeedback,
+                    expandedTab: $expandedActionTab,
+                    panelContentHeight: $panelContentHeight,
+                    isImportingSubtitle: $isImportingSubtitle,
+                    isSelectingDanmaku: $isSelectingDanmaku,
+                    showInfoPanel: $showInfoPanel,
+                    shareURL: cachedShareURL,
+                    isFullscreen: hudIsFullscreen,
+                    onClose: closePlayer,
+                    onToggleFullscreen: toggleFullscreenFromHUD,
+                    onCapture: captureNow,
+                    onShare: shareNow,
+                    onInteractionChanged: handleHUDInteraction,
+                    onUserInteraction: revealControls
+                )
+                .opacity(hudVisibility.isVisible ? 1 : 0)
+                .allowsHitTesting(hudVisibility.isVisible)
+                .accessibilityHidden(!hudVisibility.isVisible)
+            }
+
+            if showInfoPanel {
+                PlayerHUDInfoPanel(title: mainTitle, kicker: titleKicker, isNarrow: isNarrow)
+            }
+            // 浮动跳过片头/片尾按钮:放在 ZStack 最上方(HUD 之上),提高位置避免被底栏遮挡。
+            // 单实例常驻（不在玻璃容器内挂副本——那会打断面板的液态展开动画）：
+            // 功能面板打开时改用「簇底距 + 按钮高 + 间距 + 面板实测高度」抬到面板上方空位。
+            //
+            // ⚠️ 本层的理想高度可能超过屏幕（底距吃面板实测高度，横屏上面板 320 上限
+            // 时整层 ≈ 540pt > 屏高），而它是根 ZStack 的子视图——溢出会把视频 surface
+            // 的 frame 一起撑大（画面被撑大，issue #5 的另一条传播路径）。套
+            // `PlayerLayoutClamp`：本层向父层报告的尺寸恒为提案（= 屏幕），溢出照常
+            // 绘制但不参与父层定尺寸；层内 Spacer 布局与按钮位置分毫不变。
+            let isActionPanelOpen = expandedActionTab != nil
+            let skipBottomPadding: CGFloat = isActionPanelOpen
+                ? (isNarrow ? 90 : 106) + (isNarrow ? 44 : 40) + 12 + panelContentHeight + 12
+                : (isNarrow ? 150 : 168)
+            PlayerLayoutClamp {
+                VStack {
+                    Spacer(minLength: 0)
+                    HStack {
+                        Spacer(minLength: 0)
+                        PlayerSkipPromptView()
+                            .padding(.trailing, PlayerChromeMetrics.sidePadding(chromeInsets, isNarrow: isNarrow))
+                            .padding(.bottom, skipBottomPadding)
+                    }
+                }
+            }
+            .allowsHitTesting(true)
+            .motion(Motion.glass, value: expandedActionTab)
+            .motion(Motion.glass, value: panelContentHeight)
+
+            // 长按右键 2x 提示徽章：独立于 HUD 显隐（加速不唤醒 HUD），浮在顶部中央。
+            VStack(spacing: 0) {
+                PlayerHoldFastForwardBadge()
+                    .padding(.top, holdBadgeTopPadding)
+                Spacer(minLength: 0)
+            }
+            .allowsHitTesting(false)
+
+            #if os(iOS)
+            SystemVolumeControl(state: systemVolume)
+
+            // 横滑期间只显示底部时间轴；亮度 OSD 独立显示，不唤醒整套 HUD。
+            // 只把 @Observable 的 feedback 引用传下去，逐帧更新只重算这个子树。
+            PlayerPanFeedbackOverlay(
+                feedback: panFeedback,
+                isNarrow: isNarrow,
+                playbackID: request?.id.uuidString ?? "",
+                onInteractionChanged: handleHUDInteraction
+            )
+            #endif
+
+            PlayerScreenshotToast(message: screenshotToast)
+        }
+        // HUD 显隐动画：`.animation(value:)` 挂在容器上，`.opacity` 属性动画
+        // 两个方向都渐变（macOS 上 transition removal 不生效，见上方注释）。
+        .motion(Motion.standard, value: hudVisibility.isVisible)
+        // opening→ready/playing 时让 loading 层、缓冲圈、错误徽章的显隐柔和过渡。
+        .motion(Motion.standard, value: controller.state.state)
+        // HUD 只在播放器子树使用 dark scheme；系统 Glass、Menu、Slider 和语义前景色
+        // 因此走同一套解析，不会把底层 AppShell 的外观一并切换。
+        .environment(\.colorScheme, .dark)
+        // 本树整体 ignoresSafeArea 后安全区已归零，把外层读到的真实值发给
+        // HUD 锚点（顶栏 / 信息面板 / 动作簇 / OSD …）做系统 chrome 让位。
+        .environment(\.playerChromeInsets, chromeInsets)
+        .onGeometryChange(for: Bool.self) { proxy in
+            proxy.size.width < 560
+        } action: { isNarrow = $0 }
+        .fileImporter(isPresented: $isImportingSubtitle,
+                      allowedContentTypes: Self.subtitleTypes) { result in
+            if case .success(let url) = result {
+                controller.loadExternalSubtitle(fileURL: url)
+            }
+        }
+        .sheet(isPresented: $isSelectingDanmaku) {
+            let suggestion = danmakuModel.danmaku.searchSuggestion(for: request?.id)
+            DanmakuSelectionSheet(
+                requestID: request?.id,
+                initialAnime: suggestion?.anime
+                    ?? app.nowPlayingItem?.seriesName
+                    ?? app.nowPlayingItem?.name
+                    ?? mainTitle,
+                initialEpisode: suggestion?.episode
+                    ?? app.nowPlayingItem?.episodeNumber.map(String.init)
+                    ?? ""
+            )
+            .presentationBackground(.clear)
+        }
+        #if os(macOS)
+        // 鼠标移动只走 PlayerMouseTrackingView（NSTrackingArea，.activeAlways）一条通道；
+        // `.onContinuousHover` 已删——两条通道监听同一事件，同一移动会触发两遍
+        // （且两者坐标系不同，pointerMoved 的去重比对被搅和失效）。
+        .onReceive(NotificationCenter.default.publisher(for: NSMenu.didBeginTrackingNotification)) {
+            notification in
+            guard let menu = notification.object as? NSMenu else { return }
+            hudVisibility.menuTrackingDidBegin(menu, canAutoHide: canAutoHideControls)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSMenu.didEndTrackingNotification)) {
+            notification in
+            guard let menu = notification.object as? NSMenu else { return }
+            hudVisibility.menuTrackingDidEnd(menu, canAutoHide: canAutoHideControls)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) {
+            notification in
+            guard let window = notification.object as? NSWindow,
+                  window.isKeyWindow || window.isMainWindow
+            else { return }
+            isFullscreen = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) {
+            notification in
+            guard let window = notification.object as? NSWindow,
+                  window.isKeyWindow || window.isMainWindow || isFullscreen
+            else { return }
+            isFullscreen = false
+        }
+        // 长按 2x 期间切走 App：keyUp 会丢，主动收尾恢复原速（幂等）。
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didResignActiveNotification)) { _ in
+            controller.endHoldFastForward()
+        }
+        // 显示器 EDR headroom 探针：换屏 / 显示配置变化时重报。内核 macOS 端
+        // 不探测屏幕，HDR 输出档位全靠宿主喂（创建 config + 运行时推送）。
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSWindow.didChangeScreenNotification)) { notification in
+            guard let window = notification.object as? NSWindow,
+                  window.isKeyWindow || window.isMainWindow
+            else { return }
+            reportDisplayEDRHeadroom()
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didChangeScreenParametersNotification)) { _ in
+            reportDisplayEDRHeadroom()
+        }
+        #endif
+        .onAppear {
+            PlaybackLog.info("PlayerScreen onAppear request=\(request?.title ?? "nil")")
+            #if os(macOS)
+            playerLog.info("PlayerScreen onAppear")
+            PlayerWindowFitter.saveOriginalIfNeeded()
+            installKeyMonitor()
+            isFullscreen = NSApp.keyWindow?.styleMask.contains(.fullScreen) ?? false
+            reportDisplayEDRHeadroom()
+            #endif
+        }
+        // task(id:)：覆盖层已开着时换片（onOpenURL / 播另一集）也能重新打开
+        .task(id: request) {
+            guard let request, !Task.isCancelled else { return }
+            PlaybackLog.append("PlayerScreen task id=\(request.title)")
+            // 含 FileManager.stat，缓存住别在每次 body 都 stat；换片随 id 重算。
+            cachedShareURL = computeShareURL()
+            controller.openIfNeeded(request)
+            guard !Task.isCancelled else { return }
+            revealControls()
+        }
+        .onChange(of: request?.id) {
+            isSelectingDanmaku = false
+        }
+        // 协调器没有 Environment，减弱动态效果由这里解析后灌给它。
+        .onChange(of: reduceMotion, initial: true) {
+            hudVisibility.motionAnimation = reduceMotion ? nil : Motion.standard
+            // 卸载延时跟随动画：无动画（reduceMotion）时立即卸载。
+            hudVisibility.unmountDelay = reduceMotion ? .zero : .seconds(Motion.standardSeconds)
+        }
+        .onChange(of: controller.state.state, initial: true) { _, newState in
+            PlaybackLog.info("PlayerState -> \(newState)")
+            // 只有真在出画面时才压着不让息屏；暂停 / 出错立刻放手。
+            // 同一处顺带把系统「正在播放」的播放/暂停状态对齐。
+            controller.syncSystemPlaybackState()
+        }
+        // 系统「正在播放」的进度：跟着**整秒**才变的 displayPosition 走，约 1 Hz，
+        // 顺带覆盖 seek / 变速这些不改 state 的路径。
+        .onChange(of: controller.state.timeline.displayPosition) {
+            controller.syncSystemPlaybackState()
+        }
+        // 标题要等 AppModel 的 nowPlayingItem 到位才拼得出来，所以单独跟一次。
+        .onChange(of: NowPlayingTitle(title: mainTitle, kicker: titleKicker), initial: true) {
+            _, titles in
+            controller.updateNowPlayingMetadata(title: titles.title, subtitle: titles.kicker)
+        }
+        // 显隐触发只看「用户是否需要控件」（`PlayerHUDGates.revealTrigger`，不含缓冲）：
+        // 缓冲起/止也唤出 HUD 的话，全屏压暗遮罩会跟着画面暗一下亮一下（issue #2）。
+        .onChange(of: hudGates.revealTrigger, initial: true) {
+            revealControls()
+        }
+        // 缓冲只改自动收起资格：已经在屏上的 HUD 留住，但不主动唤出来。
+        .onChange(of: hudGates.canAutoHide) { _, canAutoHide in
+            hudVisibility.refreshAutoHide(canAutoHide: canAutoHide)
+        }
+        .onDisappear {
+            hudVisibility.cancel()
+            // 覆盖层没了就一定看不见画面：无条件还掉息屏令牌和系统登记。
+            // （取消准备 / 注销这两条路只清 presentedPlayer，不停引擎，
+            // 所以这里不能"按当前状态推导"，见 releaseSystemPlaybackState 注释。）
+            controller.releaseSystemPlaybackState()
+            // 长按 2x 的兜底收尾（幂等）：iOS 手势被系统打断收不到抬起、
+            // macOS keyUp 丢失时也走这里。正常路径触摸状态机 / keyUp 已先收。
+            controller.endHoldFastForward()
+            #if os(iOS)
+            holdTask?.cancel()
+            singleTapTask?.cancel()
+            touchStart = nil
+            lastTapDate = nil
+            #endif
+        }
+        #if os(macOS)
+        .onChange(of: controller.state.videoParams) { _, params in
+            // 视频参数到达 / 换片 → 窗口贴合视频比例（重复同规格不抖动，见 Fitter）
+            if let params {
+                PlayerWindowFitter.fit(videoWidth: params.width, videoHeight: params.height)
+            }
+        }
+        // 光标跟 HUD 同步：自动隐藏时藏起，鼠标一动系统自动还回。
+        // 不用 NSCursor.hide()/unhide() 配平——漏一次 unhide 光标就永久没了。
+        .onChange(of: hudVisibility.isVisible, initial: true) { _, visible in
+            syncCursorWithHUD(visible: visible)
+        }
+        .onDisappear {
+            playerLog.info("PlayerScreen onDisappear")
+            PlayerWindowFitter.restore()
+            uninstallKeyMonitor()
+            // 退出播放器无条件还回光标：避免在「隐藏直到移动」状态下关掉覆盖层。
+            NSCursor.unhide()
+        }
+        #endif
+    }
+
+    /// 画面手势使用独立命中层，位于视频之上、HUD 之下。
+    /// Button、Menu 和 Slider 因此不会再把点击冒泡成播放暂停或隐藏 HUD。
+    private var playerGestureLayer: some View {
+        Color.clear
+            .contentShape(Rectangle())
+            #if os(macOS)
+            .onTapGesture(count: 2) { toggleFullscreen() }
+            .onTapGesture { toggleControls() }
+            #else
+            // iOS 画面手势（单击 HUD / 双击暂停 / 长按 2x / 滑动 seek·亮度·音量）
+            // 由**一个** minimumDistance = 0 的 DragGesture 统一计时判定。
+            // SwiftUI 的 tap / longPress 独立仲裁和滑动手势叠在一起抢不出稳定
+            // 优先级（实测双击会被吞），自己分类是确定性的，行为同 bilibili。
+            .gesture(playerTouchGesture)
+            .onGeometryChange(for: CGSize.self) { proxy in
+                proxy.size
+            } action: { panAreaSize = $0 }
+            // 切后台 / 来电中断：被打断的触摸不会再有 onEnded，在场景切换时收尾，
+            // 避免回前台后 hold 任务到点触发 2x、或滑动会话从旧起点继续。
+            .onChange(of: scenePhase) { _, phase in
+                guard phase != .active else { return }
+                interruptTouchSession()
+            }
+            #endif
+    }
+
+    // MARK: - iOS 画面触摸状态机（单击 / 双击 / 长按 2x / 滑动）
+
+    #if os(iOS)
+    private var playerTouchGesture: some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { handleTouchChanged($0) }
+            .onEnded { handleTouchEnded($0) }
+    }
+
+    private func handleTouchChanged(_ value: DragGesture.Value) {
+        if let existing = touchStart {
+            if value.startLocation == existing.location {
+                // 同一触摸在延续（startLocation 在拖动开始时就固定了）。
+                touchTranslationStore.translation = value.translation
+                classifyPanIfNeeded(at: value)
+                return
+            }
+            // startLocation 变了：不是同一根手指的延续。SwiftUI 会把拖动重定向到
+            // 第二根手指、或旧触摸被系统手势打断后重启拖动——旧触摸按打断收尾
+            // （seek 不落盘），新触摸重新起会话，亮度/音量不再沿用旧起点跳变。
+            interruptTouchSession()
+        }
+        // 全新触摸：若 seek 提交还在 80ms 去抖窗口内，几乎必然是「假 onEnded
+        // （多指强制结束）之后紧接着落下的第二根手指」——取消那个提交。
+        // 真松手后 80ms 内就重开新拖动的场景几乎不存在，且后果只是这次拖动
+        // 不落盘，手指还在屏上、重拖成本≈0。
+        cancelPendingPanCommit()
+        touchStart = TouchStart(date: Date(), location: value.startLocation)
+        touchTranslationStore.translation = value.translation
+        scheduleHoldDetection()
+    }
+
+    /// 长按判定：到点时手指仍在屏上、没滑走、不在别的手势里，进临时 2 倍速。
+    private func scheduleHoldDetection() {
+        holdTask?.cancel()
+        holdTask = Task { @MainActor in
+            try? await Task.sleep(for: TouchLimits.holdDuration)
+            guard !Task.isCancelled else { return }
+            let translation = touchTranslationStore.translation
+            guard touchStart != nil,
+                  abs(translation.width) < TouchLimits.movementSlop,
+                  abs(translation.height) < TouchLimits.movementSlop,
+                  panFeedback.session == nil,
+                  !controller.isHoldFastForwarding
+            else { return }
+            controller.beginHoldFastForward()
+        }
+    }
+
+    /// 滑动分类（横滑 seek / 左右半屏亮度音量）。长按 2x 已就位时忽略：互斥，2x 优先。
+    private func classifyPanIfNeeded(at value: DragGesture.Value) {
+        guard !controller.isHoldFastForwarding else { return }
+        let translation = value.translation
+        guard abs(translation.width) >= TouchLimits.panThreshold
+            || abs(translation.height) >= TouchLimits.panThreshold
+        else { return }
+        if panFeedback.session != nil {
+            updatePan(translation: translation)
+            return
+        }
+        guard panAreaSize.width > 1, panAreaSize.height > 1 else { return }
+        guard let mode = PlayerPanGestureModel.mode(
+            translation: translation,
+            startX: value.startLocation.x,
+            width: panAreaSize.width
+        ) else { return }
+        var session = PlayerPanSession(
+            mode: mode,
+            startSeconds: durationSeconds(controller.state.position),
+            durationSeconds: durationSeconds(controller.state.duration)
+        )
+        switch mode {
+        case .seek:
+            // 没拿到时长无处可 seek，这次拖动不建会话。
+            guard session.durationSeconds > 0 else { return }
+            session.previewSeconds = session.startSeconds
+        case .brightness:
+            session.verticalStart = currentScreenBrightness()
+            session.verticalValue = session.verticalStart
+        case .volume:
+            session.verticalStart = systemVolume.volume
+            session.verticalValue = systemVolume.volume
+        }
+        panFeedback.session = session
+        if mode == .seek {
+            shouldRestoreHUDAfterSeek = hudVisibility.isVisible
+            if shouldRestoreHUDAfterSeek {
+                hudVisibility.hide()
+            }
+        }
+        updatePan(translation: translation)
+    }
+
+    private func updatePan(translation: CGSize) {
+        guard var session = panFeedback.session else { return }
+        switch session.mode {
+        case .seek:
+            session.previewSeconds = PlayerPanGestureModel.seekTarget(
+                startSeconds: session.startSeconds,
+                translation: translation.width,
+                width: panAreaSize.width,
+                duration: session.durationSeconds
+            )
+        case .brightness:
+            let value = PlayerPanGestureModel.verticalTarget(
+                start: session.verticalStart,
+                translation: translation.height,
+                extent: panAreaSize.height
+            )
+            session.verticalValue = value
+            keyWindowSceneScreen?.brightness = CGFloat(value)
+        case .volume:
+            let value = PlayerPanGestureModel.verticalTarget(
+                start: session.verticalStart,
+                translation: translation.height,
+                extent: panAreaSize.height
+            )
+            session.verticalValue = value
+            systemVolume.volume = value
+        }
+        panFeedback.session = session
+    }
+
+    /// 系统打断（切后台 / 来电 / 换指重定向）时的触摸收尾。与 handleTouchEnded
+    /// 的差异：seek 不落盘——被打断的拖动不该当成用户确认过的跳转。
+    private func interruptTouchSession() {
+        holdTask?.cancel()
+        holdTask = nil
+        singleTapTask?.cancel()
+        singleTapTask = nil
+        cancelPendingPanCommit()
+        lastTapDate = nil
+        touchStart = nil
+        touchTranslationStore.translation = .zero
+        panFeedback.session = nil
+        if controller.isHoldFastForwarding {
+            controller.endHoldFastForward()
+        }
+    }
+
+    private func handleTouchEnded(_ value: DragGesture.Value) {
+        holdTask?.cancel()
+        holdTask = nil
+        let start = touchStart
+        touchStart = nil
+        touchTranslationStore.translation = .zero
+
+        // 长按 2x 中抬指：收尾恢复原速（与 macOS 右箭头共用 controller 状态机）。
+        if controller.isHoldFastForwarding {
+            controller.endHoldFastForward()
+            return
+        }
+        // 滑动中抬指：seek 落盘（拖动中只出预览，松手才跳）；亮度音量已实时生效。
+        if let session = panFeedback.session {
+            if session.mode == .seek {
+                schedulePanCommit(session)
+            } else {
+                panFeedback.session = nil
+            }
+            return
+        }
+        // 轻点判定：时间短、位移小。
+        guard let start,
+              PlayerPanGestureModel.isQuickTap(
+                elapsed: Date().timeIntervalSince(start.date),
+                translation: value.translation,
+                slop: TouchLimits.movementSlop,
+                maxDuration: TouchLimits.tapMaxDuration
+              )
+        else { return }
+        handleTap()
+    }
+
+    /// seek 提交去抖：真抬指后 ~80ms 落盘；若这期间来了换指的新 onChanged
+    /// （interruptTouchSession 取消本任务），说明那个 onEnded 是多指强制结束
+    /// 的假抬指，放弃提交。真抬指场景多等 80ms 无感知。
+    private func schedulePanCommit(_ session: PlayerPanSession) {
+        pendingPanCommit?.cancel()
+        pendingPanCommit = Task { @MainActor in
+            try? await Task.sleep(for: TouchLimits.panCommitDebounce)
+            guard !Task.isCancelled else { return }
+            pendingPanCommit = nil
+            commitPan(session)
+            guard panFeedback.session == session else { return }
+            panFeedback.session = nil
+            restoreHUDAfterSeekIfNeeded()
+        }
+    }
+
+    private func cancelPendingPanCommit() {
+        pendingPanCommit?.cancel()
+        pendingPanCommit = nil
+        guard panFeedback.session?.mode == .seek else { return }
+        panFeedback.session = nil
+        restoreHUDAfterSeekIfNeeded()
+    }
+
+    private func restoreHUDAfterSeekIfNeeded() {
+        guard shouldRestoreHUDAfterSeek else { return }
+        shouldRestoreHUDAfterSeek = false
+        revealControls()
+    }
+
+    /// 单击 / 双击分流：第二击落到窗口内立即切播放暂停；单击延迟到窗口过期才切 HUD。
+    private func handleTap() {
+        let now = Date()
+        if let last = lastTapDate,
+           PlayerPanGestureModel.isDoubleTap(
+            interval: now.timeIntervalSince(last),
+            window: TouchLimits.doubleTapInterval
+           ) {
+            singleTapTask?.cancel()
+            singleTapTask = nil
+            lastTapDate = nil
+            controller.togglePlayPause()
+            return
+        }
+        lastTapDate = now
+        singleTapTask?.cancel()
+        singleTapTask = Task { @MainActor in
+            try? await Task.sleep(for: TouchLimits.singleTapDelay)
+            guard !Task.isCancelled else { return }
+            lastTapDate = nil
+            toggleControls()
+        }
+    }
+
+    private func commitPan(_ session: PlayerPanSession) {
+        switch session.mode {
+        case .seek:
+            controller.seek(toFraction: PlayerPanGestureModel.fraction(
+                seconds: session.previewSeconds,
+                duration: session.durationSeconds
+            ))
+        case .brightness, .volume:
+            break  // 已实时生效
+        }
+    }
+
+    private var keyWindowSceneScreen: UIScreen? {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }?
+            .screen
+    }
+
+    private func currentScreenBrightness() -> Double {
+        Double(keyWindowSceneScreen?.brightness ?? 0.5)
+    }
+
+    private func durationSeconds(_ duration: Duration) -> Double {
+        Double(duration.microseconds) / 1_000_000
+    }
+    #endif
+
+    // MARK: - 显隐控制
+
+    private func revealControls() {
+        hudVisibility.reveal(canAutoHide: canAutoHideControls)
+    }
+
+    private func toggleControls() {
+        if hudVisibility.isVisible {
+            hudVisibility.hide()
+        } else {
+            revealControls()
+        }
+    }
+
+    private func handleHUDInteraction(_ interaction: PlayerHUDInteraction, _ active: Bool) {
+        hudVisibility.setInteraction(
+            interaction,
+            active: active,
+            canAutoHide: canAutoHideControls
+        )
+    }
+
+    /// 播放、暂停、拖动、缓冲和辅助面板都由同一条规则决定 HUD 是否可以自动收起。
+    /// 播放信息面板**不**放进这条规则：它只读、不拦截任何交互、且独立于 HUD
+    /// 挂载（HUD 卸载后照常每秒刷新），收进来的后果是快捷键唤出的 HUD 被钉死，
+    /// 直到关掉面板才恢复计时。
+    ///
+    /// 判据本身住 `PlayerHUDGates`（唯一来源）：这里只取「自动收起」那一半，
+    /// 「该不该唤出」由 `revealTrigger` 单独观察，缓冲不参与唤出（issue #2）。
+    private var canAutoHideControls: Bool { hudGates.canAutoHide }
+
+    /// 中央缓冲指示（自带暗底的白转圈）是否可见。
+    private var showsBufferingIndicator: Bool {
+        controller.state.isBufferingSustained && controller.state.state == .playing
+    }
+
+    private var hudGates: PlayerHUDGates {
+        PlayerHUDGates(
+            state: controller.state.state,
+            // 迟滞后的 UI 态：单帧饿数据不该让 HUD 的收起计时跟着抖。
+            isBuffering: controller.state.isBufferingSustained,
+            setupError: controller.setupError,
+            isImportingSubtitle: isImportingSubtitle,
+            isSelectingDanmaku: isSelectingDanmaku,
+            isVoiceOverEnabled: isVoiceOverEnabled
+        )
+    }
+
+    #if os(macOS)
+    /// 光标与 HUD 显隐对齐：HUD 藏起时交给系统「隐藏到下次鼠标移动」，
+    /// 鼠标一动自动恢复；HUD 唤出 / 退出播放器时强制 unhide 兜底。
+    /// 缓冲 / VoiceOver 时 HUD 不走自动隐藏（见 `canAutoHideControls`），
+    /// 光标因此保持可见。
+    private func syncCursorWithHUD(visible: Bool) {
+        if visible {
+            NSCursor.unhide()
+        } else {
+            NSCursor.setHiddenUntilMouseMoves(true)
+        }
+    }
+    #endif
+
+    private func closePlayer() {
+        playerLog.info("closePlayer（ESC / ×）")
+        guard !isClosing else { return }
+        isClosing = true
+        // 缩窗期间 HUD 立即淡出卸载；hide() 自带 userHidden 锁，
+        // 鼠标移动不会在缩窗途中把 HUD 唤回。
+        hudVisibility.cancel()
+        hudVisibility.hide()
+        // 绑定本次关闭的 request：延迟 dismiss 期间若用户已开新片，不能误清新 presentedPlayer。
+        let closingID = request?.id
+        // 先触发窗口还原动画，画面还活着、跟着窗口一起缩回去（与打开时的
+        // 展开动画对称）；缩完再停引擎、退出播放器——不会出现「播放器没了，
+        // 窗口自己在动」的不连贯。停播若是同步做，画面第 0ms 就黑掉，
+        // 无引擎占位图会裸露闪现。PlayerWindowFitter 只有 App/macOS 一份，
+        // iOS 没有窗口可还原。
+        #if os(macOS)
+        PlayerWindowFitter.restore()
+        #endif
+        Task { @MainActor in
+            // 窗口弹性动画约 0.18-0.2s，等它带着画面缩完再停引擎。
+            try? await Task.sleep(for: .seconds(0.25))
+            guard !Task.isCancelled else { return }
+            // 停播前确认屏上还是被关的这片：PlaybackController 是全局共享单例，
+            // 延迟停播不能误停用户在这 0.25s 内新开的片。closingID 为 nil
+            // 保持老行为（照常停引擎，只是不 dismiss）。
+            if let closingID,
+               !PlayerClosePolicy.shouldDismiss(presentedID: app.presentedPlayer?.id, closingID: closingID) {
+                return
+            }
+            controller.stopPlayback()
+            guard PlayerClosePolicy.shouldDismiss(
+                presentedID: app.presentedPlayer?.id,
+                closingID: closingID
+            ) else { return }
+            app.dismissPlayer()
+        }
+    }
+
+    private var hudIsFullscreen: Bool {
+        #if os(macOS)
+        isFullscreen
+        #else
+        false
+        #endif
+    }
+
+    /// 2x 徽章的顶部间距：窗口模式避开系统标题栏拖动区、全屏让出工具栏条带
+    /// （与 HUD 顶栏 PlayerHUDTopBar.topPadding 同一口径）。
+    private var holdBadgeTopPadding: CGFloat {
+        #if os(macOS)
+        if hudIsFullscreen { return 56 }
+        return 58
+        #else
+        return PlayerChromeMetrics.topBarTopPadding(chromeInsets, isNarrow: isNarrow)
+        #endif
+    }
+
+    private func toggleFullscreenFromHUD() {
+        #if os(macOS)
+        toggleFullscreen()
+        #endif
+    }
+
+    #if os(macOS)
+    private func toggleFullscreen() {
+        guard let window = NSApp.keyWindow else { return }
+        // 不在这里翻转 isFullscreen：等 didEnter/didExit 通知与系统状态对齐，
+        // 避免与绿键/菜单全屏抢状态。
+        window.toggleFullScreen(nil)
+        revealControls()
+    }
+    #endif
+
+    // MARK: - 键盘（macOS）
+
+    #if os(macOS)
+    /// 把当前屏的 EDR headroom 报给控制器。屏幕读数拿不到就静默跳过
+    /// （引擎创建 config 另有一次兜底查询，见 PlaybackDisplayMetrics）。
+    private func reportDisplayEDRHeadroom() {
+        guard let headroom = PlaybackDisplayMetrics.currentScreenEDRHeadroom() else { return }
+        controller.updateDisplayEDRHeadroom(PlaybackDisplayMetrics.sanitized(headroom))
+    }
+
+    /// 安装全局本地键盘监听。`NSEvent.addLocalMonitorForEvents` 在主线程拦截 App 的按键，
+    /// 不依赖视图焦点——播放器是覆盖层，`.onKeyPress` 抢不到焦点所以不响。
+    /// 同时监听 keyUp：右箭头的「长按 2x / 轻点快进」要靠 keyUp 与 autorepeat 分辨。
+    private func installKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { event in
+            handleKey(event) ? nil : event
+        }
+    }
+
+    private func uninstallKeyMonitor() {
+        if let monitor = keyMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyMonitor = nil
+        }
+    }
+
+    /// 处理一个按键；返回 true 表示已消费（不再下传），false 放行给系统。
+    private func handleKey(_ event: NSEvent) -> Bool {
+        // 只吃无修饰键的按键，Cmd/Ctrl/Option 组合留给系统（Cmd+Q 等）。
+        let cmd = event.modifierFlags.intersection([.command, .control, .option])
+        guard cmd.isEmpty else { return false }
+        // keyWindow 不是主窗口：open 面板 / 分享面板 / sheet 等正持有键盘，按键属于
+        // 它们，放行——否则弹幕 sheet 或 fileImporter 打开时按 ESC 会把整个播放器关掉。
+        if let keyWindow = NSApp.keyWindow, keyWindow != NSApp.mainWindow { return false }
+        // SwiftUI sheet 的子窗口在部分系统版本上不接管 keyWindow，用显式状态兜底。
+        if isImportingSubtitle || isSelectingDanmaku { return false }
+        // 只让位给**文本输入**环境（如系统保存面板的文件名框）：那里空格 / 方向键是编辑键。
+        // 不再让给 NSSlider 等控件——HUD 的进度 / 音量滑杆被点过之后会一直占着
+        // firstResponder，空格和方向键会被它吃掉，表现就是「按键绑定偶尔失效」
+        // （点一下别处才恢复）。视频播放器里这些键永远属于播放控制（IINA/QuickTime 行为）。
+        if let responder = NSApp.keyWindow?.firstResponder,
+           responder is NSTextView {
+            return false
+        }
+
+        // 右箭头特殊：长按 = 临时 2 倍速（松手恢复原速），轻点 = 快进 10 秒。
+        // 首按不动作——是轻点还是长按，要等 autorepeat（长按）或 keyUp（轻点）才能分辨。
+        if event.keyCode == 124 {
+            switch event.type {
+            case .keyDown:
+                if event.isARepeat {
+                    controller.beginHoldFastForward()
+                    // 加速期间不唤醒 HUD：提示由独立的 2x 徽章承担，HUD 保持原显隐。
+                }
+                return true
+            case .keyUp:
+                if controller.isHoldFastForwarding {
+                    controller.endHoldFastForward()
+                    // 长按收尾同样不唤醒 HUD；轻点快进才走 reveal（与左箭头一致）。
+                    return true
+                }
+                controller.skip(by: 10)
+                revealControls()
+                return true
+            default:
+                return false
+            }
+        }
+
+        // 通用键只响应首按：按住会触发 autorepeat keyDown，空格/回车/静音/全屏这些
+        // 开关类动作会被重复触发造成快速闪断（右箭头在上一段已单独处理长按 2x）。
+        if event.isARepeat { return true }
+
+        guard event.type == .keyDown else { return false }
+        switch PlayerKeyAction.action(keyCode: event.keyCode) {
+        case .togglePlayPause:
+            controller.togglePlayPause(); revealControls(); return true
+        case .closePlayer:
+            closePlayer(); return true
+        case .seekBackward:
+            controller.skip(by: -10); revealControls(); return true
+        case .seekForward:
+            controller.skip(by: 10); revealControls(); return true
+        case .volumeDown:
+            controller.adjustVolume(by: -0.1); revealControls(); return true
+        case .volumeUp:
+            controller.adjustVolume(by: 0.1); revealControls(); return true
+        case .toggleMute:
+            controller.toggleMute(); revealControls(); return true
+        case .toggleFullscreen:
+            toggleFullscreen(); return true
+        case nil:
+            return false
+        }
+    }
+    #endif
+
+    /// 分享：macOS 弹系统分享面板——直连流分享 URL，本地文件分享文件本身。
+    private func shareNow() {
+        #if os(macOS)
+        guard let view = NSApp.keyWindow?.contentView, let shareURL = cachedShareURL else { return }
+        let picker = NSSharingServicePicker(items: [shareURL])
+        picker.show(relativeTo: view.bounds, of: view, preferredEdge: .minY)
+        #endif
+    }
+
+    /// Jellyfin 流依赖 Authorization 请求头，不能只分享裸 URL；这类源不显示分享入口。
+    // 计算 involves FileManager.stat，缓存在 @State 里随 request 变化重算一次，
+    // 不在每次 body 求值时都做系统调用。
+    private func computeShareURL() -> URL? {
+        if let local = request?.securityScopedURL { return local }
+        if let uri = request?.uri, FileManager.default.fileExists(atPath: uri) {
+            return URL(fileURLWithPath: uri)
+        }
+        guard request?.authHeader == nil,
+              let uri = request?.uri, let url = URL(string: uri),
+              url.scheme == "http" || url.scheme == "https"
+        else {
+            return nil
+        }
+        return url
+    }
+
+    private func captureNow() {
+        // 截图编码/写盘在后台（captureScreenshot 内部），这里只等结果回来显示 toast。
+        Task {
+            guard let name = await controller.captureScreenshot() else {
+                revealControls()
+                return
+            }
+            // 连续截图时旧清除任务不能把新 toast 提前抹掉：用 token 归属判定。
+            let token = UUID()
+            screenshotToastToken = token
+            screenshotToast = "已保存：\(name)"
+            try? await Task.sleep(for: .seconds(2))
+            guard screenshotToastToken == token else { return }
+            screenshotToast = nil
+        }
+    }
+
+    /// Infuse 版式：小字显示集号和单集名，大字显示系列名。
+    private var titleKicker: String {
+        guard let item = app.nowPlayingItem, let episodeLabel = item.episodeLabel else { return "" }
+        return "\(episodeLabel) · \(item.name)"
+    }
+
+    private var mainTitle: String {
+        if let item = app.nowPlayingItem {
+            if item.episodeLabel != nil { return item.seriesName ?? item.name }
+            return item.name
+        }
+        return controller.currentTitle ?? request?.title ?? ""
+    }
+
+    private static var subtitleTypes: [UTType] {
+        ["srt", "ass", "ssa", "vtt"]
+            .compactMap { UTType(filenameExtension: $0, conformingTo: .text) }
+    }
+}
+
+/// `onChange` 只接一个 Equatable，标题和小字要一起比就得包一层。
+private struct NowPlayingTitle: Equatable {
+    var title: String
+    var kicker: String
+}
+
+#if os(macOS)
+/// 使用 AppKit 原生 NSTrackingArea 跟踪窗口鼠标移动与移出。
+/// 彻底解决 macOS 上 SwiftUI `.onContinuousHover` 鼠标移出窗口不触发 `.ended` 的问题。
+private struct PlayerMouseTrackingView: NSViewRepresentable {
+    let onMoved: (CGPoint) -> Void
+    let onExited: () -> Void
+
+    func makeNSView(context: Context) -> TrackingNSView {
+        let view = TrackingNSView()
+        view.onMoved = onMoved
+        view.onExited = onExited
+        return view
+    }
+
+    func updateNSView(_ nsView: TrackingNSView, context: Context) {
+        nsView.onMoved = onMoved
+        nsView.onExited = onExited
+    }
+
+    final class TrackingNSView: NSView {
+        var onMoved: ((CGPoint) -> Void)?
+        var onExited: (() -> Void)?
+        private var trackingArea: NSTrackingArea?
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let trackingArea {
+                removeTrackingArea(trackingArea)
+            }
+            let options: NSTrackingArea.Options = [
+                .mouseEnteredAndExited,
+                .mouseMoved,
+                .activeAlways,
+                .inVisibleRect
+            ]
+            let area = NSTrackingArea(rect: bounds, options: options, owner: self, userInfo: nil)
+            addTrackingArea(area)
+            trackingArea = area
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            // 不拦截任何点击事件，完全透明传递给底层手势与上层控件
+            return nil
+        }
+
+        override func mouseMoved(with event: NSEvent) {
+            let location = convert(event.locationInWindow, from: nil)
+            onMoved?(location)
+        }
+
+        override func mouseEntered(with event: NSEvent) {
+            let location = convert(event.locationInWindow, from: nil)
+            onMoved?(location)
+        }
+
+        override func mouseExited(with event: NSEvent) {
+            // 误报过滤（issue #4）：全屏时系统把工具栏条带（NSToolbarFullScreenWindow，
+            // 高 52pt，见 FullscreenTitlebarFade）等独立窗口盖在主窗之上，指针滑进条带
+            // 会让本视图收到 mouseExited，但指针并没有真的离开窗口——全屏 HUD 顶栏
+            // 按钮正压在条带里，不过滤就「一碰按钮 HUD 就收走」（顶缘唤出菜单栏同理）。
+            // 用屏幕全局坐标复核：仍在窗口矩形内就不算移出。
+            if let window, window.frame.contains(NSEvent.mouseLocation) { return }
+            onExited?()
+        }
+    }
+}
+#endif
+
+
+/// 滑动手势的逐帧反馈载体（iOS）。@Observable 引用类型：拖动中每个 onChanged
+/// 只让读它的子树重算，PlayerScreen.body 不再逐帧重算（原先 panSession 是
+/// PlayerScreen 的 @State，60-120Hz 的 onChanged 让整套 Glass 树跟着跑）。
+@Observable
+final class PlayerPanFeedback {
+    var session: PlayerPanSession?
+}
+
+/// 当前触摸的累计位移（`P1-13`）。
+///
+/// **故意不是 `@Observable`**：它每触摸事件都写、但只在长按判定的 Task 里读一次。
+/// 让它参与观察，等于把「每个触摸事件」变成「整个 `PlayerScreen.body` 重算」——
+/// HUD 挂载时那棵 Glass 树（11 面玻璃）会跟着每个事件重跑。
+///
+/// 用 `@MainActor` 是因为所有读写都在触摸回调与 `Task { @MainActor }` 里
+/// （SwiftUI 手势回调与视图更新都在主 actor）。
+@MainActor
+final class TouchTranslationStore {
+    var translation: CGSize = .zero
+}
+
+#if os(iOS)
+/// 滑动手势的独立反馈层（iOS）：HUD 隐藏时显示时间轴，亮度调整显示 OSD。
+/// 逐帧值只有这个子树在读；出现/消失过渡也挂在这里（模式切换很稀疏）。
+private struct PlayerPanFeedbackOverlay: View {
+    let feedback: PlayerPanFeedback
+    let isNarrow: Bool
+    let playbackID: String
+    let onInteractionChanged: (PlayerHUDInteraction, Bool) -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.playerChromeInsets) private var chromeInsets
+
+    var body: some View {
+        ZStack {
+            if let session = feedback.session, session.mode == .seek {
+                VStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    PlayerHUDTimeline(
+                        playbackID: playbackID,
+                        panFeedback: feedback,
+                        onInteractionChanged: onInteractionChanged
+                    )
+                    .padding(.horizontal, PlayerChromeMetrics.sidePadding(chromeInsets, isNarrow: isNarrow))
+                    .padding(.bottom, isNarrow ? 16 : 28)
+                }
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+                .transition(.section)
+            }
+            if let session = feedback.session, session.mode == .brightness {
+                VStack(spacing: 0) {
+                    PlayerAdjustOSDBadge(
+                        systemImage: "sun.max.fill",
+                        value: session.verticalValue
+                    )
+                    .padding(.top, PlayerChromeMetrics.osdTopPadding(chromeInsets))
+                    Spacer(minLength: 0)
+                }
+            }
+        }
+        .motion(Motion.fast, value: feedback.session?.mode)
+    }
+}
+#endif

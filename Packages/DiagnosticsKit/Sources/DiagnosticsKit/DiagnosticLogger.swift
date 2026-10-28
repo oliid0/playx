@@ -193,7 +193,7 @@ public final class DiagnosticLogger: @unchecked Sendable {
         var level: DiagnosticLevel
     }
 
-    public convenience init(subsystem: String = "com.oliid0.playerx", category: String) {
+    public convenience init(subsystem: String = "dev.jumusu.OcPlayer", category: String) {
         self.init(subsystem: subsystem, category: category,
                   backend: Self.defaultBackend, now: Date.init, minimumLevel: nil)
     }
@@ -569,7 +569,7 @@ private final class DiagnosticBackend: @unchecked Sendable {
         }
         let base = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
-        return base.appendingPathComponent("Logs/PlayerX", isDirectory: true)
+        return base.appendingPathComponent("Logs/OcPlayer", isDirectory: true)
     }()
 
     /// 当前正在写的**会话文件**（写满会续编成 `…-2.jsonl`，见 `continueInNewFile`）。
@@ -617,7 +617,7 @@ private final class DiagnosticBackend: @unchecked Sendable {
         self.fileURL = Self.sessionFileURL(
             directory: directory, base: sessionFileBaseName, index: 1)
         self.encoder = Self.makeEncoder()
-        self.sinkLogger = Logger(subsystem: "com.oliid0.playerx", category: "DiagnosticsKit.FileSink")
+        self.sinkLogger = Logger(subsystem: "dev.jumusu.OcPlayer", category: "DiagnosticsKit.FileSink")
         self.emitToOSLog = emitToOSLog
     }
 

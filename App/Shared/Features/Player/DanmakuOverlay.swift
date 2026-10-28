@@ -1,0 +1,683 @@
+import CoreText
+import DanmakuKit
+import DanmakuRenderKit
+import PlaybackKit
+import SwiftUI
+
+#if os(macOS)
+import AppKit
+typealias PlatformFont = NSFont
+#else
+import UIKit
+typealias PlatformFont = UIFont
+#endif
+
+/// App 层弹幕 overlay（见 Packages/DanmakuRenderKit/PROVENANCE.md）。
+///
+/// 为什么不用内核弹幕的旧因已定位:转换器给每条弹幕合成稳定唯一 `id`,内核拿它当
+/// shell stable_tracks 的 key,viewport 重排时个别弹幕的轨道偏好互相顶掉 → 单独几条
+/// 突然换位置(跳轨)。去掉 `id` 后跳轨曾消失过一次,但内核 DFM+ 的滑窗重排问题
+/// 再次出现,当前版本**禁用内核弹幕渲染,一律走本 overlay**:DanmakuRenderKit 的
+/// 轨道模型是入轨时「追击判定」、入轨后不换轨,结构上不会有重排换轨。
+/// `PlaybackController.resolveOverlayDanmakuRoute()` 当前恒 true,内核修复后恢复
+/// 旧判定（内核支持则听偏好,不支持则强制 overlay）。
+///
+/// 时间桥：内核每帧发 positionChanged（`PlaybackEngine.latestMediaTime`），本控制器
+/// 30Hz 采样它决定谁出场。暂停/缓冲＝媒体时间冻结 → 冻结检测暂停视图动画；
+/// seek＝时间跳变 → 清屏重同步。速率变化透传 `playingSpeed`。
+///
+/// ⚠️ 对内核的要求只有两条：`latestMediaTime` 读取要**便宜**（30Hz 采样不能被
+/// 一整帧渲染阻塞），以及 playing/buffering 状态由真实事件驱动。换内核时先验这两条。
+@MainActor
+final class DanmakuOverlayController {
+    /// overlay 弹幕模型 = 包的解析输出（Erika JSON 的读写两侧都在 DanmakuKit，
+    /// App 层不再认识内核数据格式）。
+    typealias Comment = DanmakuJSONParser.Entry
+
+    /// 渲染偏好（由 PlaybackController 镜像下发，保持与内核路径同一套 UserDefaults）。
+    struct Preferences {
+        var enabled = true
+        var opacity: Double = 0.85
+        var displayArea: Double = 0.75
+        var blockTop = false
+        var blockBottom = false
+        var blockScroll = false
+        var allowStacking = false
+        /// 全局时间偏移（秒），正数让弹幕更晚出现。
+        var offsetSeconds: Double = 0
+        /// 基础字号
+        var fontSize: Double = 22.0
+    }
+
+    var engineProvider: () -> (any PlaybackEngine)?
+    /// 真实播放状态（playing/buffering 由内核事件驱动，不靠媒体时间猜——
+    /// 24fps 视频配 60Hz 采样会每隔一次看到 delta=0，时间猜测会以 ~15Hz
+    /// 抖动 pause/play，而库的 pause 会移除全部动画、play 重加，抖起来
+    /// 就是满屏「一抽一抽」）。
+    var playbackStateProvider: () -> (playing: Bool, buffering: Bool)?
+    private(set) var preferences = Preferences()
+
+    private(set) lazy var view: DanmakuView = {
+        let view = DanmakuView(frame: .zero)
+        // 复用池：默认 false 时每条弹幕都新建 NSView，密集段落的 alloc/addSubview
+        // 抖动会顶到主线程帧预算（上游 Mac 示例同样打开）。
+        view.enableCellReusable = true
+        applyPreferences(to: view)
+        return view
+    }()
+
+    private var comments: [Comment] = []
+
+    /// 弹幕数据是否已装载（HUD「时间偏移」区块的显隐用；overlay 路线下
+    /// controller 的内核轨道恒为空，不能拿轨道数判断）。
+    var hasComments: Bool { !comments.isEmpty }
+    /// 下一条待出场弹幕的下标（comments 已按 time 排序）。
+    private var pointer = 0
+    /// 匹配返回的时间轴校正（dandanplay shift），与 HUD 全局偏移分开工。
+    private var trackOffsetSeconds: Double = 0
+    private var timer: Timer?
+    /// seek 跳变检测（只认原始媒体时间，见 DanmakuSeekDetector）。
+    private var seekDetector = DanmakuSeekDetector()
+    /// 上次发射机会的 effective 阈值。与本次阈值差 >2s = 媒体时间发生了 tick
+    /// 没看见的跳变，spawnUpTo 据此跳过积压（结构性兜底，见其注释）。
+    private var lastSpawnThreshold: Double?
+    private var viewPausedBySync = false
+
+    /// 每 5s 打一条 overlay 状态日志（诊断内存爬升用）：已发射条数 / 子视图数 / 复用池大小。
+    /// 子视图数在播放途中持续增长 = cell 没有被正确回收复用。
+    private var lastStateLogAt: TimeInterval = 0
+    /// 单帧发射超过此数即判定「爆发补发」（正常节奏单帧只发几条），写 warning 日志。
+    private static let burstSpawnThreshold = 40
+    /// seek 跳变判定阈值（秒）：tick 的 delta 检测与 spawnUpTo 的积压兜底共用同一标准。
+    private static let seekJumpSeconds = 2.0
+    /// 弹幕诊断日志开关（PlaybackPreferences 默认关，设置页「弹幕诊断日志」控制）。
+    private var diagnosticsEnabled: Bool { PlaybackPreferences.danmakuDiagnosticsEnabled }
+
+    init(engineProvider: @escaping () -> (any PlaybackEngine)?,
+         playbackStateProvider: @escaping () -> (playing: Bool, buffering: Bool)? = { nil }) {
+        self.engineProvider = engineProvider
+        self.playbackStateProvider = playbackStateProvider
+    }
+
+    // MARK: - 数据
+
+    /// 装载弹幕（结构直传版）。
+    ///
+    /// 弹弹play `p` 字段 → Entry 的转换与按时间排序都在 `DanmakuService` 的 actor 上
+    /// 完成（`DanmakuJSONConverter.entries(from:)`），主线程只做一次赋值——此前这里
+    /// 要对几 MB JSON 做解码 + 排序（三万条 = 主线程 100–400ms，正好压在起播窗口）。
+    /// 空数据（没有任何有效条目）由编排器直接走 `clearDanmaku`，不会调到这里。
+    /// `trackOffsetSeconds` 是匹配源的 shift，与用户全局偏移叠加生效。
+    func replace(entries: [DanmakuJSONParser.Entry], trackOffsetSeconds: Double) {
+        comments = entries
+        self.trackOffsetSeconds = trackOffsetSeconds
+        PlaybackLog.info("danmaku overlay 装载 \(comments.count) 条 trackOffset=\(trackOffsetSeconds)s")
+        resync(reason: "replace")
+    }
+
+    func clear() {
+        comments = []
+        pointer = 0
+        seekDetector.reset()
+        lastSpawnThreshold = nil
+        view.clean()
+        // 复用池里的 cell 带着整条已渲染弹幕的模型/测量，不清的话关播放器后
+        // 上一集的 cell 树整棵留在单例持有的 DanmakuView 上（vendored 层修补，
+        // 见 DanmakuRenderKit PROVENANCE.md）。
+        view.clearPool()
+    }
+
+    func reset() {
+        clear()
+        stopTimer()
+    }
+
+    /// 视图从窗口移除时调用:只停采样 timer,不动弹幕数据。
+    /// overlay 随播放器状态会经历 disappear → reappear(如窗口还原动画期间),
+    /// 数据在 controller 生命周期里跨这些阶段保留,重新 appear 后 startTimer 继续播。
+    func pauseSampling() {
+        stopTimer()
+    }
+
+    // MARK: - 偏好
+
+    func update(_ transform: (inout Preferences) -> Void) {
+        var next = preferences
+        transform(&next)
+        let offsetChanged = next.offsetSeconds != preferences.offsetSeconds
+        let fontSizeChanged = next.fontSize != preferences.fontSize
+        preferences = next
+        applyPreferences(to: view)
+        if offsetChanged || fontSizeChanged { resync(reason: "preferences") }
+    }
+
+    private func applyPreferences(to view: DanmakuView) {
+        let p = preferences
+        view.displayArea = CGFloat(max(0.1, min(1, p.displayArea)))
+        view.enableFloatingDanmaku = !p.blockScroll
+        view.enableTopDanmaku = !p.blockTop
+        view.enableBottomDanmaku = !p.blockBottom
+        view.isOverlap = p.allowStacking
+        view.paddingTop = 10
+        view.paddingBottom = 16
+        view.trackHeight = CGFloat(p.fontSize) * 1.35
+        #if os(macOS)
+        view.alphaValue = CGFloat(max(0.05, min(1, p.opacity)))
+        #else
+        view.alpha = CGFloat(max(0.05, min(1, p.opacity)))
+        #endif
+        view.isHidden = !p.enabled
+        if !p.enabled { view.clean() }
+    }
+
+    func setRate(_ rate: Double) {
+        view.playingSpeed = Float(max(0.25, min(4, rate)))
+    }
+
+    // MARK: - 采样同步
+
+    /// 当前是否处于活跃档（60Hz）。暂停/缓冲/禁用/空数据时降到 2Hz 轮询。
+    private var timerIsFast = true
+
+    func startTimer() {
+        guard timer == nil else { return }
+        armTimer(fast: true)
+    }
+
+    /// 活跃时 60Hz 平滑采样发射（消除 30Hz 定时器的成团发射突发感）；
+    /// 暂停/缓冲/禁用/空数据这些没有可做事的状态降到 2Hz——只留「发觉状态恢复」
+    /// 的轮询，不再每秒空醒主线程 60 次。
+    private func armTimer(fast: Bool) {
+        timer?.invalidate()
+        let t = Timer(timeInterval: fast ? 1.0 / 60.0 : 0.5, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.tick()
+            }
+        }
+        // 挂 .common：菜单/右键跟踪跑在 eventTracking mode，只进 .default 的话
+        // 期间 timer 停摆，合上首拍 delta 超阈值被误判 seek 清屏。
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+        timerIsFast = fast
+    }
+
+    private func stopTimer() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    /// 弹幕是否处于「有事可做」的活跃状态。
+    private var isDanmakuActive: Bool {
+        guard let engine = engineProvider(), preferences.enabled, !comments.isEmpty else { return false }
+        if let playback = playbackStateProvider(), !playback.playing || playback.buffering { return false }
+        return true
+    }
+
+    private func tick() {
+        // 频率按状态升降：恢复播放回到 60Hz 由这里的轮询发觉（≤0.5s 延迟）。
+        let active = isDanmakuActive
+        if timerIsFast != active { armTimer(fast: active) }
+
+        guard let engine = engineProvider(), preferences.enabled, !comments.isEmpty else { return }
+        // seek 检测只认原始媒体时间（DanmakuSeekDetector）；下面的出场判定用
+        // effectiveSeconds（减偏移），两个时基不再混用。
+        let now = mediaSeconds(engine)
+
+        // 暂停/缓冲跟随真实播放状态：暂停时停视图动画，恢复时续播
+        //（pause 会把 cell 模型帧钉在呈现位置，play 从那里续，不瞬移）。
+        if let playback = playbackStateProvider() {
+            let shouldPause = !playback.playing || playback.buffering
+            if shouldPause != viewPausedBySync {
+                if shouldPause { view.pause() } else { view.play() }
+                viewPausedBySync = shouldPause
+            }
+        }
+
+        switch seekDetector.evaluate(rawSeconds: now, jumpSeconds: Self.seekJumpSeconds) {
+        case .firstSample:
+            return
+        case .jumped:
+            // seek：媒体时间跳变，清屏重同步。
+            resync(reason: "seek")
+            return
+        case .continuous:
+            break
+        }
+        if viewPausedBySync { return }
+        // 5s 状态采样（诊断内存爬升）：cell 回收/复用是否失衡。
+        // 平时关（诊断开关）不打——每 5s 一条属「排查时才需要」的高频日志。
+        if diagnosticsEnabled {
+            let wall = Date().timeIntervalSinceReferenceDate
+            if wall - lastStateLogAt >= 5 {
+                lastStateLogAt = wall
+                PlaybackLog.info(
+                    "弹幕 overlay 状态 已发射=\(pointer) 子视图=\(view.subviews.count) "
+                        + "池=\(view.pooledCellCount) 总数=\(comments.count)"
+                )
+            }
+        }
+        spawnUpTo(now)
+    }
+
+    private func mediaSeconds(_ engine: any PlaybackEngine) -> Double {
+        Double(engine.latestMediaTime.microseconds) / 1_000_000
+    }
+
+    /// 出场判定用的有效媒体时间（两个偏移都让弹幕更晚出现 → 时间轴右移）。
+    private func effectiveSeconds(_ raw: Double) -> Double {
+        raw - trackOffsetSeconds - preferences.offsetSeconds
+    }
+
+    /// seek / 换数据 / 改偏移后：清屏，指针对齐当前媒体时间。
+    /// `reason` 只进诊断日志，用于区分对齐触发源（replace/seek/preferences/backlog）。
+    private func resync(reason: String = "seek") {
+        guard preferences.enabled, let engine = engineProvider() else { return }
+        view.stop()
+        view.play()
+        viewPausedBySync = false
+        let raw = mediaSeconds(engine)
+        let now = effectiveSeconds(raw)
+        pointer = Self.upperBound(of: comments, time: now)
+        if diagnosticsEnabled {
+            // 对齐点即「从此刻起才发射的弹幕时间轴」。续播起播若这里对齐到 ~0
+            // 而实际播放已在续播位，后面 tick 会把 0~续播位 的弹幕一次补发。
+            PlaybackLog.info(
+                "弹幕时间轴对齐 reason=\(reason) "
+                    + "mediaTime=\(String(format: "%.1f", now))s "
+                    + "pointer=\(pointer)/\(comments.count) "
+                    + "trackOffset=\(String(format: "%.1f", trackOffsetSeconds))s"
+            )
+        }
+        // seek 检测基对齐到**原始**采样点（与 tick 的 evaluate 同一时基；写 effective
+        // 会让下一拍 delta 凭空多出偏移量、越阈值误判 seek → 清屏死循环）。
+        // 置为对齐点而非 nil：resync 后首拍 tick 仍要做跳变检测。置 nil 的话，
+        // 续播 seek 若落在「注入对齐」与首拍之间（日志实证的爆发根因），跳变会被
+        // 首拍静默吞掉，第二拍就把 0~续播位 的弹幕一次补发。
+        seekDetector.align(rawSeconds: raw)
+        // 积压兜底基走 effective 时基（与 spawnUpTo 的 threshold 同源），维持原语义。
+        lastSpawnThreshold = now
+        startTimer()
+    }
+
+    private func spawnUpTo(_ mediaSeconds: Double) {
+        let threshold = effectiveSeconds(mediaSeconds)
+        // 发射量决策交给纯函数（DanmakuSpawnPlanner，单测覆盖）：
+        // - 积压跳变（两次发射机会之间前进超过 seekJumpSeconds）→ 清屏重对齐，
+        //   不补发过期弹幕（「起播爆一大片」的兜底）；
+        // - 其余情况每拍最多 24 条，超出顺延——阈值内的前向 seek 不再一帧喷几百条。
+        let decision = DanmakuSpawnPlanner.decide(
+            count: comments.count,
+            time: { self.comments[$0].time },
+            pointer: pointer,
+            threshold: threshold,
+            lastThreshold: lastSpawnThreshold,
+            seekJumpSeconds: Self.seekJumpSeconds
+        )
+        switch decision {
+        case .resetBacklog:
+            PlaybackLog.warning(
+                "弹幕积压跳变已跳过 last=\(String(format: "%.1f", lastSpawnThreshold ?? 0))s "
+                    + "now=\(String(format: "%.1f", threshold))s "
+                    + "pointer=\(pointer)/\(comments.count)"
+            )
+            lastSpawnThreshold = threshold
+            resync(reason: "backlog")
+        case .emit(let advanceTo):
+            lastSpawnThreshold = threshold
+            let start = pointer
+            while pointer < advanceTo {
+                view.shoot(danmaku: makeModel(for: comments[pointer]))
+                pointer += 1
+            }
+            let spawned = pointer - start
+            // 单帧发射远超正常节奏 = 时间轴对齐错位导致补发（典型：续播起播对齐到 0），
+            // 与「弹幕时间轴对齐」日志对照即可定位根因。
+            if diagnosticsEnabled, spawned >= Self.burstSpawnThreshold {
+                PlaybackLog.warning(
+                    "弹幕爆发发射 spawned=\(spawned) "
+                        + "mediaTime=\(String(format: "%.1f", mediaSeconds))s "
+                        + "pointer=\(pointer)/\(comments.count) "
+                        + "threshold=\(String(format: "%.1f", threshold))s"
+                )
+            }
+        }
+    }
+
+    private func makeModel(for comment: Comment) -> DanmakuCellModel {
+        OverlayDanmakuModel(comment: comment, fontSize: CGFloat(preferences.fontSize))
+    }
+
+    /// 第一条 `time > seconds` 的下标；全部不超过则返回 `count`。
+    ///
+    /// `comments` 按 `time` 升序（`DanmakuJSONConverter.entries(from:)` 保证）。
+    /// 用二分而不是 `firstIndex(where:)`：一张热番的弹幕表有几万条，线性扫描是
+    /// 几十微秒量级，而每次 seek / 换源 / 改偏移都要对齐一次指针；二分是 O(log n)
+    /// （30k 条 ≈ 15 次比较）。语义与
+    /// `comments.firstIndex { $0.time > seconds } ?? comments.count` 逐字相同。
+    /// `nonisolated` + 纯函数：便于 `AppTests` 直接钉住边界（空表 / 全过 / 全未过）。
+    nonisolated static func upperBound(of comments: [Comment], time seconds: Double) -> Int {
+        var low = 0
+        var high = comments.count
+        while low < high {
+            let mid = low + (high - low) / 2
+            if comments[mid].time > seconds { high = mid } else { low = mid + 1 }
+        }
+        return low
+    }
+}
+
+// MARK: - Cell
+
+/// 单条弹幕的模型：文本 / 颜色 / 字号 / 类型 / 停留时长，尺寸预测量。
+final class OverlayDanmakuModel: DanmakuCellModel {
+    let comment: DanmakuOverlayController.Comment
+    let font: PlatformFont
+    let color: PlatformColor
+    let size: CGSize
+    let marginX: CGFloat
+    let marginY: CGFloat
+    let identifier: String
+    let displayTime: Double
+    let type: DanmakuCellType
+    var track: UInt?
+
+    /// 行盒高度（`NSAttributedString.size().height`，**未加边距**）。
+    /// 基线换算要用它，见 `OverlayDanmakuCell.baseline`。
+    let textLineHeight: CGFloat
+
+    /// 亮度自适应描边色：亮色/浅色字用纯黑坚实描边，极深字用高亮描边避免黑成一团。
+    /// 与旧实现同口径（0.299/0.587/0.114 亮度、阈值 0.25）。
+    let strokeColor: PlatformColor
+
+    /// 描边外扩半径。旧实现是 `strokeWidth = 8% 字号` 的**居中**描边，向外扩一半
+    /// 即 4% 字号；下面用「同一行文字按圆环偏移画 12 次」复现同样的外扩量。
+    let outlineRadius: CGFloat
+
+    init(comment: DanmakuOverlayController.Comment, fontSize: CGFloat) {
+        self.comment = comment
+        #if os(macOS)
+        font = NSFont.systemFont(ofSize: fontSize, weight: .semibold)
+        color = NSColor(calibratedRed: CGFloat((comment.color >> 16) & 0xFF) / 255,
+                        green: CGFloat((comment.color >> 8) & 0xFF) / 255,
+                        blue: CGFloat(comment.color & 0xFF) / 255, alpha: 1)
+        #else
+        font = UIFont.systemFont(ofSize: fontSize, weight: .semibold)
+        color = UIColor(red: CGFloat((comment.color >> 16) & 0xFF) / 255,
+                        green: CGFloat((comment.color >> 8) & 0xFF) / 255,
+                        blue: CGFloat(comment.color & 0xFF) / 255, alpha: 1)
+        #endif
+        identifier = "\(comment.time)#\(comment.text)"
+        // 自然飞行节奏：滚动弹幕 7 秒（更灵动不拥堵），固定弹幕 4 秒。
+        displayTime = comment.mode == .scroll ? 7.0 : 4.0
+        switch comment.mode {
+        case .scroll: type = .floating
+        case .top: type = .top
+        case .bottom: type = .bottom
+        }
+        let attributed = NSAttributedString(string: comment.text, attributes: [.font: font])
+        var measured = attributed.size()
+        textLineHeight = measured.height
+        // 描边与阴影在字形外扩，测量宽度与高度预留边距，避免边缘裁切。
+        let mX = max(8.0, fontSize * 0.35)
+        let mY = max(4.0, fontSize * 0.15)
+        self.marginX = mX
+        self.marginY = mY
+        measured.width += mX
+        measured.height += mY
+        size = measured
+
+        let red = CGFloat((comment.color >> 16) & 0xFF) / 255
+        let green = CGFloat((comment.color >> 8) & 0xFF) / 255
+        let blue = CGFloat((comment.color & 0xFF)) / 255
+        let luminance = 0.299 * red + 0.587 * green + 0.114 * blue
+        strokeColor = luminance < 0.25
+            ? PlatformColor(white: 0.85, alpha: 1.0)
+            : PlatformColor.black
+        outlineRadius = max(0.6, fontSize * 0.045)
+    }
+
+    // MARK: - CoreText 排版（懒建 + 缓存）
+
+    private let lineLock = NSLock()
+    private var fillLine: CTLine?
+    private var outlineLine: CTLine?
+    private var lineBaselineOffset: CGFloat = 0
+
+    /// 原色行 / 描边色行 / **行盒底 → 基线**的偏移。
+    ///
+    /// **懒建而不是在 `init` 里建**：`init` 在主线程上、每条弹幕一次，
+    /// 而 `CTLineCreateWithAttributedString` 实测约 26 µs，两行就是 52 µs 的主线程税；
+    /// `displaying` 在 `DanmakuAsyncLayer` 的池队列上，两帧可能重叠，所以加锁。
+    /// 无竞争时只是一次 `NSLock`（约 20 ns）。
+    ///
+    /// 偏移口径见 `OverlayDanmakuCell.baseline`。
+    func lines() -> (fill: CTLine, outline: CTLine, baselineOffset: CGFloat) {
+        lineLock.lock()
+        defer { lineLock.unlock() }
+        if let fillLine, let outlineLine { return (fillLine, outlineLine, lineBaselineOffset) }
+
+        func line(_ color: PlatformColor) -> CTLine {
+            CTLineCreateWithAttributedString(
+                NSAttributedString(string: comment.text, attributes: [.font: font, .foregroundColor: color])
+            )
+        }
+        let fill = line(self.color)
+        let outline = line(strokeColor)
+        var ascent: CGFloat = 0
+        var descent: CGFloat = 0
+        var leading: CGFloat = 0
+        _ = CTLineGetTypographicBounds(fill, &ascent, &descent, &leading)
+
+        // ⚠️ 是 `行盒高 − round(ascent)`，**不是** `round(descent)`。两者在多数字号下
+        // 相等（AppKit 的行盒高通常就是 round(ascent)+round(descent)），但 16pt 上
+        // 不等：ascent 15.469 / descent 3.375，行盒高 19 → 偏移 19−15 = 4，
+        // 而 round(descent) = 3，会造成整条弹幕错位一个像素。九档字号（12…44pt）
+        // 逐像素对照旧路径钉住了这条（`OverlayDanmakuCellRenderTests`）。
+        let offset = textLineHeight - ascent.rounded()
+
+        fillLine = fill
+        outlineLine = outline
+        lineBaselineOffset = offset
+        return (fill, outline, offset)
+    }
+
+    var cellClass: DanmakuCell.Type { OverlayDanmakuCell.self }
+
+    func isEqual(to cellModel: DanmakuCellModel) -> Bool {
+        guard let other = cellModel as? OverlayDanmakuModel else { return false }
+        return identifier == other.identifier
+    }
+}
+
+/// 单条弹幕的高清绘制：
+/// 1. 彻底关闭透明上下文上的 LCD 亚像素平滑（Font Smoothing），杜绝白边泛白；
+/// 2. 双通道分层绘制：底层纯黑描边 + 顶层原色填充，确保弹幕原色鲜亮纯正；
+/// 3. 亮度自适应描边（亮色字纯黑描边，极深字柔和浅描边）；
+/// 4. 柔和投影增强高亮与复杂视频背景穿透力。
+///
+/// ## macOS：描边改成 CoreText + 圆环偏移（2026-10-15，实测 11–27×）
+///
+/// 原先两趟都走 `NSString.draw(at:withAttributes:)`，描边靠 `.strokeWidth` 文本效果。
+/// 那条路**每次绘制都要把字形实时转成 `CGPath`**——`CTFontCreatePathForGlyph` 实测
+/// 237 µs/字形，一条 13 字的弹幕光描边就 2.0 ms（填充只要 46 µs）。改用
+/// 「同一行 `CTLine` 按圆环偏移画 12 次 + 画一次原色填充」后实测 2.43 ms → 0.23 ms。
+/// 缓存字形描边路径（`CGPath.copy(strokingWithWidth:)`）虽然也能提速，但只有 6×
+/// 且要 ~15 MB 字形缓存，故不取。
+///
+/// iOS 仍走原路径：`DanmakuAsyncLayer` 在 iOS 用 `UIGraphicsBeginImageContextWithOptions`
+/// （y-down 翻转上下文），CoreText 的文本矩阵约定与 macOS 的 y-up 上下文不同，
+/// 未在本机验证过，不冒险。
+final class OverlayDanmakuCell: DanmakuCell {
+
+    /// 描边圆环方向表（12 向，近似圆）。三角函数只在类型初始化时算一次。
+    ///
+    /// **试过两圈（内 8 + 外 12）并否决**：内环只让墨迹多 5 个像素——12 份副本的
+    /// 并集本来就把环带内部填实了，剩下的差异在最外缘的半透明过渡带与投影上
+    /// （旧实现的投影投在「填充 + 描边」后的字形上，比只投填充更大），补内环治不到。
+    /// 单圈成本更低、代码更短。
+    private static let outlineDirections: [CGPoint] = (0..<12).map { index in
+        let angle = 2 * Double.pi * Double(index) / 12
+        return CGPoint(x: CGFloat(cos(angle)), y: CGFloat(sin(angle)))
+    }
+
+    override func displaying(_ context: CGContext, _ size: CGSize, _ isCancelled: Bool) {
+        guard !isCancelled, let model = model as? OverlayDanmakuModel else { return }
+
+        // 透明位图上下文禁止字体平滑（Font Smoothing 默认假设白底，在透明图层上会引起暗色背景泛白）
+        context.setAllowsFontSmoothing(false)
+        context.setShouldSmoothFonts(false)
+
+        context.setAllowsAntialiasing(true)
+        context.setShouldAntialias(true)
+        context.setAllowsFontSubpixelPositioning(true)
+        context.setShouldSubpixelPositionFonts(true)
+        context.setAllowsFontSubpixelQuantization(true)
+        context.setShouldSubpixelQuantizeFonts(true)
+        context.setLineJoin(.round)
+        context.setLineCap(.round)
+
+        #if os(macOS)
+        let lines = model.lines()
+        let baseline = Self.baseline(for: model, offset: lines.baselineOffset)
+
+        context.saveGState()
+        context.textMatrix = .identity
+        // 第 1 遍：底层纯黑描边 = 同一行文字按圆环偏移画 12 次。
+        for direction in Self.outlineDirections {
+            context.textPosition = CGPoint(
+                x: baseline.x + direction.x * model.outlineRadius,
+                y: baseline.y + direction.y * model.outlineRadius
+            )
+            CTLineDraw(lines.outline, context)
+        }
+        // 第 2 遍：顶层 100% 原始色彩填充 + 柔和投影。
+        // 投影用 CGContext 而不是 `NSShadow` 属性：CTLineDraw 不认 AppKit 的 `.shadow`，
+        // 而 CGContext 的投影语义与旧实现一致（只压在填充这一遍，不污染描边）。
+        context.setShadow(offset: CGSize(width: 0, height: -1.0), blur: 1.5,
+                          color: PlatformColor.black.withAlphaComponent(0.45).cgColor)
+        context.textPosition = baseline
+        CTLineDraw(lines.fill, context)
+        context.restoreGState()
+        #else
+        drawLegacy(context: context, model: model)
+        #endif
+    }
+
+    /// 旧实现：两趟 `NSString.draw(at:withAttributes:)` + `NSShadow` + `.strokeWidth` 描边。
+    /// iOS 仍在使用；同时是渲染回归用例的对照基准（见 `drawFill`）。
+    func drawLegacy(context: CGContext, model: OverlayDanmakuModel) {
+        let text = NSString(string: model.comment.text)
+
+        let shadow = NSShadow()
+        shadow.shadowBlurRadius = 1.5
+        #if os(macOS)
+        shadow.shadowOffset = NSSize(width: 0, height: -1.0)
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.45)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        #else
+        shadow.shadowOffset = CGSize(width: 0, height: 1.0)
+        shadow.shadowColor = UIColor.black.withAlphaComponent(0.45)
+        #endif
+
+        // 双通道分层绘制：
+        // 第 1 遍：底层绘制空心纯黑描边（正数 strokeWidth 表示仅描边不填充）+ 阴影
+        // 第 2 遍：顶层绘制 100% 原始色彩实体文字填充（无 strokeWidth，保留弹幕原色）
+        let strokeWidthPercent: Double = 8.0
+
+        let strokeAttributes: [NSAttributedString.Key: Any] = [
+            .font: model.font,
+            .foregroundColor: model.strokeColor,
+            .strokeColor: model.strokeColor,
+            .strokeWidth: strokeWidthPercent,
+            .shadow: shadow,
+        ]
+
+        let fillAttributes: [NSAttributedString.Key: Any] = [
+            .font: model.font,
+            .foregroundColor: model.color,
+        ]
+
+        let origin = CGPoint(x: model.marginX / 2, y: model.marginY / 2)
+        text.draw(at: origin, withAttributes: strokeAttributes)
+        text.draw(at: origin, withAttributes: fillAttributes)
+    }
+
+    #if os(macOS)
+    /// `CTLineDraw` 的基线。
+    ///
+    /// 旧实现用 `NSString.draw(at:)`，在 y-up 上下文里它的 `origin` 是**行盒左下角**，
+    /// 而行盒高由 AppKit 定（`NSAttributedString.size().height`），基线在
+    /// `行盒高 − round(ascent)` 处。实测 12/14/16/18/22/26/30/36/44 pt 九档字号与
+    /// 旧路径**逐像素零差异**（`OverlayDanmakuCellRenderTests` 钉住这条）。
+    static func baseline(for model: OverlayDanmakuModel, offset: CGFloat) -> CGPoint {
+        CGPoint(x: model.marginX / 2, y: model.marginY / 2 + offset)
+    }
+
+    /// 只画原色填充（不含描边；`withShadow` 控制是否带投影）。
+    ///
+    /// `displaying` 的填充趟走这里；渲染回归用例也用它——与旧 `NSString.draw` 的
+    /// 填充趟逐像素对照，钉住上面那条基线换算（写错就整屏弹幕错位，而它不会让
+    /// 任何现有用例变红）。
+    func drawFill(_ context: CGContext, model: OverlayDanmakuModel, withShadow: Bool) {
+        let lines = model.lines()
+        context.saveGState()
+        context.textMatrix = .identity
+        if withShadow {
+            context.setShadow(offset: CGSize(width: 0, height: -1.0), blur: 1.5,
+                              color: PlatformColor.black.withAlphaComponent(0.45).cgColor)
+        }
+        context.textPosition = Self.baseline(for: model, offset: lines.baselineOffset)
+        CTLineDraw(lines.fill, context)
+        context.restoreGState()
+    }
+    #endif
+}
+
+// MARK: - SwiftUI 宿主
+
+/// 弹幕 overlay 的 SwiftUI 壳：垫在视频表面之上、手势层之下。
+struct DanmakuOverlayHost: View {
+    let controller: DanmakuOverlayController
+
+    var body: some View {
+        DanmakuOverlayRepresentable(controller: controller)
+            .allowsHitTesting(false)
+            .ignoresSafeArea()
+            .onDisappear {
+                // 只停 60Hz 采样 timer,保留已装载的弹幕数据:
+                // overlay 在窗口还原动画等场景会先 disappear 再 reappear,
+                // 丢数据会导致重开后进度指针错位或弹幕整体丢失。
+                controller.pauseSampling()
+            }
+    }
+}
+
+private struct DanmakuOverlayRepresentable: PlatformViewRepresentable {
+    let controller: DanmakuOverlayController
+
+    #if os(macOS)
+    func makeNSView(context: Context) -> DanmakuView {
+        controller.startTimer()
+        return controller.view
+    }
+
+    func updateNSView(_ nsView: DanmakuView, context: Context) {}
+
+    static func dismantleNSView(_ nsView: DanmakuView, coordinator: ()) {
+        nsView.pause()
+    }
+    #else
+    func makeUIView(context: Context) -> DanmakuView {
+        controller.startTimer()
+        return controller.view
+    }
+
+    func updateUIView(_ uiView: DanmakuView, context: Context) {}
+
+    static func dismantleUIView(_ uiView: DanmakuView, coordinator: ()) {
+        uiView.pause()
+    }
+    #endif
+}

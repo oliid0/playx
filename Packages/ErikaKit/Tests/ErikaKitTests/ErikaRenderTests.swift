@@ -1,0 +1,352 @@
+import CErika
+import CoreMedia
+import Foundation
+import Metal
+import QuartzCore
+import Testing
+import PlaybackKit
+@testable import ErikaKit
+
+/// M0 第 5 步的无头验收：挂一个**离屏** CAMetalLayer，自己手动打 render_tick，
+/// 证明内核真的在解码 → 上屏 → 推音频，并且 pause / seek / 倍速 / resize 连打不出错。
+/// CAMetalLayer 不进窗口层级也能拿 drawable，所以这一切不需要开窗口。
+@Suite("Erika 离屏渲染", .serialized)
+struct ErikaRenderTests {
+
+    /// 造一个能直接交给内核的离屏 CAMetalLayer。
+    private static func makeLayer(width: Int, height: Int) throws -> CAMetalLayer {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw CocoaError(.featureUnsupported)
+        }
+        let layer = CAMetalLayer()
+        layer.device = device
+        layer.pixelFormat = .bgra8Unorm
+        layer.framebufferOnly = false          // 允许内核回读，capture_frame 才稳
+        layer.isOpaque = true
+        layer.bounds = CGRect(x: 0, y: 0, width: width, height: height)
+        layer.drawableSize = CGSize(width: width, height: height)
+        return layer
+    }
+
+    private static func attach(_ presenter: ErikaPresenter, _ layer: CAMetalLayer,
+                               width: Int, height: Int) throws {
+        let raw = UInt64(UInt(bitPattern: Unmanaged.passUnretained(layer).toOpaque()))
+        try presenter.attachMetalLayer(raw, pixelWidth: width, pixelHeight: height, scale: 1)
+    }
+
+    /// 打 tick 并抽干事件，最多 `frames` 帧；`stop` 返回 true 就提前结束。
+    @discardableResult
+    private static func pump(_ presenter: ErikaPresenter, frames: Int,
+                            collect: (PlayerEvent) -> Void = { _ in },
+                            stop: () -> Bool = { false }) throws -> ErikaPresenterStats {
+        var stats = ErikaPresenterStats()
+        for _ in 0..<frames {
+            // 显示链会给「这一帧的绝对呈现时间」，离屏就用当前时间 + 一帧。
+            stats = try presenter.renderTick(at: CACurrentMediaTime() + 1.0 / 60)
+            while let event = try presenter.pollEvent() { collect(event) }
+            if stop() { break }
+            Thread.sleep(forTimeInterval: 1.0 / 60)
+        }
+        return stats
+    }
+
+    @Test("有画面有声音：rendered / pushed_audio 都在涨，硬解生效")
+    func rendersPictureAndPushesAudio() async throws {
+        let movie = try await TestMedia.makeMovieWithTone(seconds: 2)
+        defer { try? FileManager.default.removeItem(at: movie) }
+
+        let presenter = try ErikaPresenter()
+        let layer = try Self.makeLayer(width: 640, height: 360)
+        try Self.attach(presenter, layer, width: 640, height: 360)
+
+        try presenter.open(PlaybackSource(fileURL: movie))
+
+        var tracks = TrackCounts(video: 0, audio: 0, subtitle: 0)
+        var duration: Duration?
+        var failure: String?
+        var decoderSwitched = false
+
+        // 等 open 落地（最多 ~2 秒）。
+        try Self.pump(presenter, frames: 120, collect: { event in
+            switch event {
+            case .tracksChanged(let counts): tracks = counts
+            case .durationChanged(let value): duration = value
+            case .videoDecoderChanged: decoderSwitched = true
+            case .failed(_, let message): failure = message ?? "unknown"
+            default: break
+            }
+        }, stop: { duration != nil && tracks.video > 0 && tracks.audio > 0 })
+
+        #expect(failure == nil, "open 阶段不该报错：\(failure ?? "")")
+        #expect(tracks.video == 1, "应有 1 条视频轨，实际 \(tracks.video)")
+        #expect(tracks.audio == 1, "应有 1 条音轨，实际 \(tracks.audio)")
+
+        try presenter.play()
+
+        var position = Duration.zero
+        // 播 ~1.5 秒（90 帧 @60Hz）。
+        let stats = try Self.pump(presenter, frames: 90, collect: { event in
+            switch event {
+            case .positionChanged(let value): position = value
+            case .videoDecoderChanged: decoderSwitched = true
+            case .failed(_, let message): failure = message ?? "unknown"
+            default: break
+            }
+        })
+
+        #expect(failure == nil, "播放中不该报错：\(failure ?? "")")
+        #expect(stats.decoded_video_frames > 0, "应解出视频帧")
+        #expect(stats.rendered_video_frames > 0,
+                "应真的上屏过（rendered=\(stats.rendered_video_frames)）")
+        #expect(stats.pushed_audio_frames > 0,
+                "应真的推过音频（pushed=\(stats.pushed_audio_frames)）")
+        #expect(stats.render_failures == 0, "渲染不该有失败：\(stats.render_failures)")
+        #expect(stats.audio_failures == 0, "音频不该有失败：\(stats.audio_failures)")
+        #expect(stats.hardware_video_frames > 0,
+                "macOS 上应该走 VideoToolbox 硬解（decoder_changed=\(decoderSwitched)）")
+        #expect(position.microseconds > 0, "位置应该往前走，实际 \(position.microseconds)µs")
+
+        // 画面到底是不是真画面：截一张，素材是逐帧变亮的灰底，所以像素应非全黑且三通道接近。
+        let pixels = try presenter.captureFrameRGBA(width: 64, height: 36)
+        let luma = pixels.enumerated().filter { $0.offset % 4 != 3 }.map { Int($0.element) }
+        let brightest = luma.max() ?? 0
+        #expect(brightest > 0, "截帧不该是全黑")
+
+        try presenter.detachSurface()
+        try presenter.close()
+    }
+
+    @Test("pause / seek / 倍速 / resize 连打不炸")
+    func controlsAreStable() async throws {
+        let movie = try await TestMedia.makeMovieWithTone(seconds: 2)
+        defer { try? FileManager.default.removeItem(at: movie) }
+
+        let presenter = try ErikaPresenter()
+        let layer = try Self.makeLayer(width: 480, height: 270)
+        try Self.attach(presenter, layer, width: 480, height: 270)
+        try presenter.open(PlaybackSource(fileURL: movie))
+
+        var ready = false
+        var failure: String?
+        func note(_ event: PlayerEvent) {
+            switch event {
+            case .stateChanged(let state) where state != .opening && state != .idle: ready = true
+            case .failed(_, let message): failure = message ?? "unknown"
+            default: break
+            }
+        }
+
+        try Self.pump(presenter, frames: 120, collect: note, stop: { ready })
+        #expect(ready, "应至少进入过 Ready")
+
+        try presenter.play()
+        try Self.pump(presenter, frames: 20, collect: note)
+
+        try presenter.pause()
+        try Self.pump(presenter, frames: 10, collect: note)
+
+        try presenter.seek(to: .milliseconds(1_000))
+        try Self.pump(presenter, frames: 20, collect: note)
+
+        try presenter.setRate(2.0)
+        try presenter.setVolume(0.3)
+        try presenter.play()
+        try Self.pump(presenter, frames: 20, collect: note)
+
+        // 窗口 resize：内核要求下一次 tick 之前先 resize_surface。
+        layer.drawableSize = CGSize(width: 800, height: 450)
+        try presenter.resizeSurface(pixelWidth: 800, pixelHeight: 450, scale: 1)
+        let stats = try Self.pump(presenter, frames: 30, collect: note)
+
+        #expect(failure == nil, "连打控制不该报错：\(failure ?? "")")
+        #expect(stats.render_failures == 0, "resize 后渲染不该失败：\(stats.render_failures)")
+        #expect(stats.import_failures == 0, "帧导入不该失败：\(stats.import_failures)")
+
+        try presenter.stop()
+        try presenter.detachSurface()
+        try presenter.close()
+    }
+
+    /// `erika_presenter_render_tick_with_timing` 在钉点二进制里真实可用，且指针
+    /// 传递正确。
+    ///
+    /// 这条守两件事：①符号确实在 v0.2.1 的 macOS slice 里（本 App 依赖它在**编译期**
+    /// 解析——钉点低于 v0.2.1 会构建失败而不是静默降级）；②`withUnsafePointer` 传的
+    /// 是「到显示目标的延迟」而不是别的东西（内核只借用、开工前拷走）。带 timing 与
+    /// 不带 timing 的 tick 在无头环境里表现应当一致：都能出画、都不报错。
+    @Test("带显示目标延迟的 tick 正常出画")
+    func rendersWithPresentationTiming() async throws {
+        let movie = try await TestMedia.makeMovieWithTone(seconds: 2)
+        defer { try? FileManager.default.removeItem(at: movie) }
+
+        let presenter = try ErikaPresenter()
+        let layer = try Self.makeLayer(width: 640, height: 360)
+        try Self.attach(presenter, layer, width: 640, height: 360)
+        try presenter.open(PlaybackSource(fileURL: movie))
+
+        var ready = false
+        var failure: String?
+        func note(_ event: PlayerEvent) {
+            switch event {
+            case .stateChanged(let state) where state != .opening && state != .idle: ready = true
+            case .failed(_, let message): failure = message ?? "unknown"
+            default: break
+            }
+        }
+        try Self.pump(presenter, frames: 120, collect: note, stop: { ready })
+        #expect(ready, "应至少进入过 Ready")
+        try presenter.play()
+
+        // 手动推进：这一批走的是带 timing 的重载（延迟取一帧，正好是内核对
+        // 「下一秒要显示的那一帧」的典型用法）。
+        var stats = ErikaPresenterStats()
+        for _ in 0..<30 {
+            stats = try presenter.renderTick(
+                at: CACurrentMediaTime() + 1.0 / 60,
+                presentationDelay: 1.0 / 60
+            )
+            while let event = try presenter.pollEvent() { note(event) }
+            try await Task.sleep(for: .milliseconds(16))
+        }
+
+        #expect(failure == nil, "带 timing 的 tick 不该报错：\(failure ?? "")")
+        #expect(stats.render_failures == 0, "渲染不该失败：\(stats.render_failures)")
+        #expect(stats.rendered_video_frames > 0, "带 timing 的 tick 也要真的出画")
+
+        try presenter.stop()
+        try presenter.detachSurface()
+        try presenter.close()
+    }
+
+    /// 运行时切换亮度上采样：真实内核接受调用，且**要么真在跑、要么明确报回落**。
+    ///
+    /// 两条都重要：①运行期入口此前从未被调用过，这条证明它通；②`inactive` 有**两个**
+    /// 来源——后端不支持，以及画面管线还没跑起来（未 attach / 首帧之前）。所以这条
+    /// 用例必须挂上 surface 并真的 tick 过，再断言「有计算后端就必须有帧被上采样」，
+    /// 否则「设了没效果」和「后端不支持」在 App 侧根本分不开。
+    /// 不把具体后端写死（不同机器可以是 simdgroupMatrix / scalar / inactive）。
+    @Test("运行期切换亮度上采样：挂上画布后要么真在跑、要么明确回落")
+    func switchesLumaUpscalerAtRuntime() async throws {
+        let movie = try await TestMedia.makeMovieWithTone(seconds: 2)
+        defer { try? FileManager.default.removeItem(at: movie) }
+
+        let presenter = try ErikaPresenter()
+        let layer = try Self.makeLayer(width: 640, height: 360)
+        try Self.attach(presenter, layer, width: 640, height: 360)
+        try presenter.open(PlaybackSource(fileURL: movie))
+        try presenter.play()
+
+        // 先跑热：没有画面时内核报 inactive 只代表「还没开始」。
+        var stats = try Self.pump(presenter, frames: 60)
+        #expect(stats.rendered_video_frames > 0, "前提：应真的出过画")
+
+        for mode in PlaybackUpscalerMode.allCases {
+            try presenter.setUpscaler(mode)
+            stats = try Self.pump(presenter, frames: 40)
+            let state = try presenter.upscalerStatus()
+            #expect(state.requested == mode, "请求的档位要能被内核读回：\(mode.rawValue)")
+
+            switch state.backend {
+            case .off:
+                // 关闭档：后端必须是 off，且不该有上采样帧。
+                #expect(mode == .off, "只有关闭档才允许后端为 off")
+            case .inactive:
+                // 明确回落：允许（该后端不支持 ArtCNN），但设置页会据此提示。
+                #expect(mode != .off, "开着增强却报 inactive 是回退，不是常态")
+            case .building, .scalar, .simdgroupMatrix:
+                #expect(
+                    state.upscaledFrames > 0,
+                    "报了计算后端却一帧都没上采样：\(mode.rawValue) backend=\(state.backend.rawValue)"
+                )
+            case .unknown:
+                Issue.record("后端状态不该是 unknown：\(mode.rawValue)")
+            }
+        }
+
+        // 关回去也要能读回（用户关掉增强不该留下残影）。
+        try presenter.setUpscaler(.off)
+        _ = try Self.pump(presenter, frames: 20)
+        #expect(try presenter.upscalerStatus().requested == .off)
+
+        try presenter.stop()
+        try presenter.detachSurface()
+        try presenter.close()
+    }
+
+    /// 字幕外观下发：真实内核接受这个调用，且覆盖与非覆盖两条路都不报错。
+    ///
+    /// 这条守的是**符号与结构体布局**（`erika_presenter_set_subtitle_style` 按值传
+    /// 21 字段的结构体，此前从未被调用过），以及「没有字幕轨时也不该炸」——
+    /// 用户完全可能先改字幕外观再打开片源。
+    @Test("字幕外观下发：无字幕轨时也不报错")
+    func appliesSubtitleStyleSafely() async throws {
+        let movie = try await TestMedia.makeMovieWithTone(seconds: 1)
+        defer { try? FileManager.default.removeItem(at: movie) }
+
+        let engine = try ErikaEngine()
+        try engine.open(PlaybackSource(fileURL: movie))
+
+        // 只填空缺（不覆盖）：片源自带排版保留。
+        engine.setSubtitleStyle(
+            SubtitleStyle(alignment: 2, marginVertical: 40, outlineWidth: 3, bold: true),
+            overrides: []
+        )
+        // 覆盖模式：把改过的项变成替换。
+        engine.setSubtitleStyle(
+            SubtitleStyle(alignment: 8, primaryColorRGBA: 0xFFFF_00FF),
+            overrides: [.alignment, .colors]
+        )
+        // 空样式（用户什么都没设）：调用方会跳过下发，这里直接验内核也不介意。
+        engine.setSubtitleStyle(SubtitleStyle(), overrides: [])
+
+        // 走到这里没抛错就说明内核接受了（setSubtitleStyle 内部失败只记日志，
+        // 所以用一次正常 tick 确认引擎还活着）。
+        try engine.play()
+        var stats = ErikaPresenterStats()
+        for _ in 0..<10 {
+            stats = try engine.audioOnlyTick()
+        }
+        #expect(stats.render_failures == 0)
+    }
+
+    /// 诊断字段的覆盖：`kernelDiagnosticsFields()` 必须把内核的原始计数器**全部**导出去。
+    /// 这条守的是「别再悄悄丢字段」——映射是几十行机械赋值，少写一行不会有任何编译
+    /// 错误，只会在下一次排障时表现为「那个数字又不在了」。所以逐个点名。
+    /// 放在本套件里是因为它要真实例化引擎（需要 Metal），与其它渲染用例同一前提。
+    @Test("诊断字段覆盖全部原始计数器与输出细节")
+    func kernelDiagnosticsFieldsCoverEverything() throws {
+        let engine = try ErikaEngine()
+        // 用 deinit 收尾而不是 close()：close 是终态，这里只想验证读字段。
+
+        let fields = engine.kernelDiagnosticsFields()
+
+        let requiredKeys = [
+            // 视频 / 渲染
+            "decoded_video_frames", "rendered_video_frames", "rendered_test_frames",
+            "software_video_frames", "hardware_video_frames", "zero_copy_video_frames",
+            "cpu_video_frame_fallbacks", "video_frame_backpressure_drops",
+            "direct_zero_copy_video_frames", "shared_handle_video_frames",
+            "last_render_micros", "last_render_current_micros",
+            "render_failures", "import_failures",
+            // 音频
+            "pushed_audio_frames", "audio_failures", "audio_clock_read_frames",
+            "audio_clock_queued_frames", "audio_clock_underflow_frames",
+            "audio_recovery_state", "audio_last_error_code", "audio_recovery_attempts",
+            "audio_recovery_count", "audio_recovery_failures",
+            // HDR
+            "hdr_source_frames", "hdr10_output_frames", "sdr_tonemap_frames",
+            "hdr10_metadata_updates", "hdr10_metadata_failures", "hdr10_output_failures",
+            "hdr10_output_active",
+            // 覆盖层 / 弹幕
+            "overlay_frames", "danmaku_frames", "danmaku_items",
+            // 输出细节
+            "output_encoding", "output_surface_format", "output_fallback_reason",
+            "output_fallback_count", "output_headroom_known", "output_headroom",
+            "output_extended_linear",
+        ]
+        for key in requiredKeys {
+            #expect(fields[key] != nil, "诊断字段缺了 \(key)——排障时那个数字就没了")
+        }
+        #expect(fields.count >= requiredKeys.count, "字段数不该少于点名清单")
+    }
+}

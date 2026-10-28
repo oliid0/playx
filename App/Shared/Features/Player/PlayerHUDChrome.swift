@@ -1,0 +1,449 @@
+import JellyfinKit
+import PlaybackKit
+import Foundation
+import Observation
+import SwiftUI
+
+#if os(macOS)
+import AppKit
+#endif
+
+/// 播放器浮层专属白调色板。播放器子树使用深色外观，HUD 之外的玻璃内容
+/// （如跳过按钮）一律用 `.primary` 等动态色，禁止从本调色板取色。
+enum PlayerHUDPalette {
+    static let primary = Color.white
+    static let secondary = Color.white.opacity(0.76)
+    static let tertiary = Color.white.opacity(0.5)
+}
+
+/// 静态 Glass 承载层：没有固定不透明底色，统一从已经压暗的画面取样。
+struct PlayerHUDGlassSurface<SurfaceShape: Shape, Content: View>: View {
+    let shape: SurfaceShape
+    let content: Content
+
+    init(in shape: SurfaceShape, @ViewBuilder content: () -> Content) {
+        self.shape = shape
+        self.content = content()
+    }
+
+    var body: some View {
+        content
+            .glassEffect(.regular, in: shape)
+    }
+}
+
+/// 只有真实 Button 使用 interactive Glass。
+struct PlayerHUDGlassIconButton: View {
+    let systemImage: String
+    let accessibilityLabel: String
+    let action: () -> Void
+
+    private var side: CGFloat {
+        #if os(iOS)
+        44
+        #else
+        42
+        #endif
+    }
+
+    var body: some View {
+        button
+            .glassEffect(.regular.interactive(), in: Circle())
+    }
+
+    private var button: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .symbolRenderingMode(.monochrome)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(PlayerHUDPalette.primary)
+                .frame(width: side, height: side)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help(accessibilityLabel)
+        .accessibilityLabel(accessibilityLabel)
+    }
+}
+
+/// 播放器内的消息、状态和预览面板统一使用静态 Regular Liquid Glass。
+struct PlayerHUDPanel<SurfaceShape: Shape, Content: View>: View {
+    let shape: SurfaceShape
+    let content: Content
+
+    init(in shape: SurfaceShape, @ViewBuilder content: () -> Content) {
+        self.shape = shape
+        self.content = content()
+    }
+
+    var body: some View {
+        PlayerHUDGlassSurface(in: shape) {
+            content
+        }
+    }
+}
+
+/// 单独的观察边界：打开信息面板时，position 更新不会让 PlayerScreen 和主 HUD 一起失效。
+///
+/// 由原「播放信息」（标题 / 时间 / 分辨率）和「播放统计」（裸计数行）合并而来：
+/// 上半部是用户可读的播放元信息，底部「内核统计」保留 8 个原始计数器——0 和
+/// 「不支持」在排查时是两回事，不做智能省略（见 `PlaybackStats`）。计数器来自
+/// `latestStats`，它不是 observable 属性，整面板包一层 TimelineView 每秒强制重读，
+/// 顺带让进度行跟上整秒；其余字段仍是 observable，变化即时反映。
+struct PlayerHUDInfoPanel: View {
+    @Environment(PlaybackController.self) private var controller
+    @Environment(\.playerChromeInsets) private var chromeInsets
+
+    let title: String
+    let kicker: String
+    let isNarrow: Bool
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            PlayerHUDPanel(in: RoundedRectangle(cornerRadius: 14)) {
+                VStack(alignment: .leading, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(title)
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(PlayerHUDPalette.primary)
+                        if !kicker.isEmpty {
+                            Text(kicker)
+                                .font(.caption)
+                                .foregroundStyle(PlayerHUDPalette.secondary)
+                        }
+                    }
+
+                    PlayerHUDInfoSection(title: "播放") {
+                        infoRow("状态", stateValue)
+                        infoRow("进度", progressValue)
+                        infoRow("倍速", playerHUDRateLabel(controller.rate))
+                        infoRow("音量", volumeValue)
+                        infoRow("章节", chaptersValue)
+                    }
+
+                    PlayerHUDInfoSection(title: "视频") {
+                        if let params = controller.state.videoParams {
+                            infoRow("分辨率", "\(params.width)×\(params.height) · \(PlayerVideoColorLabel.aspect(width: params.width, height: params.height))")
+                            infoRow(
+                                "动态范围",
+                                PlayerVideoColorLabel.dynamicRange(
+                                    transfer: params.transfer,
+                                    isDolbyVision: controller.activeRequest?.sessionContext?.isDolbyVision == true,
+                                    outputEncoding: controller.engine?.latestOutputEncoding ?? .unknown
+                                )
+                            )
+                            infoRow(
+                                "色彩",
+                                "\(PlayerVideoColorLabel.primaries(params.primaries)) · \(PlayerVideoColorLabel.transfer(params.transfer))"
+                            )
+                            // 「输出」只在真有可报内容时出现（内核未报编码 / 拿不到
+                            // 快照时整行隐藏），避免 SDR 屏上凭空多一行「未知」。
+                            if let output = PlayerVideoColorLabel.outputDetail(
+                                encoding: controller.engine?.latestOutputEncoding ?? .unknown,
+                                snapshot: controller.engine?.latestOutputSnapshot ?? .unknown
+                            ) {
+                                infoRow("输出", output)
+                            }
+                        } else {
+                            infoRow("分辨率", "—")
+                        }
+                        infoRow("画面", controller.state.hasSurface ? "已出画" : "未出画")
+                    }
+
+                    PlayerHUDInfoSection(title: "音频") {
+                        infoRow("音轨", audioTrackValue)
+                    }
+
+                    PlayerHUDInfoSection(title: "字幕") {
+                        infoRow("字幕", subtitleValue)
+                    }
+
+                    PlayerHUDInfoSection(title: "内核统计") {
+                        statsGrid
+                    }
+                }
+                .padding(14)
+            }
+            .frame(maxWidth: 340, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        // 顶距原值 70/82 是避开顶栏的手算值，顶栏让位灵动岛后跟着平移
+        // （见 PlayerChromeMetrics.infoPanelTopPadding）。
+        .padding(.horizontal, PlayerChromeMetrics.sidePadding(chromeInsets, isNarrow: isNarrow))
+        .padding(.top, PlayerChromeMetrics.infoPanelTopPadding(chromeInsets, isNarrow: isNarrow))
+        .allowsHitTesting(false)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("播放信息")
+    }
+
+    private var stateValue: String {
+        var value = stateLabel
+        // 与 PlayerScreen 的缓冲圈同一判定，避免「转圈但状态行不动」。
+        // 用迟滞后的 UI 态：单帧饿数据不该让状态行闪一下「缓冲中」（issue #2）。
+        if controller.state.isBufferingSustained && controller.state.state == .playing {
+            value += " · 缓冲中"
+        }
+        return value
+    }
+
+    private var stateLabel: String {
+        switch controller.state.state {
+        case .idle: "空闲"
+        case .opening: "打开中"
+        case .ready: "就绪"
+        case .playing: "播放中"
+        case .paused: "已暂停"
+        case .stopped: "已停止"
+        case .closed: "已关闭"
+        case .error: "错误"
+        }
+    }
+
+    private var progressValue: String {
+        let timeline = controller.state.timeline
+        var value = "\(playerHUDTimeLabel(timeline.displayPosition)) / \(playerHUDTimeLabel(timeline.duration))"
+        if timeline.duration > .zero {
+            value += " · \(playerHUDPercentLabel(timeline.progress))"
+        }
+        return value
+    }
+
+    private var volumeValue: String {
+        if controller.muted { return "已静音" }
+        return "\(Int((controller.volume * 100).rounded()))%"
+    }
+
+    private var chaptersValue: String {
+        let chapters = controller.chapters
+        return chapters.isEmpty ? "无" : "\(chapters.count) 章"
+    }
+
+    private var audioTrackValue: String {
+        guard let track = controller.state.audioTracks.first(where: { $0.selected }) else {
+            return "无独立音轨"
+        }
+        var value = track.displayTitle
+        if let sampleRate = track.sampleRate, sampleRate > 0 {
+            value += " · \(sampleRate / 1000) kHz"
+        }
+        return value
+    }
+
+    private var subtitleValue: String {
+        guard let track = controller.state.subtitleTracks.first(where: { $0.selected }) else {
+            return "关闭"
+        }
+        return track.source == .external ? "\(track.displayTitle)（外挂）" : track.displayTitle
+    }
+
+    private var statsGrid: some View {
+        let stats = controller.engine?.latestStats ?? PlaybackStats()
+        let items: [(label: String, value: UInt64)] = [
+            ("解码", stats.decodedVideoFrames),
+            ("渲染", stats.renderedVideoFrames),
+            ("硬解", stats.hardwareVideoFrames),
+            ("软解", stats.softwareVideoFrames),
+            ("零拷贝", stats.zeroCopyVideoFrames),
+            ("音频帧", stats.pushedAudioFrames),
+            ("渲染失败", stats.renderFailures),
+            ("音频失败", stats.audioFailures),
+        ]
+        return LazyVGrid(
+            columns: [
+                GridItem(.flexible(), alignment: .leading),
+                GridItem(.flexible(), alignment: .leading),
+            ],
+            alignment: .leading,
+            spacing: 6
+        ) {
+            ForEach(items, id: \.label) { item in
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(item.label)
+                        .font(.caption2)
+                        .foregroundStyle(PlayerHUDPalette.tertiary)
+                    Text(item.value.formatted())
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(PlayerHUDPalette.primary)
+                }
+            }
+        }
+    }
+
+    private func infoRow(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(PlayerHUDPalette.tertiary)
+            Spacer(minLength: 12)
+            Text(value)
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(PlayerHUDPalette.secondary)
+                .multilineTextAlignment(.trailing)
+                .lineLimit(3)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+/// 信息面板的分区标题 + 行容器。
+private struct PlayerHUDInfoSection<Content: View>: View {
+    let title: String
+    let content: Content
+
+    init(title: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(PlayerHUDPalette.tertiary)
+            content
+        }
+    }
+}
+
+/// `VideoParams` 的 AVCol 原始编码 → 可读标签。认不出的码退回原始值：
+/// 宁可显示 "TRC 23" 也不猜错。
+enum PlayerVideoColorLabel {
+    /// 动态范围标注：源侧认传输函数（PQ/HLG），再叠加杜比视界与实际输出编码。
+    ///
+    /// - 杜比源：内核（profile 5）会把 RPU 映射进标准 HDR 链、（profile 8）走 HDR10
+    ///   底层，源侧 transfer 不再是可靠的判定依据，标注统一以「杜比视界」开头；
+    ///   输出编码已知时补上「映射 SDR / HDR」——SDR 屏上看杜比片是用户最想确认的场景。
+    /// - 输出未知（`.unknown`）时杜比源也只报「杜比视界」，不猜。
+    static func dynamicRange(
+        transfer: UInt32,
+        isDolbyVision: Bool = false,
+        outputEncoding: PlaybackOutputEncoding = .unknown
+    ) -> String {
+        if isDolbyVision {
+            switch outputEncoding {
+            case .sdr: return "杜比视界（映射 SDR）"
+            case .appleEdr, .hdr10Pq, .extendedLinear: return "杜比视界（HDR）"
+            case .unknown: return "杜比视界"
+            }
+        }
+        switch transfer {
+        case 16: return "HDR (PQ)"
+        case 18: return "HLG"
+        default: return "SDR"
+        }
+    }
+
+    static func transfer(_ raw: UInt32) -> String {
+        switch raw {
+        case 1: "BT.1886"
+        case 4: "Gamma 2.2"
+        case 6: "BT.601"
+        case 13: "sRGB"
+        case 16: "PQ"
+        case 18: "HLG"
+        default: "TRC \(raw)"
+        }
+    }
+
+    static func primaries(_ raw: UInt32) -> String {
+        switch raw {
+        case 1: "BT.709"
+        case 6: "BT.601"
+        case 9: "BT.2020"
+        case 11: "DCI-P3"
+        case 12: "Display P3"
+        default: "原色 \(raw)"
+        }
+    }
+
+    /// 宽高比标签：gcd 约成整比（16:9）优先，约出的数太大退小数（854×480 → 1.78:1）。
+    static func aspect(width: Int, height: Int) -> String {
+        guard width > 0, height > 0 else { return "—" }
+        let divisor = gcd(width, height)
+        let w = width / divisor
+        let h = height / divisor
+        if w <= 50, h <= 50 { return "\(w):\(h)" }
+        return String(format: "%.2f:1", Double(width) / Double(height))
+    }
+
+    /// 信息面板「输出」行：实际输出编码 + 面格式 + 回退原因。
+    ///
+    /// 与「动态范围」互补：那一行说源是什么、被映射成了什么，这一行说**为什么**——
+    /// 「源是 HDR 却出 SDR」的答案就在回退原因里（显示器不支持 HDR、面格式拿不到
+    /// 16 位浮点…）。两处都没有可报的内容（`.unknown` + 中性快照）时返回 nil，
+    /// 调用方据此隐藏整行，而不是显示一行假数据。
+    static func outputDetail(
+        encoding: PlaybackOutputEncoding,
+        snapshot: PlaybackOutputSnapshot
+    ) -> String? {
+        var parts: [String] = []
+        if let encodingLabel = outputEncodingLabel(encoding) { parts.append(encodingLabel) }
+        if let formatLabel = surfaceFormatLabel(snapshot.surfaceFormat) { parts.append(formatLabel) }
+        if snapshot.fallbackReason != .none && snapshot.fallbackReason != .unknown {
+            parts.append("回退 \(fallbackLabel(snapshot.fallbackReason))")
+        } else if snapshot.fallbackReason == .unknown {
+            // 内核报了一个本版本不认识的回退码：说「有回退但原因未知」，别装作没事。
+            parts.append("回退（原因未识别）")
+        }
+        if parts.isEmpty { return nil }
+        return parts.joined(separator: " · ")
+    }
+
+    private static func outputEncodingLabel(_ encoding: PlaybackOutputEncoding) -> String? {
+        switch encoding {
+        case .sdr: "SDR"
+        case .appleEdr: "Apple EDR"
+        case .hdr10Pq: "HDR10 PQ"
+        case .extendedLinear: "扩展线性"
+        case .unknown: nil
+        }
+    }
+
+    private static func surfaceFormatLabel(_ format: PlaybackOutputSnapshot.SurfaceFormat) -> String? {
+        switch format {
+        case .eightBitUnorm: "8bit"
+        case .tenBitUnorm: "10bit"
+        case .sixteenBitFloat: "16bit 浮点"
+        case .unknown: nil
+        }
+    }
+
+    private static func fallbackLabel(_ reason: PlaybackOutputSnapshot.FallbackReason) -> String {
+        switch reason {
+        case .none: "无"
+        case .displayHdrUnsupported: "显示器不支持 HDR"
+        case .hybridCompositionRequired: "非直接合成面"
+        case .wgpuBackendNotVulkan: "后端不是 Vulkan"
+        case .rgba16FloatSurfaceFormatUnavailable: "缺 16 位浮点面格式"
+        case .nativeWindowDataSpaceApiUnavailable: "系统缺数据空间 API"
+        case .scrgbDataSpaceVerificationFailed: "scRGB 数据空间校验失败"
+        case .surfaceConfigureFailed: "输出面配置失败"
+        case .legacyAppleEdrUnsupported: "后端不支持 Apple EDR"
+        case .unknown: "原因未识别"
+        }
+    }
+
+    private static func gcd(_ a: Int, _ b: Int) -> Int {
+        var a = a
+        var b = b
+        while b != 0 {
+            (a, b) = (b, a % b)
+        }
+        return a
+    }
+}
+
+func playerHUDRateLabel(_ value: Double) -> String {
+    "\(value.formatted(.number.precision(.fractionLength(0...2))))×"
+}
+
+func playerHUDTimeLabel(_ duration: Duration) -> String {
+    duration.formatted(
+        .time(pattern: duration > .seconds(3600) ? .hourMinuteSecond : .minuteSecond)
+    )
+}
+
+/// 进度/比例统一显示为整数百分比（HUD 各行只此一份）。
+func playerHUDPercentLabel(_ fraction: Double) -> String {
+    "\(Int((fraction * 100).rounded()))%"
+}

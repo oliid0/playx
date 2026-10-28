@@ -13,5 +13,6 @@ let package = Package(
     ],
     targets: [
         .target(name: "PlaybackKit", dependencies: ["DiagnosticsKit"]),
+        .testTarget(name: "PlaybackKitTests", dependencies: ["PlaybackKit"]),
     ]
 )

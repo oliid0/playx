@@ -1,0 +1,334 @@
+import DiagnosticsKit
+import Foundation
+import Observation
+
+/// App 版本信息工具
+public enum AppVersion {
+    public static var currentShortVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.0"
+    }
+
+    public static var currentBuildVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
+    }
+
+    /// 构建时注入的 Git commit 标识（如 "e657463"、"e657463-dirty" 或本地 Xcode 调试 "dev"）
+    public static var gitCommit: String? {
+        guard let raw = Bundle.main.object(forInfoDictionaryKey: "GitCommit") as? String else {
+            return nil
+        }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != "$(GIT_COMMIT_HASH)" else {
+            return nil
+        }
+        return trimmed
+    }
+
+    public static var displayString: String {
+        if let commit = gitCommit {
+            return "v\(currentShortVersion) (Build \(currentBuildVersion) · \(commit))"
+        }
+        return "v\(currentShortVersion) (Build \(currentBuildVersion))"
+    }
+
+    /// 比较两个版本号（如 "1.2.0" 和 "1.2.1" 或带 "v" 前缀）
+    /// - Returns: `.orderedAscending` 表示 remote > current（有新版）
+    public static func compare(current: String, remote: String) -> ComparisonResult {
+        let cleanCurrent = sanitize(current)
+        let cleanRemote = sanitize(remote)
+
+        let v1Components = cleanCurrent.split(separator: ".").compactMap { Int($0) }
+        let v2Components = cleanRemote.split(separator: ".").compactMap { Int($0) }
+
+        let maxCount = max(v1Components.count, v2Components.count)
+        if maxCount == 0 { return .orderedSame }
+
+        for i in 0..<maxCount {
+            let part1 = i < v1Components.count ? v1Components[i] : 0
+            let part2 = i < v2Components.count ? v2Components[i] : 0
+            if part1 < part2 {
+                return .orderedAscending // remote is newer
+            } else if part1 > part2 {
+                return .orderedDescending // current is newer
+            }
+        }
+        // 数字部分同号时按预发布规则：正式版 > 预发布版（装了 0.1.6-beta.1 的
+        // 用户要能收到 0.1.6 正式版提醒，原先两者 sanitize 后同号被当成「最新」）。
+        let currentIsPrerelease = hasPrereleaseSuffix(current)
+        let remoteIsPrerelease = hasPrereleaseSuffix(remote)
+        if currentIsPrerelease && !remoteIsPrerelease { return .orderedAscending }
+        if !currentIsPrerelease && remoteIsPrerelease { return .orderedDescending }
+        return .orderedSame
+    }
+
+    /// 原始版本串里带预发布后缀（-beta.1 / +readahead.1 等非数字点号字符）。
+    private static func hasPrereleaseSuffix(_ version: String) -> Bool {
+        var v = version.trimmingCharacters(in: .whitespacesAndNewlines)
+        if v.hasPrefix("v") || v.hasPrefix("V") { v.removeFirst() }
+        return v.contains { !$0.isNumber && $0 != "." }
+    }
+
+    public static func isNewer(remote: String, than current: String = currentShortVersion) -> Bool {
+        compare(current: current, remote: remote) == .orderedAscending
+    }
+
+    public static func sanitize(_ version: String) -> String {
+        var v = version.trimmingCharacters(in: .whitespacesAndNewlines)
+        if v.hasPrefix("v") || v.hasPrefix("V") {
+            v.removeFirst()
+        }
+        // 截取到第一个非数字且非点号的字符（例如 1.0.0-beta -> 1.0.0）
+        if let nonNumericIndex = v.firstIndex(where: { !$0.isNumber && $0 != "." }) {
+            v = String(v[..<nonNumericIndex])
+        }
+        return v
+    }
+}
+
+/// GitHub Release 数据模型
+public struct GitHubRelease: Codable, Sendable, Identifiable {
+    public var id: String { tagName }
+    public let tagName: String
+    public let name: String?
+    public let body: String?
+    public let htmlURL: URL
+    public let publishedAt: Date?
+    public let isPrerelease: Bool?
+
+    enum CodingKeys: String, CodingKey {
+        case tagName = "tag_name"
+        case name
+        case body
+        case htmlURL = "html_url"
+        case publishedAt = "published_at"
+        case isPrerelease = "prerelease"
+    }
+
+    public init(
+        tagName: String,
+        name: String? = nil,
+        body: String? = nil,
+        htmlURL: URL,
+        publishedAt: Date? = nil,
+        isPrerelease: Bool? = nil
+    ) {
+        self.tagName = tagName
+        self.name = name
+        self.body = body
+        self.htmlURL = htmlURL
+        self.publishedAt = publishedAt
+        self.isPrerelease = isPrerelease
+    }
+}
+
+/// GitHub Release 检查服务
+@Observable
+@MainActor
+public final class AppUpdateChecker {
+    public enum State: Equatable, Sendable {
+        case idle
+        case checking
+        case upToDate(version: String)
+        case updateAvailable(GitHubRelease)
+        case failed(String)
+
+        public static func == (lhs: State, rhs: State) -> Bool {
+            switch (lhs, rhs) {
+            case (.idle, .idle), (.checking, .checking):
+                return true
+            case (.upToDate(let v1), .upToDate(let v2)):
+                return v1 == v2
+            case (.updateAvailable(let r1), .updateAvailable(let r2)):
+                return r1.tagName == r2.tagName
+            case (.failed(let m1), .failed(let m2)):
+                return m1 == m2
+            default:
+                return false
+            }
+        }
+    }
+
+    /// 默认域走 `PlayXStorage.defaultPreferences`：自动化运行（`OCPLAYER_ISOLATED_STORAGE=1`）
+    /// 落到隔离域 —— 「上次检查时间」这类写入不该落在开发者本机的真实偏好里。
+    public static let shared = AppUpdateChecker(defaults: PlayXStorage.defaultPreferences)
+
+    public private(set) var state: State = .idle
+
+    /// 上一次**拿到结果**（含 404 兜底）的时间。持久化：冷启动的自动检查按它节流。
+    public var lastCheckedDate: Date? {
+        guard let stamp = defaults.object(forKey: SettingsKeys.updateLastCheckedAt) as? Double else {
+            return nil
+        }
+        return Date(timeIntervalSince1970: stamp)
+    }
+
+    /// 触发弹窗展示的 Release 对象（置空则关闭弹窗）
+    public var promptRelease: GitHubRelease?
+
+    /// 用户选择忽略提醒的版本号
+    public var ignoredVersion: String? {
+        get { defaults.string(forKey: SettingsKeys.updateIgnoredVersion) }
+        set {
+            if let newValue {
+                defaults.set(newValue, forKey: SettingsKeys.updateIgnoredVersion)
+            } else {
+                defaults.removeObject(forKey: SettingsKeys.updateIgnoredVersion)
+            }
+        }
+    }
+
+    public let repoOwner: String
+    public let repoName: String
+    private let session: URLSession
+    private let defaults: UserDefaults
+    /// 自动检查（启动 / 进设置页）的最短间隔；用户点「检查」不走节流。
+    private let checkInterval: TimeInterval
+
+    public init(
+        repoOwner: String? = nil,
+        repoName: String? = nil,
+        session: URLSession = .shared,
+        defaults: UserDefaults = .standard,
+        checkInterval: TimeInterval = 24 * 60 * 60
+    ) {
+        // 仓库归属从 Info.plist 读（挪窝只改 plist，不动代码）；缺省兜底旧值，
+        // 测试可显式注入。
+        let configured = Self.configuredRepo()
+        self.repoOwner = repoOwner ?? configured.owner
+        self.repoName = repoName ?? configured.name
+        self.session = session
+        self.defaults = defaults
+        self.checkInterval = checkInterval
+    }
+
+    private static func configuredRepo() -> (owner: String, name: String) {
+        let info = Bundle.main.infoDictionary
+        guard let owner = info?["GitHubRepoOwner"] as? String,
+              let name = info?["GitHubRepoName"] as? String
+        else { return ("1824239290", "OcPlayer") }
+        return (owner, name)
+    }
+
+    /// 忽略指定版本的自动弹窗提醒
+    public func ignoreVersion(_ version: String) {
+        ignoredVersion = version
+        if promptRelease?.tagName == version {
+            promptRelease = nil
+        }
+    }
+
+    /// 清除已忽略的版本记录
+    public func clearIgnoredVersion() {
+        ignoredVersion = nil
+    }
+
+    /// 检查更新
+    /// - Parameter isUserInitiated: 是否为用户主动点击（若是且有新版，无论是否曾被忽略均弹出弹窗）
+    public func checkForUpdates(isUserInitiated: Bool = false) async {
+        // 冷启动每次都直打 GitHub API 既没必要也容易撞限流：自动检查按间隔节流。
+        // 用户点按钮永远放行——他明确要看结果，缓存 24h 反而是坏体验。
+        if !isUserInitiated, let last = lastCheckedDate,
+           Date().timeIntervalSince(last) < checkInterval {
+            return
+        }
+        state = .checking
+        do {
+            guard let url = URL(string: "https://api.github.com/repos/\(repoOwner)/\(repoName)/releases/latest") else {
+                state = .failed("无效的请求地址")
+                return
+            }
+
+            var request = URLRequest(url: url)
+            request.httpMethod = "GET"
+            request.timeoutInterval = 12
+            request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+            request.setValue("OcPlayer/\(AppVersion.currentShortVersion)", forHTTPHeaderField: "User-Agent")
+
+            let (data, response) = try await session.data(for: request)
+
+            guard let httpResponse = response as? HTTPURLResponse else {
+                state = .failed("服务器响应无效")
+                return
+            }
+
+            if httpResponse.statusCode == 404 {
+                // 仓库没有任何 Release、仓库挪走或转私有，GitHub 都回 404——App 区分
+                // 不了。维持「视为最新」的兜底语义，但记日志留排查线索（原先是纯静默，
+                // 仓库挪窝后更新检查会永远安静地失效）。
+                AppDiagnostics.logWarning(
+                    "更新检查 404：仓库无 Release 或仓库地址已变更",
+                    fields: [
+                        "owner": .string(repoOwner),
+                        "repo": .string(repoName),
+                    ])
+                state = .upToDate(version: AppVersion.currentShortVersion)
+                stampLastChecked()
+                return
+            }
+
+            guard (200...299).contains(httpResponse.statusCode) else {
+                if httpResponse.statusCode == 403 {
+                    state = .failed("GitHub 访问频繁，请稍后重试")
+                } else {
+                    state = .failed("请求失败 (\(httpResponse.statusCode))")
+                }
+                return
+            }
+
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let release = try decoder.decode(GitHubRelease.self, from: data)
+
+            stampLastChecked()
+
+            if AppVersion.isNewer(remote: release.tagName) {
+                state = .updateAvailable(release)
+
+                if isUserInitiated {
+                    promptRelease = release
+                } else if ignoredVersion != release.tagName {
+                    // 启动自动检查时，未被忽略的新版本自动弹出弹窗
+                    promptRelease = release
+                }
+            } else {
+                state = .upToDate(version: release.tagName)
+            }
+        } catch {
+            // 请求被取消（设置页离页 `.task` 收尾）不是错误：复位 idle 让下次进来能自愈。
+            // 原先落 default 分支写 `网络异常: cancelled`，而重进设置页有 `.idle` 守卫——
+            // 错误态就此钉死，只能靠手动点「重试」。
+            if Self.isCancellation(error) {
+                state = .idle
+                return
+            }
+            if let urlError = error as? URLError {
+                switch urlError.code {
+                case .notConnectedToInternet:
+                    state = .failed("未连接网络")
+                case .timedOut:
+                    state = .failed("网络超时")
+                case .cannotFindHost, .cannotConnectToHost:
+                    state = .failed("无法连接 GitHub")
+                default:
+                    state = .failed("网络异常: \(urlError.localizedDescription)")
+                }
+            } else {
+                state = .failed("检查失败: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// 只有「拿到结果」才落时间戳：失败不记，下次冷启动照常重试（本来也只试一次）。
+    private func stampLastChecked() {
+        defaults.set(Date().timeIntervalSince1970, forKey: SettingsKeys.updateLastCheckedAt)
+    }
+
+    /// 取消判据。委托给唯一真源 —— 这里早先是**第三份副本**，而且比真源更宽：
+    /// 只查 `code == NSURLErrorCancelled`、**不查 domain**，于是
+    /// `NSError(domain: "SomeOtherDomain", code: -999)` 会被误判成取消
+    /// （`CancellationClassifierTests` 明确断言它**不算**取消）。
+    /// `Task.isCancelled` 保留在前：本类型比分类器多知道一层「当前任务已取消」。
+    private static func isCancellation(_ error: Error) -> Bool {
+        Task.isCancelled || CancellationClassifier.isCancellation(error)
+    }
+}

@@ -1,0 +1,220 @@
+import CoreModel
+import Foundation
+import Get
+import JellyfinAPI
+
+/// PlaybackInfo 返回的单个 MediaSource 域模型。
+public struct PlaybackMediaSource: Hashable, Sendable {
+    public let id: String
+    public let name: String?
+    public let path: String?
+    public let size: Int?
+    public let container: String?
+    public let supportsDirectPlay: Bool?
+    public let supportsDirectStream: Bool?
+    public let supportsTranscoding: Bool?
+    public let bitrate: Int?
+    public let runTimeSeconds: Double?
+    /// 第一个视频流的 videoRangeType 原始串（Jellyfin：SDR/HDR10/DOVI/DOVIWithHDR10…）。
+    /// 存原始字符串而非 SDK 枚举，兼容 Emby 兼容层的任意取值；nil 表示未知。
+    public let videoRangeType: String?
+
+    init(id: String, name: String?, path: String?, size: Int?, container: String?,
+         supportsDirectPlay: Bool?, supportsDirectStream: Bool?, supportsTranscoding: Bool?,
+         bitrate: Int?, runTimeSeconds: Double?, videoRangeType: String?) {
+        self.id = id
+        self.name = name
+        self.path = path
+        self.size = size
+        self.container = container
+        self.supportsDirectPlay = supportsDirectPlay
+        self.supportsDirectStream = supportsDirectStream
+        self.supportsTranscoding = supportsTranscoding
+        self.bitrate = bitrate
+        self.runTimeSeconds = runTimeSeconds
+        self.videoRangeType = videoRangeType
+    }
+
+    init(_ source: MediaSourceInfo, fallbackID: String) {
+        self.init(
+            id: source.id ?? fallbackID,
+            name: source.name,
+            path: source.path,
+            size: source.size,
+            container: source.container,
+            supportsDirectPlay: source.isSupportsDirectPlay,
+            supportsDirectStream: source.isSupportsDirectStream,
+            supportsTranscoding: source.isSupportsTranscoding,
+            bitrate: source.bitrate,
+            runTimeSeconds: seconds(fromTicks: source.runTimeTicks),
+            videoRangeType: source.mediaStreams?
+                .first(where: { $0.type == .video })?
+                .videoRangeType?
+                .rawValue
+        )
+    }
+}
+
+public enum PlaybackDeliveryMethod: String, Hashable, Sendable {
+    case directPlay
+    case directStream
+    case transcode
+}
+
+/// A single Jellyfin playback session carried from PlaybackInfo through the
+/// player request and every playback report. The media-source metadata is also
+/// the stable input used by later episode matching (for example, danmaku).
+public struct PlaybackSessionContext: Hashable, Sendable {
+    public let itemID: String
+    public let playSessionID: String?
+    public let mediaSourceID: String?
+    public let mediaSourceName: String?
+    public let mediaSourcePath: String?
+    public let mediaSourceSize: Int?
+    public let durationSeconds: Double?
+    public let deliveryMethod: PlaybackDeliveryMethod
+    /// 第一个视频流的 videoRangeType 原始串；nil 表示未知（本地文件/手动 URL）。
+    public let videoRangeType: String?
+
+    /// `videoRangeType` 前缀 DOVI（大小写不敏感）即杜比视界：
+    /// 覆盖 DOVI、DOVIWithHDR10/HLG/SDR/EL 等全部变体；DOVIInvalid 也算杜比源。
+    public var isDolbyVision: Bool {
+        guard let videoRangeType else { return false }
+        return videoRangeType.uppercased().hasPrefix("DOVI")
+    }
+
+    public init(
+        itemID: String,
+        playSessionID: String? = nil,
+        mediaSourceID: String? = nil,
+        mediaSourceName: String? = nil,
+        mediaSourcePath: String? = nil,
+        mediaSourceSize: Int? = nil,
+        durationSeconds: Double? = nil,
+        deliveryMethod: PlaybackDeliveryMethod = .directPlay,
+        videoRangeType: String? = nil
+    ) {
+        self.itemID = itemID
+        self.playSessionID = playSessionID
+        self.mediaSourceID = mediaSourceID
+        self.mediaSourceName = mediaSourceName
+        self.mediaSourcePath = mediaSourcePath
+        self.mediaSourceSize = mediaSourceSize
+        self.durationSeconds = durationSeconds
+        self.deliveryMethod = deliveryMethod
+        self.videoRangeType = videoRangeType
+    }
+}
+
+/// 多版本条目的选源规则，播放协商与浏览期媒体信息共用一份，
+/// 免得两边各写一遍后悄悄跑偏（详情页展示的文件必须就是开播会用的那份）。
+public enum MediaSourceSelection {
+    /// 能直连的优先 → 可直推的其次 → 第一条兜底。空列表返回 nil。
+    public static func preferredIndex(
+        count: Int,
+        supportsDirectPlay: (Int) -> Bool,
+        supportsDirectStream: (Int) -> Bool
+    ) -> Int? {
+        guard count > 0 else { return nil }
+        if let index = (0..<count).first(where: supportsDirectPlay) { return index }
+        if let index = (0..<count).first(where: supportsDirectStream) { return index }
+        return 0
+    }
+}
+
+/// `/Items/{id}/PlaybackInfo` 的收口结果，避免 JellyfinAPI 类型漏到 App 层。
+public struct PlaybackInfo: Hashable, Sendable {
+    public let playSessionID: String?
+    public let mediaSources: [PlaybackMediaSource]
+
+    init(playSessionID: String?, mediaSources: [PlaybackMediaSource]) {
+        self.playSessionID = playSessionID
+        self.mediaSources = mediaSources
+    }
+
+    /// 开播实际会用的那一份媒体源（见 `MediaSourceSelection`）。
+    public var preferredSource: PlaybackMediaSource? {
+        guard let index = MediaSourceSelection.preferredIndex(
+            count: mediaSources.count,
+            supportsDirectPlay: { mediaSources[$0].supportsDirectPlay == true },
+            supportsDirectStream: { mediaSources[$0].supportsDirectStream == true }
+        ) else { return nil }
+        return mediaSources[index]
+    }
+
+    public func sessionContext(
+        itemID: String,
+        selectedSource: PlaybackMediaSource?
+    ) -> PlaybackSessionContext {
+        PlaybackSessionContext(
+            itemID: itemID,
+            playSessionID: playSessionID,
+            mediaSourceID: selectedSource?.id,
+            mediaSourceName: selectedSource?.name,
+            mediaSourcePath: selectedSource?.path,
+            mediaSourceSize: selectedSource?.size,
+            durationSeconds: selectedSource?.runTimeSeconds,
+            deliveryMethod: Self.deliveryMethod(for: selectedSource),
+            videoRangeType: selectedSource?.videoRangeType
+        )
+    }
+
+    private static func deliveryMethod(
+        for source: PlaybackMediaSource?
+    ) -> PlaybackDeliveryMethod {
+        if source?.supportsDirectPlay == true { return .directPlay }
+        if source?.supportsDirectStream == true { return .directStream }
+        if source?.supportsTranscoding == true { return .transcode }
+        return .directPlay
+    }
+}
+
+extension JellyfinServer {
+
+    /// 当前客户端声明支持的直连能力。
+    /// 目标：能直连的尽量直连，不让服务端主动转码。
+    static var directPlayDeviceProfile: DeviceProfile {
+        DeviceProfile(
+            directPlayProfiles: [
+                DirectPlayProfile(
+                    audioCodec: "aac,ac3,eac3,dts,truehd,flac,opus",
+                    container: "mkv,mp4,ts,m2ts",
+                    type: .video,
+                    videoCodec: "h264,hevc,av1,vc1"
+                ),
+                DirectPlayProfile(
+                    container: "mp4,m4a,flac,opus,aac,ac3,eac3",
+                    type: .audio
+                ),
+            ],
+            maxStreamingBitrate: 120_000_000,
+            name: "OcPlayer"
+        )
+    }
+
+    /// 获取条目 PlaybackInfo，带回可用的 MediaSource 列表。
+    /// 使用 POST + DeviceProfile，让服务端按 OcPlayer 的直连能力返回播放信息。
+    public func playbackInfo(itemID: String) async throws -> PlaybackInfo {
+        let dto = PlaybackInfoDto(
+            allowAudioStreamCopy: true,
+            allowVideoStreamCopy: true,
+            deviceProfile: Self.directPlayDeviceProfile,
+            enableDirectPlay: true,
+            enableDirectStream: true,
+            enableTranscoding: false,
+            userID: profile.userID
+        )
+        let request = Request<PlaybackInfoResponse>(
+            path: "/Items/\(itemID)/PlaybackInfo",
+            method: .post,
+            query: [("userId", profile.userID)],
+            body: dto,
+            id: "GetPlaybackInfo"
+        )
+        let response = try await send(request)
+        let sources = (response.mediaSources ?? []).map {
+            PlaybackMediaSource($0, fallbackID: itemID)
+        }
+        return PlaybackInfo(playSessionID: response.playSessionID, mediaSources: sources)
+    }
+}

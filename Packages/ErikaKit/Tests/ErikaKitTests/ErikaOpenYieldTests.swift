@@ -1,0 +1,122 @@
+import Foundation
+import QuartzCore
+import Testing
+#if os(macOS)
+import AppKit
+#else
+import UIKit
+#endif
+import PlaybackKit
+@testable import ErikaKit
+
+/// open 让位契约：open 长持主锁期间（内核同步做网络连接与格式探测，弱网可达数十秒），
+/// stop / detach / resize 只登记意图立即返回、open 收尾补做；play / pause / seek /
+/// 速率 / 音量直接丢弃。宿主（PlaybackController）据此把 open 派到后台并安全取消。
+/// 用真实内核 presenter 但不打开媒体——让位机器不依赖媒体内容。
+@Suite("Erika open 让位契约")
+struct ErikaOpenYieldTests {
+
+    @Test("open 在飞时 stop 让位登记，收尾补做并置 interrupted")
+    func stopDuringOpeningIsDeferredUntilFinish() throws {
+        let engine = try ErikaEngine()
+        engine.markOpeningStarted()
+        try? engine.stop() // 让位：立即返回，不碰主锁（登记路径不抛，try? 只为签名）
+        #expect(!engine.openWasInterrupted, "收尾前 interrupted 不应置位")
+        engine.finishOpening() // 收尾：补 stop
+        #expect(engine.openWasInterrupted, "登记过的 stop 应在收尾时置 interrupted")
+        // 收尾之后再 stop：opening 已结束，走正常路径（presenter 无媒体，错误被 try? 吞掉）
+        #expect(throws: Never.self) { _ = try? engine.stop() }
+    }
+
+    @Test("open 在飞时 detach 让位登记并报告未断开")
+    func detachDuringOpeningIsDeferred() throws {
+        let engine = try ErikaEngine()
+        engine.markOpeningStarted()
+        let detached = engine.detach()
+        #expect(!detached, "open 在飞时 detach 应报告未断开（登记给收尾补做）")
+        #expect(!engine.openWasInterrupted)
+        engine.finishOpening()
+        #expect(engine.openWasInterrupted)
+    }
+
+    @Test("open 在飞时播放控制被丢弃且不算让位")
+    func controlCallsDroppedDuringOpening() throws {
+        let engine = try ErikaEngine()
+        engine.markOpeningStarted()
+        #expect(throws: Never.self) { try engine.play() }
+        #expect(throws: Never.self) { try engine.pause() }
+        #expect(throws: Never.self) { try engine.seek(to: .seconds(1)) }
+        #expect(throws: Never.self) { try engine.setRate(1.5) }
+        #expect(throws: Never.self) { try engine.setVolume(0.5) }
+        engine.finishOpening()
+        #expect(!engine.openWasInterrupted, "丢弃的控制调用不是让位，open 成果应保留")
+    }
+
+    @Test("open 在飞时轨道/字幕/截图/弹幕/统计入口让位：读给默认值、动作丢弃")
+    func secondaryEntriesYieldDuringOpening() throws {
+        let engine = try ErikaEngine()
+        engine.markOpeningStarted()
+
+        // 读方法：立即返回默认值，不抛、不撞锁
+        #expect(try engine.tracks().isEmpty)
+        #expect(try engine.danmakuTracks().isEmpty)
+        #expect(try engine.danmakuConfig() == DanmakuConfig())
+        _ = try engine.stats()
+        #expect(try engine.captureFrameRGBA(width: 4, height: 4).isEmpty)
+
+        // 动作方法：丢弃不抛，也不算让位登记
+        #expect(throws: Never.self) { try engine.selectAudioTrack(1) }
+        #expect(throws: Never.self) { try engine.selectSubtitleTrack(nil) }
+        #expect(throws: Never.self) { _ = try engine.addExternalSubtitle("/tmp/ocplayer-yield.srt") }
+        #expect(throws: Never.self) { try engine.setSubtitleScale(1.2) }
+        #expect(throws: Never.self) { try engine.setDanmakuEnabled(false) }
+        #expect(throws: Never.self) { try engine.setDanmakuGlobalOffset(.seconds(1)) }
+        #expect(throws: Never.self) { try engine.setDanmakuConfig(DanmakuConfig()) }
+        #expect(throws: Never.self) { try engine.loadDanmaku(json: "[]") }
+        #expect(throws: Never.self) { try engine.clearDanmaku() }
+
+        engine.finishOpening()
+        #expect(!engine.openWasInterrupted, "这批让位是丢弃/默认值语义，不是 stop/detach 登记")
+        // 收尾之后再走一遍：opening 已结束，正常路径（无媒体，presenter 错误由调用方处理）
+        #expect(throws: Never.self) { _ = try engine.tracks() }
+    }
+
+    @Test("无让位登记的干净 open 收尾不置 interrupted")
+    func cleanOpenNotMarkedInterrupted() throws {
+        let engine = try ErikaEngine()
+        engine.markOpeningStarted()
+        engine.finishOpening()
+        #expect(!engine.openWasInterrupted)
+    }
+
+    @Test("后写的 surface 操作覆盖先写的（后写胜出）")
+    func laterSurfaceOperationWins() throws {
+        let engine = try ErikaEngine()
+        engine.markOpeningStarted()
+        _ = engine.detach() // 登记 detach
+        // 重新登记（模拟视图又发起 resize 覆盖 detach 的极端时序）：
+        // 直接通过 resize 覆盖——登记槽是单槽后写胜出。
+        engine.resize(pixelWidth: 100, pixelHeight: 80, scale: 2)
+        engine.finishOpening()
+        // 断言落在行为上：收尾不崩溃；且最终补做的是良性 resize，
+        // 不算拆卸，所以 interrupted 不置位（否则慢速 Jellyfin open 会被误判打断而不 play，永久转圈）。
+        #expect(!engine.openWasInterrupted)
+    }
+
+    @Test("open 在飞时 attach 紧随 resize，收尾补做 attach 且几何更新为最新值")
+    @MainActor
+    func attachFollowedByResizePreservesAttach() throws {
+        let engine = try ErikaEngine()
+        engine.markOpeningStarted()
+        #if os(macOS)
+        let view = AppKit.NSView()
+        #else
+        let view = UIKit.UIView()
+        #endif
+        let layer = QuartzCore.CAMetalLayer()
+        try engine.attach(to: view, layer: layer, pixelWidth: 100, pixelHeight: 80, scale: 1)
+        engine.resize(pixelWidth: 200, pixelHeight: 160, scale: 2)
+        engine.finishOpening()
+        #expect(!engine.openWasInterrupted)
+    }
+}

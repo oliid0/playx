@@ -1,0 +1,80 @@
+import DiagnosticsKit
+import Foundation
+
+/// App 全局诊断日志入口。
+///
+/// 单一 `DiagnosticLogger`，所有模块共用同一目录下的按会话 JSONL 文件
+/// （`~/Library/Logs/OcPlayer/diagnostics-<时间戳>-<会话id>.jsonl`，一次启动一个；
+/// 保留最新 10 个 / 总量 ≤50MB / 不超过 30 天，当前会话文件永不删），
+/// 同时镜像到 OSLog（Console.app 按 subsystem `dev.jumusu.OcPlayer` 过滤）。
+/// 敏感字段（token / Authorization 头 / 用户路径）由红actor 在写盘前统一脱敏。
+enum AppDiagnostics {
+
+    static let logger = DiagnosticLogger(subsystem: "dev.jumusu.OcPlayer", category: "App")
+
+    static var fileURL: URL { logger.fileURL }
+
+    static var recentRecords: [DiagnosticEntry] {
+        (try? logger.readRecords(limit: 40)) ?? []
+    }
+
+    /// 消息一律 `@autoclosure`：低于最低落盘级别时整条不求值（含字符串插值）。
+    static func logDebug(_ message: @autoclosure () -> String,
+                         fields: [String: DiagnosticValue] = [:],
+                         throttle: DiagnosticThrottle? = nil) {
+        logger.debug(message(), fields: fields, throttle: throttle)
+    }
+
+    static func logInfo(_ message: @autoclosure () -> String,
+                        fields: [String: DiagnosticValue] = [:],
+                        throttle: DiagnosticThrottle? = nil) {
+        logger.info(message(), fields: fields, throttle: throttle)
+    }
+
+    static func logWarning(_ message: @autoclosure () -> String,
+                           fields: [String: DiagnosticValue] = [:],
+                           throttle: DiagnosticThrottle? = nil) {
+        logger.warning(message(), fields: fields, throttle: throttle)
+    }
+
+    static func logError(_ message: @autoclosure () -> String,
+                         fields: [String: DiagnosticValue] = [:],
+                         throttle: DiagnosticThrottle? = nil) {
+        logger.error(message(), fields: fields, throttle: throttle)
+    }
+
+    static func flush() {
+        logger.flush()
+    }
+
+    /// 有界等待版 flush：进程终止路径用它，别为了最后几条日志把退出流程吊住。
+    @discardableResult
+    static func flush(timeout: TimeInterval) -> Bool {
+        logger.flush(timeout: timeout)
+    }
+
+    /// 每次启动留一条会话记录：版本 + 平台 + 构建，排查「哪个版本出的问题」。
+    static func recordLaunch() {
+        AppStorageMaintenance.shared.start()
+        #if os(macOS)
+        let platform = "macOS"
+        #else
+        let platform = "iOS"
+        #endif
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        var fields: [String: DiagnosticValue] = [
+            "platform": .string(platform),
+            "version": .string(version),
+            "build": .string(build),
+        ]
+        if let commit = AppVersion.gitCommit {
+            fields["commit"] = .string(commit)
+        }
+        logInfo("应用启动", fields: fields)
+    }
+
+    static func requestStorageMaintenance() {
+        AppStorageMaintenance.shared.requestMaintenance()
+    }
+}

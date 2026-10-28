@@ -45,7 +45,7 @@ final class RenderLoop {
         frameRate.prime(defaultRange: link.preferredFrameRateRange)
 
         let thread = RenderThread(link: link, proxy: proxy)
-        thread.name = "com.oliid0.playerx.render"
+        thread.name = "dev.jumusu.OcPlayer.render"
         thread.qualityOfService = .userInteractive
         self.thread = thread
         thread.start()

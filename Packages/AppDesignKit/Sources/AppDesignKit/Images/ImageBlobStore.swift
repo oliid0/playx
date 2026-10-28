@@ -1,0 +1,181 @@
+import DiagnosticsKit
+import Foundation
+
+/// 图片字节的**自有**磁盘缓存（不依赖 `URLCache`）。
+///
+/// ## 为什么不用 `URLCache`
+///
+/// 离线出图曾经完全依赖 `URLCache`，实测**不可靠**：索引库里条目明明在
+/// （`storage_policy = 0`、服务器发的是 `Cache-Control: public, max-age=31536000,
+/// immutable`），但**换一个 `URLCache` 实例（= 重启 App）就再也读不回来**——
+/// 同一个实例内能命中，跨实例一律 miss。表现就是用户报的「重启后图片全变占位符」。
+///
+/// 这个行为既无法在单元测试里断言（直接调 `cachedResponse(for:)` 是能读到的，
+/// 走 `URLSession` 才暴露），也没法从 Foundation 拿到解释。图片能不能离线看是**用户
+/// 可见的功能**，不该建在一个我们观察不透、也无法回归的机制上。
+///
+/// 所以字节自存：文件名 = 规范化键的稳定哈希，内容 = 原始响应体（JPEG/PNG）。
+/// 读、写、淘汰全部由我们控制，可测、可观察、可解释。
+///
+/// ## 键的稳定性
+///
+/// 文件名来自 `ImageCacheKey`（已抹掉服务器地址）。**注意不能把 App 版本号算进键**：
+/// 客户端身份头里含 `Version="0.2.0 (506)"` 而构建号 = git 提交数，用它当键会让
+/// **每次发版都丢掉全部图片缓存**（实测 Build 505 与 506 的键哈希确实不同）。
+/// 归属只需「哪台服务器 + 哪个账号」，见 `ImageCacheKey.authIdentity`。
+final class ImageBlobStore: @unchecked Sendable {
+
+    /// 默认上限 256 MB。与 `URLCache` 那份并存时总占用仍受控（512 + 256）。
+    static let defaultMaxBytes = 256 * 1024 * 1024
+
+    private let directory: URL
+    private let maxBytes: Int
+    private let lock = NSLock()
+    /// 目录体积缓存：`load` 热路径上不该每次都枚举目录（海报墙一次几十张）。
+    private var cachedBytes: Int?
+
+    /// 两次「全目录扫描」之间至少写入多少字节。
+    ///
+    /// `pruneIfNeeded` 要枚举整个缓存目录、对**每个文件**取一次
+    /// `attributesOfItem` 再排序，而 `store` 是「每张图一次」——海报墙滚一屏就是
+    /// 几十次全目录 stat（上限内文件数可达数千）。按字节数节流后扫描频率从
+    /// 「每张图」降到「每 4 MB」，超限最多晚 4 MB 才修剪（上限的 1.6%）。
+    private static let pruneIntervalBytes = 4 * 1024 * 1024
+    /// 本进程已写入、尚未触发过扫描的字节数。初值 = 阈值：进程内第一次写入仍会
+    /// 扫一次，把上次会话遗留的超限收掉。
+    private var bytesSincePrune = ImageBlobStore.pruneIntervalBytes
+
+    init(directory: URL, maxBytes: Int = ImageBlobStore.defaultMaxBytes) {
+        self.directory = directory
+        self.maxBytes = maxBytes
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    /// 缓存键 → 文件名。**跨进程稳定**（`FNV1a`，非 `hashValue`）。
+    static func fileName(for key: String) -> String {
+        FNV1a.hex(of: key) + ".img"
+    }
+
+    /// 键对应的缓存文件，**存在才返回**。只查文件，不读内容、不解码。
+    ///
+    /// 登录页海报墙靠它做「这张图的字节在不在本机」的判断：墙要按条目复原缓存键，
+    /// 然后逐个问「有没有」，命中的才摆上墙。
+    func fileURL(forKey key: String) -> URL? {
+        let url = directory.appendingPathComponent(Self.fileName(for: key))
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    /// 读字节。
+    ///
+    /// **两个时间戳分工**（这里踩过坑，别合并）：
+    /// - `modificationDate` = **最后访问**时间，读取时就刷新 → 淘汰按 LRU。
+    ///   若拿它当「下载时间」，读一次就变成「刚下载」，后台刷新永远不会触发。
+    /// - `creationDate` = **下载**时间，只在 `store` 时写 → 判断该不该回源刷新。
+    func data(forKey key: String) -> Data? {
+        let url = directory.appendingPathComponent(Self.fileName(for: key))
+        // 读取时刷新 mtime：淘汰按「最久未使用」而不是「最早写入」，
+        // 否则常看的老片海报会被新片挤掉。
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return nil }
+        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
+        return data
+    }
+
+    /// 该条目的**下载**时间（不是访问时间）。nil = 没有这条 / 取不到时间。
+    ///
+    /// 取不到时返回 nil，调用方应视为「陈旧」（宁可多刷一次，也别永远不刷）。
+    func downloadedAt(forKey key: String) -> Date? {
+        let url = directory.appendingPathComponent(Self.fileName(for: key))
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) else { return nil }
+        return attrs[.creationDate] as? Date
+    }
+
+    func store(_ data: Data, forKey key: String) {
+        guard !data.isEmpty else { return }
+        let url = directory.appendingPathComponent(Self.fileName(for: key))
+        do {
+            try data.write(to: url, options: .atomic)
+            // 显式写 creationDate 而不是依赖「原子写生成的临时文件的 birthtime」：
+            // 那个行为依赖文件系统与写入实现，而刷新判断要读它，得是我们自己钉住的语义。
+            try? FileManager.default.setAttributes([.creationDate: Date()], ofItemAtPath: url.path)
+            lock.lock()
+            cachedBytes = nil          // 让下次统计重新算
+            bytesSincePrune += data.count
+            let shouldPrune = bytesSincePrune >= Self.pruneIntervalBytes
+            if shouldPrune { bytesSincePrune = 0 }
+            lock.unlock()
+            if shouldPrune { pruneIfNeeded() }
+        } catch {
+            // 写不进去（磁盘满 / 权限）不该影响这次显示：图已经拿到手了。
+            DiagnosticLogger(category: "Image").warning("图片字节写盘失败", fields: [
+                "error": .string("\(error)"),
+            ])
+        }
+    }
+
+    /// 删单条（盘上字节坏了时用）。
+    func remove(forKey key: String) {
+        let url = directory.appendingPathComponent(Self.fileName(for: key))
+        try? FileManager.default.removeItem(at: url)
+        lock.lock()
+        cachedBytes = nil
+        lock.unlock()
+    }
+
+    func removeAll() {
+        try? FileManager.default.removeItem(at: directory)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        lock.lock()
+        cachedBytes = 0
+        lock.unlock()
+    }
+
+    /// 当前占用（带缓存，供设置页显示）。
+    var totalBytes: Int {
+        lock.lock()
+        if let cachedBytes {
+            lock.unlock()
+            return cachedBytes
+        }
+        lock.unlock()
+        let bytes = Self.directorySize(directory)
+        lock.lock()
+        cachedBytes = bytes
+        lock.unlock()
+        return bytes
+    }
+
+    /// 超上限时按 mtime 最旧优先删。
+    private func pruneIfNeeded() {
+        let files = Self.filesByAge(directory)
+        var total = files.reduce(0) { $0 + $1.size }
+        guard total > maxBytes else {
+            lock.lock(); cachedBytes = total; lock.unlock()
+            return
+        }
+        // 删到上限的 90%：留出余量，免得每次写入都触发一轮扫描。
+        let target = Int(Double(maxBytes) * 0.9)
+        for file in files where total > target {
+            try? FileManager.default.removeItem(at: file.url)
+            total -= file.size
+        }
+        lock.lock(); cachedBytes = total; lock.unlock()
+    }
+
+    private static func directorySize(_ directory: URL) -> Int {
+        filesByAge(directory).reduce(0) { $0 + $1.size }
+    }
+
+    private static func filesByAge(_ directory: URL) -> [(url: URL, size: Int, date: Date)] {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: directory.path) else { return [] }
+        return names.compactMap { name -> (URL, Int, Date)? in
+            let url = directory.appendingPathComponent(name)
+            guard let attrs = try? fm.attributesOfItem(atPath: url.path),
+                  let size = attrs[.size] as? NSNumber,
+                  let date = attrs[.modificationDate] as? Date
+            else { return nil }
+            return (url, size.intValue, date)
+        }
+        .sorted { $0.2 < $1.2 }
+    }
+}
