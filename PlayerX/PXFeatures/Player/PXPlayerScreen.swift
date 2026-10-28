@@ -168,7 +168,7 @@ struct PXPlayerScreen: View {
 
     private func close() {
         model.stop()
-        app.dismissPlayer()
+        app.dismissPlayer(closingID: model.request.id)
     }
 }
 

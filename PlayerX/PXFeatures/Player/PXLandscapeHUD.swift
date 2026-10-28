@@ -40,8 +40,8 @@ struct PXLandscapeHUD: View {
                     Button { onInfo() } label: { Image(systemName: "ellipsis") }
                         .buttonStyle(PXIconButtonStyle(size: 36))
                 }
-                .padding(.horizontal, 18)
-                .padding(.top, 14)
+                .padding(.horizontal, PlayerChromeMetrics.sidePadding(EdgeInsets(), isNarrow: false))
+                .padding(.top, PlayerChromeMetrics.topBarTopPadding(EdgeInsets(), isNarrow: false))
                 Spacer()
                 HStack(spacing: 30) {
                     Button { model.skipBackward() } label: {
@@ -85,8 +85,8 @@ struct PXLandscapeHUD: View {
                     }
                     .foregroundStyle(.white.opacity(0.78))
                 }
-                .padding(.horizontal, 26)
-                .padding(.bottom, 22)
+                .padding(.horizontal, PlayerChromeMetrics.sidePadding(EdgeInsets(), isNarrow: false))
+                .padding(.bottom, 28)
             }
         }
     }

@@ -77,7 +77,8 @@ final class PXAppState: ObservableObject {
         presentedPlayer = request
     }
 
-    func dismissPlayer() {
+    func dismissPlayer(closingID: UUID? = nil) {
+        guard PlayerClosePolicy.shouldDismiss(presentedID: presentedPlayer?.id, closingID: closingID) || closingID == nil else { return }
         presentedPlayer = nil
     }
 
