@@ -31,6 +31,7 @@ final class PXPlayerModel: ObservableObject {
     private var lastSavedAt = Date.distantPast
     private var lastNowPlayingUpdate = Date.distantPast
     private var currentRate: Double
+    private var boostPreviousRate: Double?
     private var didFallbackEngine = false
     private var watchdogTask: Task<Void, Never>?
     private var preferDirectPlayback = false
@@ -156,6 +157,20 @@ final class PXPlayerModel: ObservableObject {
         preferences.preferredRate = rate
         engine?.setRate(rate)
         notice = String(format: "%.2fx", rate)
+    }
+
+    func beginTemporaryBoost() {
+        guard boostPreviousRate == nil else { return }
+        boostPreviousRate = currentRate
+        engine?.setRate(2)
+        notice = "2x 快进"
+    }
+
+    func endTemporaryBoost() {
+        guard let previous = boostPreviousRate else { return }
+        engine?.setRate(previous)
+        boostPreviousRate = nil
+        notice = nil
     }
 
     func cycleRate() {

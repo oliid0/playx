@@ -7,49 +7,67 @@ struct PXPlayerGestureLayer: View {
 
     var body: some View {
         GeometryReader { proxy in
-            Color.black.opacity(0.001)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    if model.controlsVisible { model.hideControls() } else { model.revealsControls() }
-                }
-                .gesture(
-                    DragGesture(minimumDistance: 24)
-                        .onChanged { value in
-                            guard PXPlayerPreferences.shared.dragSeek, model.duration > 0 else { return }
-                            if abs(value.translation.width) <= abs(value.translation.height) { return }
-                            if dragStart == nil {
-                                dragStart = model.currentTime
-                                model.revealsControls()
+            ZStack {
+                Color.black.opacity(0.001)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        if model.controlsVisible { model.hideControls() } else { model.revealsControls() }
+                    }
+                    .gesture(
+                        DragGesture(minimumDistance: 24)
+                            .onChanged { value in
+                                guard PXPlayerPreferences.shared.dragSeek, model.duration > 0 else { return }
+                                if abs(value.translation.width) <= abs(value.translation.height) { return }
+                                if dragStart == nil {
+                                    dragStart = model.currentTime
+                                    model.revealsControls()
+                                }
+                                let range = min(max(model.duration, 60), 600)
+                                let delta = Double(value.translation.width / max(proxy.size.width, 1)) * range
+                                dragTarget = min(max((dragStart ?? 0) + delta, 0), max(model.duration - 0.2, 0))
                             }
-                            let range = min(max(model.duration, 60), 600)
-                            let delta = Double(value.translation.width / max(proxy.size.width, 1)) * range
-                            dragTarget = min(max((dragStart ?? 0) + delta, 0), max(model.duration - 0.2, 0))
-                        }
-                        .onEnded { value in
-                            if abs(value.translation.height) > 70,
-                               abs(value.translation.height) > abs(value.translation.width) * 1.4 {
-                                if value.translation.height < 0 { model.playNext() } else { model.playPrevious() }
-                            } else if let target = dragTarget {
-                                model.seek(to: target)
+                            .onEnded { value in
+                                if abs(value.translation.width) > abs(value.translation.height), let target = dragTarget {
+                                    model.seek(to: target)
+                                }
+                                dragStart = nil
+                                dragTarget = nil
                             }
-                            dragStart = nil
-                            dragTarget = nil
-                        }
-                )
+                    )
 
-            if let target = dragTarget {
-                HStack(spacing: 8) {
-                    Image(systemName: "goforward")
-                    Text(PXFormat.time(target)).font(PXFont.mono(14))
+                HStack(spacing: 0) {
+                    edgeBoostZone(width: max(52, proxy.size.width * 0.16))
+                    Spacer(minLength: 0)
+                    edgeBoostZone(width: max(52, proxy.size.width * 0.16))
                 }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 16)
-                .frame(height: 42)
-                .background(.ultraThinMaterial, in: Capsule())
-                .position(x: proxy.size.width / 2, y: proxy.size.height * 0.78)
-                .allowsHitTesting(false)
+
+                if let target = dragTarget {
+                    HStack(spacing: 8) {
+                        Image(systemName: "goforward")
+                        Text(PXFormat.time(target)).font(PXFont.mono(14))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 16)
+                    .frame(height: 42)
+                    .background(.ultraThinMaterial, in: Capsule())
+                    .position(x: proxy.size.width / 2, y: proxy.size.height * 0.78)
+                    .allowsHitTesting(false)
+                }
             }
         }
         .ignoresSafeArea()
+    }
+
+    private func edgeBoostZone(width: CGFloat) -> some View {
+        Color.black.opacity(0.001)
+            .frame(width: width)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if model.controlsVisible { model.hideControls() } else { model.revealsControls() }
+            }
+            .onLongPressGesture(minimumDuration: 0.35, pressing: { pressing in
+                if pressing { model.beginTemporaryBoost() } else { model.endTemporaryBoost() }
+            }, perform: {})
+            .allowsHitTesting(!model.isLocked)
     }
 }

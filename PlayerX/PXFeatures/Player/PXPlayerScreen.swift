@@ -38,18 +38,32 @@ struct PXPlayerScreen: View {
             .ignoresSafeArea()
             .allowsHitTesting(false)
 
-            if storiesLayout {
-                PXStoriesTapZones(
-                    onPrevious: model.playPrevious,
-                    onNext: model.playNext,
-                    onToggleControls: {
-                        if model.controlsVisible { model.hideControls() } else { model.revealsControls() }
-                    },
-                    enabled: model.controlsVisible == false
-                )
-            } else {
-                PXPlayerGestureLayer(model: model)
+            GeometryReader { proxy in
+                if storiesLayout {
+                    if hasSideBlank(proxy) {
+                        PXStoriesTapZones(
+                            sideWidth: sideBlankWidth(proxy),
+                            onPrevious: model.playPrevious,
+                            onNext: model.playNext,
+                            onToggleControls: {
+                                if model.controlsVisible { model.hideControls() } else { model.revealsControls() }
+                            },
+                            onBoost: { model.beginTemporaryBoost() },
+                            onEndBoost: { model.endTemporaryBoost() },
+                            enabled: model.controlsVisible == false
+                        )
+                    } else {
+                        PXPortraitSwipeLayer(
+                            model: model,
+                            onPrevious: model.playPrevious,
+                            onNext: model.playNext
+                        )
+                    }
+                } else {
+                    PXPlayerGestureLayer(model: model)
+                }
             }
+            .ignoresSafeArea()
 
             if model.controlsVisible, model.snapshot.state != .failed("") {
                 if storiesLayout {
@@ -131,6 +145,25 @@ struct PXPlayerScreen: View {
                 .presentationDetents([.medium])
                 .presentationDragIndicator(.visible)
         }
+    }
+
+    private func videoAspect() -> Double {
+        let size = model.snapshot.videoSize
+        guard size.width > 0, size.height > 0 else {
+            return model.isPortraitVideo ? 9.0 / 16.0 : 16.0 / 9.0
+        }
+        return Double(size.width / size.height)
+    }
+
+    private func hasSideBlank(_ proxy: GeometryProxy) -> Bool {
+        guard model.isPortraitVideo else { return false }
+        let screenAspect = Double(proxy.size.width / max(proxy.size.height, 1))
+        return videoAspect() < screenAspect * 0.98
+    }
+
+    private func sideBlankWidth(_ proxy: GeometryProxy) -> CGFloat {
+        let renderedWidth = proxy.size.height * CGFloat(videoAspect())
+        return max(0, (proxy.size.width - renderedWidth) / 2)
     }
 
     private func close() {

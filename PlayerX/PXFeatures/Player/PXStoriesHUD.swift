@@ -157,25 +157,83 @@ struct PXStoriesHUD: View {
 }
 
 struct PXStoriesTapZones: View {
+    var sideWidth: CGFloat
     var onPrevious: () -> Void
     var onNext: () -> Void
     var onToggleControls: () -> Void
+    var onBoost: () -> Void = {}
+    var onEndBoost: () -> Void = {}
     var enabled: Bool
 
     var body: some View {
+        HStack(spacing: 0) {
+            sideZone
+                .frame(width: sideWidth)
+                .onTapGesture { onPrevious() }
+                .onLongPressGesture(minimumDuration: 0.35, pressing: { pressing in
+                    pressing ? onBoost() : onEndBoost()
+                }, perform: {})
+            Color.black.opacity(0.001)
+                .contentShape(Rectangle())
+                .onTapGesture { onToggleControls() }
+            sideZone
+                .frame(width: sideWidth)
+                .onTapGesture { onNext() }
+                .onLongPressGesture(minimumDuration: 0.35, pressing: { pressing in
+                    pressing ? onBoost() : onEndBoost()
+                }, perform: {})
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(enabled || true)
+    }
+
+    private var sideZone: some View {
+        Color.black.opacity(0.001)
+            .contentShape(Rectangle())
+    }
+}
+
+/// 竖屏视频且画面填满屏幕时，左右没有可点击空白；按抖音式上下滑动切换。
+struct PXPortraitSwipeLayer: View {
+    @ObservedObject var model: PXPlayerModel
+    var onPrevious: () -> Void
+    var onNext: () -> Void
+    @State private var offset: CGFloat = 0
+
+    var body: some View {
         GeometryReader { proxy in
-            HStack(spacing: 0) {
-                Color.black.opacity(0.001)
-                    .frame(width: proxy.size.width * 0.28)
-                    .contentShape(Rectangle())
-                    .onTapGesture { onPrevious() }
-                Color.black.opacity(0.001)
-                    .contentShape(Rectangle())
-                    .onTapGesture { onToggleControls() }
-                Color.black.opacity(0.001)
-                    .frame(width: proxy.size.width * 0.28)
-                    .contentShape(Rectangle())
-                    .onTapGesture { onNext() }
+            Color.black.opacity(0.001)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    if model.controlsVisible { model.hideControls() } else { model.revealsControls() }
+                }
+                .gesture(
+                    DragGesture(minimumDistance: 28)
+                        .onChanged { value in
+                            guard abs(value.translation.height) > abs(value.translation.width) else { return }
+                            offset = value.translation.height
+                        }
+                        .onEnded { value in
+                            let vertical = abs(value.translation.height) > abs(value.translation.width)
+                            if vertical, value.translation.height < -70 {
+                                onNext()
+                            } else if vertical, value.translation.height > 70 {
+                                onPrevious()
+                            }
+                            withAnimation(PXTheme.quick) { offset = 0 }
+                        }
+                )
+            if abs(offset) > 18 {
+                VStack {
+                    Spacer()
+                    Text(offset < 0 ? "上滑切换下一集" : "下滑切换上一集")
+                        .font(PXFont.caption(11))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 14).padding(.vertical, 8)
+                        .background(.ultraThinMaterial, in: Capsule())
+                    Spacer().frame(height: proxy.size.height * 0.18)
+                }
+                .allowsHitTesting(false)
             }
         }
         .ignoresSafeArea()
