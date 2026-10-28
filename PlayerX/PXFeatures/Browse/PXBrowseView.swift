@@ -81,7 +81,6 @@ struct PXBrowseView: View {
                 .accessibilityLabel("排序")
             }
         }
-        .pxBackCommand()
         .onAppear { app.enterPage(title: model.title) }
         .onDisappear { app.leavePage() }
         .task { await model.load() }

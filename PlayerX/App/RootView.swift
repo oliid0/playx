@@ -51,21 +51,21 @@ struct PXRootView: View {
         }
         .onOpenURL { app.handleDeepLink($0) }
         #if os(macOS)
-        .toolbar(.hidden, for: .windowToolbar)
+        .toolbar(app.presentedPlayer == nil ? .visible : .hidden, for: .windowToolbar)
         #endif
     }
 
     @ViewBuilder
     private var shell: some View {
         #if os(macOS)
-        VStack(spacing: 0) {
-            PXMacTopBar()
-            NavigationStack {
-                macContent
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-            .id(app.selectedTab)
+        NavigationStack {
+            macContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .toolbar {
+                    PXMacToolbar(app: app, settings: settings)
+                }
         }
+        .id(app.selectedTab)
         .background(PXPageBackground())
         #else
         phoneShell

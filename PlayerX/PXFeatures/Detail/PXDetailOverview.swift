@@ -6,40 +6,24 @@ struct PXDetailOverview: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
-            HStack(alignment: .top, spacing: 14) {
-                Group {
-                    if let poster = model.metadata?.posterURL {
-                        PXRemoteImage(url: poster, maxPixel: 500)
-                    } else {
-                        PXCoverImage(drama: model.drama, maxPixel: 500)
-                    }
-                }
-                .frame(width: 104, height: 156)
-                    .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 13, style: .continuous)
-                            .strokeBorder(PXTheme.stroke, lineWidth: 0.7)
-                    }
-                    .shadow(color: .black.opacity(0.35), radius: 16, y: 8)
-                VStack(alignment: .leading, spacing: 9) {
-                    Text(model.subtitle ?? model.title)
-                        .font(.system(size: 13, weight: .semibold))
+            VStack(alignment: .leading, spacing: 9) {
+                Text(model.subtitle ?? model.title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(PXTheme.textSecondary)
+                    .lineLimit(2)
+                if let overview = model.overview, !overview.isEmpty {
+                    Text(overview)
+                        .font(.system(size: 13))
                         .foregroundStyle(PXTheme.textSecondary)
-                        .lineLimit(2)
-                    if let overview = model.overview, !overview.isEmpty {
-                        Text(overview)
-                            .font(.system(size: 13))
-                            .foregroundStyle(PXTheme.textSecondary)
-                            .lineSpacing(4)
-                            .lineLimit(descriptionExpanded ? nil : 6)
-                        if overview.count > 150 {
-                            Button(descriptionExpanded ? "收起" : "展开全部") {
-                                withAnimation(PXTheme.standard) { descriptionExpanded.toggle() }
-                            }
-                            .font(.system(size: 11, weight: .bold))
-                            .foregroundStyle(PXTheme.accent)
-                            .buttonStyle(.plain)
+                        .lineSpacing(4)
+                        .lineLimit(descriptionExpanded ? nil : 6)
+                    if overview.count > 150 {
+                        Button(descriptionExpanded ? "收起" : "展开全部") {
+                            withAnimation(PXTheme.standard) { descriptionExpanded.toggle() }
                         }
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(PXTheme.accent)
+                        .buttonStyle(.plain)
                     }
                 }
             }

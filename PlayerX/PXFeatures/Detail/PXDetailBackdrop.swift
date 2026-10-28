@@ -14,7 +14,9 @@ struct PXDetailBackdrop: View {
                 if let url {
                     PXRemoteImage(url: url, maxPixel: 2000)
                 } else if let drama {
-                    PXCoverImage(drama: drama, maxPixel: 2000)
+                    PXCoverImage(drama: drama, maxPixel: 1400)
+                        .blur(radius: 26)
+                        .overlay(Color.black.opacity(0.28))
                 } else {
                     PXTheme.backgroundLift
                 }

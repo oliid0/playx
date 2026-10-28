@@ -64,7 +64,6 @@ struct PXDetailView: View {
                 }
             }
         }
-        .pxBackCommand()
         .onAppear { app.enterPage(title: model.title, shareURL: model.drama.pxShareURL) }
         .onDisappear { app.leavePage() }
         .task {
